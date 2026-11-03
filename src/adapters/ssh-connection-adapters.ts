@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { realpath as fsRealpath } from 'node:fs/promises';
 import { isIP } from 'node:net';
 import { posix as posixPath, win32 as win32Path } from 'node:path';
@@ -48,14 +48,16 @@ export interface SshProcessResult {
 }
 
 export interface SshProcessRunner {
-  /** Native OpenSSH runners set this when they need the verbose auth marker. */
-  readonly requiresReadinessMarker?: boolean;
-
   run(
     executable: string,
     args: readonly string[],
     options: { readonly timeoutMs: number; readonly shell: false },
   ): Promise<SshProcessResult>;
+}
+
+/** Trusted local/structured readiness signal; never infer readiness from SSH output. */
+export interface OpenSshReadinessProbe {
+  waitUntilReady(context: { readonly child: ChildProcess; readonly signal: AbortSignal }): Promise<boolean>;
 }
 
 export interface OpenSshExecutableResolver {
@@ -128,7 +130,6 @@ const MAX_OUTPUT_BYTES = 64 * 1024;
 const DEFAULT_TIMEOUT_MS = 10_000;
 const MAX_TIMEOUT_MS = 60_000;
 const CLEANUP_GRACE_MS = 100;
-const OPENSSH_AUTHENTICATION_LINE = /^debug1: Authentication succeeded \([^()\r\n]+\)\.$/u;
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
@@ -358,13 +359,7 @@ export interface OpenSshAgentAdapterDependencies extends SshAdapterDependencies 
   readonly runner?: SshProcessRunner;
 }
 
-function buildAgentArguments(
-  descriptor: TrustedConnectionDescriptor,
-  knownHostsPath: string,
-  timeoutMs: number,
-  targetPlatform: string,
-  includeReadinessMarker: boolean,
-): readonly string[] {
+function buildAgentArguments(descriptor: TrustedConnectionDescriptor, knownHostsPath: string, timeoutMs: number, targetPlatform: string): readonly string[] {
   const connectTimeoutSeconds = Math.max(1, Math.ceil(timeoutMs / 1000));
   const globalKnownHosts = targetPlatform === 'win32' ? 'NUL' : '/dev/null';
   return [
@@ -381,7 +376,6 @@ function buildAgentArguments(
     '-o', 'IdentitiesOnly=yes',
     '-o', `ConnectTimeout=${connectTimeoutSeconds}`,
     '-p', String(descriptor.port),
-    ...(includeReadinessMarker ? ['-v'] : []),
     '--',
     `${descriptor.user}@${descriptor.host}`,
   ];
@@ -432,7 +426,6 @@ export class OpenSshAgentAdapter {
       knownHosts.path,
       this.timeoutMs,
       this.targetPlatform,
-      this.runner.requiresReadinessMarker === true,
     );
     let result: SshProcessResult;
     try {
@@ -516,23 +509,31 @@ export class PasswordSshAdapter {
 
 /** Direct native process runner used only by the agent adapter. */
 export class NativeOpenSshProcessRunner implements SshProcessRunner {
-  readonly requiresReadinessMarker = true;
+  private readonly readinessProbe: OpenSshReadinessProbe | undefined;
+
+  constructor(readinessProbe?: OpenSshReadinessProbe) {
+    this.readinessProbe = readinessProbe;
+  }
 
   run(executable: string, args: readonly string[], options: { readonly timeoutMs: number; readonly shell: false }): Promise<SshProcessResult> {
     return new Promise((resolve, reject) => {
+      if (this.readinessProbe === undefined) {
+        reject(new SshAdapterError('ssh-connection-failed', 'SSH readiness probe is unavailable'));
+        return;
+      }
       const child = spawn(executable, [...args], {
         shell: false,
         windowsHide: true,
         stdio: ['ignore', 'pipe', 'pipe'] as const,
       });
       let outputBytes = 0;
-      let stderrTail = '';
       let finalized = false;
       let closeSeen = false;
       let forceFinalize = false;
       let outcome: { readonly result?: SshProcessResult; readonly error?: Error } | undefined;
       let closeGraceTimer: ReturnType<typeof setTimeout> | undefined;
       let escalationTimer: ReturnType<typeof setTimeout> | undefined;
+      const readinessController = new AbortController();
       const finalize = () => {
         if (finalized || !outcome || (!closeSeen && !forceFinalize)) return;
         finalized = true;
@@ -546,6 +547,7 @@ export class NativeOpenSshProcessRunner implements SshProcessRunner {
         if (outcome !== undefined) return;
         outcome = nextOutcome;
         clearTimeout(deadlineTimer);
+        readinessController.abort();
         try { child.kill(); } catch { /* process may have exited */ }
         closeGraceTimer = setTimeout(() => {
           if (closeSeen || finalized) return;
@@ -566,24 +568,29 @@ export class NativeOpenSshProcessRunner implements SshProcessRunner {
       };
       child.stdout.on('data', drain);
       child.stderr.on('data', chunk => {
-        const text = Buffer.isBuffer(chunk) ? chunk.toString('utf8') : chunk;
         drain(chunk);
-        if (outcome !== undefined) return;
-        const lines = (stderrTail + text).split(/\r?\n/u);
-        stderrTail = lines.pop() ?? '';
-        for (const line of lines) {
-          if (OPENSSH_AUTHENTICATION_LINE.test(line)) {
-            terminate({ result: { exitCode: 0, ready: true } });
-            return;
-          }
-        }
       });
       child.once('error', () => terminate({ error: new SshAdapterError('ssh-connection-failed', 'SSH connection failed') }));
       child.once('close', code => {
         closeSeen = true;
+        readinessController.abort();
         if (outcome === undefined) outcome = { result: { exitCode: code, ready: false } };
         finalize();
       });
+      let readiness: Promise<boolean>;
+      try {
+        readiness = Promise.resolve(this.readinessProbe.waitUntilReady({ child, signal: readinessController.signal }));
+      } catch (error) {
+        terminate({ error: new SshAdapterError('ssh-connection-failed', 'SSH readiness probe failed') });
+        return;
+      }
+      readiness.then(
+        ready => {
+          if (ready === true) terminate({ result: { exitCode: 0, ready: true } });
+          else terminate({ error: new SshAdapterError('ssh-connection-failed', 'SSH readiness probe failed') });
+        },
+        () => terminate({ error: new SshAdapterError('ssh-connection-failed', 'SSH readiness probe failed') }),
+      );
     });
   }
 }

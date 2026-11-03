@@ -119,17 +119,13 @@ test('fails closed when known-hosts resolution or OpenSSH execution fails', asyn
 
 test('requires authenticated readiness before treating a native -N process as connected', async () => {
   const runner: SshProcessRunner = {
-    requiresReadinessMarker: true,
-    run: async (_executable, args) => {
-      assert.ok(args.includes('-v'));
-      return { exitCode: 0, ready: true };
-    },
+    run: async () => ({ exitCode: 0, ready: true }),
   };
   await new OpenSshAgentAdapter(agentDependencies(runner)).connect({ profileId: 'production-api' });
 });
 
-test('native runner resolves on the authenticated marker and terminates the -N-style child', async () => {
-  const runner = new NativeOpenSshProcessRunner();
+test('native runner uses the injected readiness probe and terminates the -N-style child', async () => {
+  const runner = new NativeOpenSshProcessRunner({ waitUntilReady: async () => true });
   const result = await runner.run(
     process.execPath,
     ['-e', "process.stderr.write('debug1: Authentication succeeded (publickey).\\n'); setInterval(() => {}, 1000);"],
@@ -138,14 +134,17 @@ test('native runner resolves on the authenticated marker and terminates the -N-s
   assert.deepEqual(result, { exitCode: 0, ready: true });
 });
 
-test('native runner ignores pre-auth or remote text that is not the local debug line', async () => {
-  const runner = new NativeOpenSshProcessRunner();
-  const result = await runner.run(
+test('native runner never infers readiness from stderr and requires a trusted probe', async () => {
+  const runner = new NativeOpenSshProcessRunner({ waitUntilReady: async () => false });
+  await assert.rejects(runner.run(
     process.execPath,
-    ['-e', "process.stderr.write('Authenticated to attacker-controlled-output\\n'); setInterval(() => {}, 1000);"],
-    { timeoutMs: 20, shell: false },
+    ['-e', "process.stderr.write('debug1: Authentication succeeded (publickey).\\n'); setInterval(() => {}, 1000);"],
+    { timeoutMs: 100, shell: false },
+  ), error => error instanceof SshAdapterError && error.code === 'ssh-connection-failed');
+  await assert.rejects(
+    new NativeOpenSshProcessRunner().run(process.execPath, ['-e', 'setInterval(() => {}, 1000);'], { timeoutMs: 100, shell: false }),
+    error => error instanceof SshAdapterError && error.message === 'SSH readiness probe is unavailable',
   );
-  assert.deepEqual(result, { exitCode: null, ready: false });
 });
 
 test('rejects target delimiters and never turns them into an SSH destination', async () => {
