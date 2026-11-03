@@ -356,7 +356,8 @@ export interface SshAdapterDependencies {
 
 export interface OpenSshAgentAdapterDependencies extends SshAdapterDependencies {
   readonly executable?: OpenSshExecutableResolver;
-  readonly runner?: SshProcessRunner;
+  /** A runner with a trusted local readiness probe. */
+  readonly runner: SshProcessRunner;
 }
 
 function buildAgentArguments(descriptor: TrustedConnectionDescriptor, knownHostsPath: string, timeoutMs: number, targetPlatform: string): readonly string[] {
@@ -398,7 +399,7 @@ export class OpenSshAgentAdapter {
     this.realpath = dependencies.realpath ?? fsRealpath;
     this.targetPlatform = dependencies.targetPlatform ?? (typeof process === 'undefined' ? 'unknown' : process.platform);
     this.executable = dependencies.executable ?? new PlatformOpenSshExecutableResolver();
-    this.runner = dependencies.runner ?? new NativeOpenSshProcessRunner();
+    this.runner = dependencies.runner;
     this.timeoutMs = boundedTimeout(dependencies.timeoutMs);
   }
 
