@@ -87,7 +87,9 @@ const PROFILE_FIELDS = new Set([
   'credentialReference',
 ]);
 
+// eslint-disable-next-line no-control-regex -- control characters are rejected at this trust boundary
 const CONTROL_CHARACTERS = /[\u0000-\u001F\u007F]/u;
+// eslint-disable-next-line no-useless-escape -- the class intentionally includes literal brackets
 const WILDCARD_CHARACTERS = /[*?\[\]]/u;
 const FINGERPRINT = /^SHA256:[A-Za-z0-9+/]{43}$/u;
 const PROFILE_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
@@ -169,6 +171,7 @@ function validateProfileId(value: unknown): string {
 
 function validateFingerprint(value: unknown, field: string): string {
   const fingerprint = requiredString(value, field);
+  // eslint-disable-next-line no-useless-escape -- reject wildcard and bracket pattern characters
   if (!FINGERPRINT.test(fingerprint) || /\s|[*?\[\]{}]/u.test(fingerprint)) {
     fail('invalid-profile', `Connection profile field ${field} is invalid`);
   }
@@ -288,6 +291,7 @@ function validateEntry(entry: unknown): ApprovedKnownHostsEntry {
     fingerprint.trim() === '' ||
     CONTROL_CHARACTERS.test(fingerprint) ||
     !FINGERPRINT.test(fingerprint) ||
+    // eslint-disable-next-line no-useless-escape -- reject wildcard and bracket pattern characters
     /\s|[*?\[\]{}]/u.test(fingerprint)
   ) {
     fail('known-hosts-unavailable', 'Approved known-hosts data is unavailable');
