@@ -9,7 +9,7 @@ import {
   RedactedDiagnosticError,
   serializeAuditEvent,
   serializeDiagnosticError,
-} from '../../src/diagnostics/redacted-diagnostics-audit.ts';
+} from '../../src/diagnostics/redacted-diagnostics-audit.js';
 
 test('diagnostic errors use fixed messages and omit a provider error', () => {
   const raw = new Error('password=super-secret /srv/private/key stderr output');
