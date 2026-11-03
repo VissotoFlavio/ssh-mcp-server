@@ -51,6 +51,7 @@ const REFERENCE_PATTERN = /^os:\/\/([a-z][a-z0-9-]{0,31})\/([a-z0-9][a-z0-9._:-]
 const SECRET_MATERIAL_PATTERN = /(?:password|passphrase|private[\s_-]*key|secret|token)\s*[:=]/iu;
 const SECRET_LOCATOR_PATTERN = /^(?:password|passphrase|private[\s_-]*key|secret|token)$/iu;
 const PEM_PATTERN = /-----begin\s+(?:open\s+)?ssh|-----begin\s+private\s+key/iu;
+// eslint-disable-next-line no-control-regex -- rejecting control characters is part of the reference grammar
 const FORBIDDEN_CONTROL_PATTERN = /[\u0000-\u001F\u007F]/u;
 
 export interface ParsedCredentialReference {
