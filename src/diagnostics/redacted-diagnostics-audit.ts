@@ -23,14 +23,7 @@ export type ConnectionDiagnosticOutcome = 'success' | 'failure' | 'timeout';
 
 /** Stable, non-sensitive codes suitable for an MCP response or log sink. */
 export type ConnectionDiagnosticCode =
-  | 'success'
-  | 'unknown'
-  | 'invalid-input'
-  | 'provider-failure'
-  | 'timeout'
-  | 'host-key-failure'
-  | 'authentication-failure'
-  | 'connection-failure';
+  'success' | 'unknown' | 'invalid-input' | 'provider-failure' | 'timeout' | 'host-key-failure' | 'authentication-failure' | 'connection-failure';
 
 export interface RedactedDiagnosticErrorOptions {
   readonly code: unknown;
