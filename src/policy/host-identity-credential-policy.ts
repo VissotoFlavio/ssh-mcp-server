@@ -56,9 +56,7 @@ export interface AuthorizedConnection {
   readonly profile: ConnectionProfile;
   readonly knownHostsReference: string;
   readonly hostIdentity: ApprovedKnownHostsEntry;
-  readonly authentication:
-    | { readonly mode: 'agent-key' }
-    | { readonly mode: 'password'; readonly credentialReference: string };
+  readonly authentication: { readonly mode: 'agent-key' } | { readonly mode: 'password'; readonly credentialReference: string };
 }
 
 export type HostIdentityCredentialPolicyErrorCode =
@@ -76,16 +74,7 @@ export type HostIdentityCredentialPolicyErrorCode =
   | 'credential-reference-unapproved'
   | 'credential-resolver-unavailable';
 
-const SECRET_FIELDS = new Set([
-  'password',
-  'passphrase',
-  'privateKey',
-  'privateKeyContent',
-  'privateKeyPath',
-  'privateKeyFile',
-  'secret',
-  'token',
-]);
+const SECRET_FIELDS = new Set(['password', 'passphrase', 'privateKey', 'privateKeyContent', 'privateKeyPath', 'privateKeyFile', 'secret', 'token']);
 
 const PROFILE_FIELDS = new Set([
   'profileId',
@@ -197,7 +186,7 @@ export function validateProfileSelection(input: unknown): { readonly profileId: 
     }
   }
   const prototype = Object.getPrototypeOf(input);
-  if (prototype !== null && Reflect.ownKeys(prototype).some(key => key === 'profileId')) {
+  if (prototype !== null && Reflect.ownKeys(prototype).some((key) => key === 'profileId')) {
     fail('invalid-selection', 'Connection selection contains an unexpected inherited field');
   }
   return { profileId: validateProfileId(own(input, 'profileId')) };
@@ -281,7 +270,7 @@ function validateEntry(entry: unknown): ApprovedKnownHostsEntry {
     fail('known-hosts-unavailable', 'Approved known-hosts data is unavailable');
   }
   const keys = Reflect.ownKeys(entry);
-  if (keys.length !== 3 || !keys.every(key => typeof key === 'string' && ['host', 'port', 'fingerprint'].includes(key))) {
+  if (keys.length !== 3 || !keys.every((key) => typeof key === 'string' && ['host', 'port', 'fingerprint'].includes(key))) {
     fail('known-hosts-unavailable', 'Approved known-hosts data is unavailable');
   }
   const host = entry.host;
@@ -310,10 +299,7 @@ function validateEntry(entry: unknown): ApprovedKnownHostsEntry {
  * Check host identity and select an approved authentication mechanism. The
  * returned plan contains references and metadata only; no secret or key data.
  */
-export async function authorizeConnection(
-  input: unknown,
-  dependencies: HostIdentityCredentialPolicyDependencies,
-): Promise<AuthorizedConnection> {
+export async function authorizeConnection(input: unknown, dependencies: HostIdentityCredentialPolicyDependencies): Promise<AuthorizedConnection> {
   const selection = validateProfileSelection(input);
   if (!dependencies || typeof dependencies !== 'object') {
     fail('known-hosts-unavailable', 'Policy dependencies are unavailable');
@@ -344,7 +330,7 @@ export async function authorizeConnection(
   }
 
   const normalizedEntries = entries.map(validateEntry);
-  const matchingEndpoint = normalizedEntries.filter(entry => entry.host === profile.host && entry.port === profile.port);
+  const matchingEndpoint = normalizedEntries.filter((entry) => entry.host === profile.host && entry.port === profile.port);
   if (matchingEndpoint.length === 0) {
     fail('known-hosts-entry-missing', 'Approved known-hosts entry is missing');
   }

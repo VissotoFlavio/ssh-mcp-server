@@ -2,7 +2,11 @@ import { strict as assert } from 'node:assert';
 import test from 'node:test';
 
 import { validateConnectionProfile, validateProfileSelection } from '../../src/profiles/connection-profile.ts';
-import { PlatformCredentialStoreResolver, validateCredentialReference, type CredentialStoreCommandRunner } from '../../src/credentials/credential-store.ts';
+import {
+  PlatformCredentialStoreResolver,
+  validateCredentialReference,
+  type CredentialStoreCommandRunner,
+} from '../../src/credentials/credential-store.ts';
 import { authorizeConnection, HostIdentityCredentialPolicyError } from '../../src/policy/host-identity-credential-policy.ts';
 import {
   OpenSshAgentAdapter,
@@ -66,9 +70,7 @@ function descriptorFromAuthorized(authorizedProfile: {
     authMode: authorizedProfile.authMode,
     knownHostsReference: authorizedProfile.approvedKnownHostsReference,
     expectedHostFingerprint: authorizedProfile.expectedHostFingerprint,
-    ...(authorizedProfile.credentialReference === undefined
-      ? {}
-      : { credentialReference: authorizedProfile.credentialReference }),
+    ...(authorizedProfile.credentialReference === undefined ? {} : { credentialReference: authorizedProfile.credentialReference }),
   };
 }
 
@@ -90,8 +92,9 @@ test('agent-key flow accepts only a profile id and validates host identity befor
   };
   await new OpenSshAgentAdapter(adapterDependencies(descriptorFromAuthorized(authorized.profile), runner)).connect(selection);
   assert.equal(calls, 1);
-  await assert.rejects(authorizeConnection({ profileId: profile.profileId, host: 'attacker.example' }, policyDependencies()), error =>
-    error instanceof HostIdentityCredentialPolicyError && error.code === 'invalid-selection',
+  await assert.rejects(
+    authorizeConnection({ profileId: profile.profileId, host: 'attacker.example' }, policyDependencies()),
+    (error) => error instanceof HostIdentityCredentialPolicyError && error.code === 'invalid-selection',
   );
 });
 
@@ -112,15 +115,18 @@ test('password flow resolves an approved OS reference and keeps the password in 
   const ref = validateCredentialReference(profile.credentialReference);
   const credentialStore = credentialResolver.resolve(ref);
   assert.equal(credentialStore !== undefined, true);
-  const authorized = await authorizeConnection({ profileId: profile.profileId }, policyDependencies({
-    profiles: { getProfile: async () => passwordProfile },
-    credentialResolver: { isApproved: async (reference: string) => reference === profile.credentialReference },
-  }));
+  const authorized = await authorizeConnection(
+    { profileId: profile.profileId },
+    policyDependencies({
+      profiles: { getProfile: async () => passwordProfile },
+      credentialResolver: { isApproved: async (reference: string) => reference === profile.credentialReference },
+    }),
+  );
   assert.deepEqual(authorized.authentication, { mode: 'password', credentialReference: profile.credentialReference });
 
   let transportedPassword = '';
   const transport: InMemoryPasswordTransport = {
-    connect: async request => {
+    connect: async (request) => {
       transportedPassword = request.password;
       assert.equal(request.expectedHostFingerprint, fingerprint);
       assert.equal(request.strictHostKeyChecking, 'yes');
@@ -129,7 +135,7 @@ test('password flow resolves an approved OS reference and keeps the password in 
   await new PasswordSshAdapter({
     ...adapterDependencies(descriptorFromAuthorized(authorized.profile), { run: async () => ({ exitCode: 0, ready: true }) }),
     credentials: {
-      getPassword: async reference => credentialStore.getPassword(validateCredentialReference(reference)),
+      getPassword: async (reference) => credentialStore.getPassword(validateCredentialReference(reference)),
     },
     transport,
   }).connect({ profileId: profile.profileId });
@@ -138,37 +144,64 @@ test('password flow resolves an approved OS reference and keeps the password in 
   assert.throws(() => credentialResolver.resolve('os://ssh/staging-api'), /not approved/iu);
   assert.equal(credentialStoreCalls, 1);
   assert.doesNotMatch(serializeDiagnosticError(new Error('super-secret /srv/private/key')), /super-secret|private-key/iu);
-  assert.doesNotMatch(serializeAuditEvent({ profileId: profile.profileId, authMode: 'password', outcome: 'success', code: 'success' }), /super-secret|known_hosts/iu);
+  assert.doesNotMatch(
+    serializeAuditEvent({ profileId: profile.profileId, authMode: 'password', outcome: 'success', code: 'success' }),
+    /super-secret|known_hosts/iu,
+  );
 });
 
 test('host-key mismatch fails closed before authentication or transport', async () => {
   let authenticated = false;
   await assert.rejects(
-    authorizeConnection({ profileId: profile.profileId }, policyDependencies({
-      knownHosts: { getEntries: async () => [{ host: profile.host, port: profile.port, fingerprint: 'SHA256:2222222222222222222222222222222222222222222' }] },
-      agentIdentity: { isAvailable: async () => { authenticated = true; return true; } },
-    })),
-    error => error instanceof HostIdentityCredentialPolicyError && error.code === 'known-hosts-entry-mismatch',
+    authorizeConnection(
+      { profileId: profile.profileId },
+      policyDependencies({
+        knownHosts: {
+          getEntries: async () => [{ host: profile.host, port: profile.port, fingerprint: 'SHA256:2222222222222222222222222222222222222222222' }],
+        },
+        agentIdentity: {
+          isAvailable: async () => {
+            authenticated = true;
+            return true;
+          },
+        },
+      }),
+    ),
+    (error) => error instanceof HostIdentityCredentialPolicyError && error.code === 'known-hosts-entry-mismatch',
   );
   assert.equal(authenticated, false);
 
-  const approvedPassword = await authorizeConnection({ profileId: profile.profileId }, policyDependencies({
-    profiles: { getProfile: async () => ({ ...profile, authMode: 'password' as const }) },
-  }));
+  const approvedPassword = await authorizeConnection(
+    { profileId: profile.profileId },
+    policyDependencies({
+      profiles: { getProfile: async () => ({ ...profile, authMode: 'password' as const }) },
+    }),
+  );
   let credentialCalls = 0;
   let transportCalls = 0;
   const passwordDescriptor = descriptorFromAuthorized(approvedPassword.profile);
   await assert.rejects(
     new PasswordSshAdapter({
       profiles: { getConnection: async () => passwordDescriptor },
-      knownHosts: { resolve: async () => ({ path: '/srv/ssh/approved/known_hosts', fingerprint: 'SHA256:2222222222222222222222222222222222222222222' }) },
+      knownHosts: {
+        resolve: async () => ({ path: '/srv/ssh/approved/known_hosts', fingerprint: 'SHA256:2222222222222222222222222222222222222222222' }),
+      },
       trustedKnownHostsDirectory: '/srv/ssh',
       targetPlatform: 'linux',
       realpath: async (value: string) => value,
-      credentials: { getPassword: async () => { credentialCalls += 1; return { password: 'super-secret' }; } },
-      transport: { connect: async () => { transportCalls += 1; } },
+      credentials: {
+        getPassword: async () => {
+          credentialCalls += 1;
+          return { password: 'super-secret' };
+        },
+      },
+      transport: {
+        connect: async () => {
+          transportCalls += 1;
+        },
+      },
     }).connect({ profileId: profile.profileId }),
-    error => error instanceof SshAdapterError && error.code === 'known-hosts-fingerprint-mismatch',
+    (error) => error instanceof SshAdapterError && error.code === 'known-hosts-fingerprint-mismatch',
   );
   assert.equal(credentialCalls, 0);
   assert.equal(transportCalls, 0);

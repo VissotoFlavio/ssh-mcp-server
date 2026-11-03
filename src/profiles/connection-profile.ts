@@ -32,15 +32,7 @@ const PROFILE_KEYS = new Set([
   'approvedKnownHostsReference',
 ]);
 
-const SECRET_KEYS = new Set([
-  'password',
-  'passphrase',
-  'privateKey',
-  'privateKeyContent',
-  'privateKeyPath',
-  'secret',
-  'token',
-]);
+const SECRET_KEYS = new Set(['password', 'passphrase', 'privateKey', 'privateKeyContent', 'privateKeyPath', 'secret', 'token']);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -106,12 +98,7 @@ function requireOwnString(value: Record<string, unknown>, key: string): string {
 
 function requireProfileId(value: unknown): string {
   const profileId = requireString(value, 'profileId');
-  if (
-    profileId === '__proto__' ||
-    profileId === 'constructor' ||
-    profileId === 'prototype' ||
-    !/^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(profileId)
-  ) {
+  if (profileId === '__proto__' || profileId === 'constructor' || profileId === 'prototype' || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(profileId)) {
     throw new TypeError('profileId must use the canonical lowercase hyphenated form');
   }
 
@@ -155,9 +142,7 @@ export function validateConnectionProfile(input: unknown): ConnectionProfile {
 
   const knownHostsReference = requireOwnString(input, 'approvedKnownHostsReference');
 
-  const credentialReference = Object.prototype.hasOwnProperty.call(input, 'credentialReference')
-    ? input.credentialReference
-    : undefined;
+  const credentialReference = Object.prototype.hasOwnProperty.call(input, 'credentialReference') ? input.credentialReference : undefined;
   if (credentialReference !== undefined) {
     requireString(credentialReference, 'credentialReference');
   }

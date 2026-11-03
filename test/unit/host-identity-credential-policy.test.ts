@@ -37,7 +37,7 @@ function dependencies(overrides: Record<string, unknown> = {}) {
 }
 
 function assertPolicyError(action: () => unknown, code: HostIdentityCredentialPolicyError['code'], message: string): void {
-  assert.throws(action, error => {
+  assert.throws(action, (error) => {
     assert.ok(error instanceof HostIdentityCredentialPolicyError);
     assert.equal(error.code, code);
     assert.equal(error.message, message);
@@ -73,22 +73,27 @@ test('requires an approved known-hosts reference and rejects arbitrary paths or 
 test('fails closed on missing, mismatched, and ambiguous entries', async () => {
   await assert.rejects(
     authorizeConnection(selection, dependencies({ knownHosts: { getEntries: async () => [] } })),
-    error => error instanceof HostIdentityCredentialPolicyError && error.code === 'known-hosts-entry-missing',
+    (error) => error instanceof HostIdentityCredentialPolicyError && error.code === 'known-hosts-entry-missing',
   );
   await assert.rejects(
-    authorizeConnection(selection, dependencies({ knownHosts: { getEntries: async () => [{ ...matchingEntry, fingerprint: 'SHA256:2222222222222222222222222222222222222222222' }] } })),
-    error => error instanceof HostIdentityCredentialPolicyError && error.code === 'known-hosts-entry-mismatch',
+    authorizeConnection(
+      selection,
+      dependencies({
+        knownHosts: { getEntries: async () => [{ ...matchingEntry, fingerprint: 'SHA256:2222222222222222222222222222222222222222222' }] },
+      }),
+    ),
+    (error) => error instanceof HostIdentityCredentialPolicyError && error.code === 'known-hosts-entry-mismatch',
   );
   await assert.rejects(
     authorizeConnection(selection, dependencies({ knownHosts: { getEntries: async () => [matchingEntry, matchingEntry] } })),
-    error => error instanceof HostIdentityCredentialPolicyError && error.code === 'known-hosts-entry-ambiguous',
+    (error) => error instanceof HostIdentityCredentialPolicyError && error.code === 'known-hosts-entry-ambiguous',
   );
 });
 
 test('requires an agent identity and does not expose identity material', async () => {
   await assert.rejects(
     authorizeConnection(selection, dependencies({ agentIdentity: { isAvailable: async () => false } })),
-    error => error instanceof HostIdentityCredentialPolicyError && error.code === 'agent-identity-unavailable',
+    (error) => error instanceof HostIdentityCredentialPolicyError && error.code === 'agent-identity-unavailable',
   );
   const plan = await new HostIdentityCredentialPolicy(dependencies()).authorize(selection);
   assert.equal('privateKey' in plan, false);
@@ -101,8 +106,11 @@ test('password mode requires and approves only an opaque credential reference', 
   assert.deepEqual(plan.authentication, { mode: 'password', credentialReference: 'os://ssh/production-api' });
 
   await assert.rejects(
-    authorizeConnection(selection, dependencies({ profiles: { getProfile: async () => profile }, credentialResolver: { isApproved: async () => false } })),
-    error => error instanceof HostIdentityCredentialPolicyError && error.code === 'credential-reference-unapproved',
+    authorizeConnection(
+      selection,
+      dependencies({ profiles: { getProfile: async () => profile }, credentialResolver: { isApproved: async () => false } }),
+    ),
+    (error) => error instanceof HostIdentityCredentialPolicyError && error.code === 'credential-reference-unapproved',
   );
   assertPolicyError(
     () => validatePolicyProfile({ ...baseProfile, authMode: 'password' }),
@@ -155,7 +163,7 @@ test('public authorization resolves only a profile id from the trusted registry'
 
   await assert.rejects(
     authorizeConnection({ ...selection, host: 'attacker.example', port: 2222 }, trustedDependencies),
-    error => error instanceof HostIdentityCredentialPolicyError && error.code === 'invalid-selection',
+    (error) => error instanceof HostIdentityCredentialPolicyError && error.code === 'invalid-selection',
   );
   assert.equal(resolvedProfileId, '');
   assert.equal(resolverCalls, 0);
@@ -171,7 +179,7 @@ test('public authorization resolves only a profile id from the trusted registry'
 
   await assert.rejects(
     authorizeConnection(selection, dependencies({ profiles: { getProfile: async () => ({ ...baseProfile, profileId: 'other-profile' }) } })),
-    error => error instanceof HostIdentityCredentialPolicyError && error.code === 'trusted-profile-not-found',
+    (error) => error instanceof HostIdentityCredentialPolicyError && error.code === 'trusted-profile-not-found',
   );
 });
 
@@ -191,11 +199,8 @@ test('rejects malformed or pattern fingerprints at both trusted and known-host b
     );
   }
   await assert.rejects(
-    authorizeConnection(
-      selection,
-      dependencies({ knownHosts: { getEntries: async () => [{ ...matchingEntry, fingerprint: 'SHA256:*' }] } }),
-    ),
-    error => error instanceof HostIdentityCredentialPolicyError && error.message === 'Approved known-hosts data is unavailable',
+    authorizeConnection(selection, dependencies({ knownHosts: { getEntries: async () => [{ ...matchingEntry, fingerprint: 'SHA256:*' }] } })),
+    (error) => error instanceof HostIdentityCredentialPolicyError && error.message === 'Approved known-hosts data is unavailable',
   );
 });
 
@@ -220,21 +225,39 @@ test('rejects secret-like credential locators and PEM material without echoing t
 
 test('provider failures and malformed entries become deterministic redacted errors', async () => {
   await assert.rejects(
-    authorizeConnection(selection, dependencies({ knownHosts: { getEntries: async () => { throw new Error('private path'); } } })),
-    error => error instanceof HostIdentityCredentialPolicyError && error.message === 'Approved known-hosts data is unavailable',
+    authorizeConnection(
+      selection,
+      dependencies({
+        knownHosts: {
+          getEntries: async () => {
+            throw new Error('private path');
+          },
+        },
+      }),
+    ),
+    (error) => error instanceof HostIdentityCredentialPolicyError && error.message === 'Approved known-hosts data is unavailable',
   );
   await assert.rejects(
-    authorizeConnection(selection, dependencies({ knownHosts: { getEntries: async () => [{ host: '*', port: 22, fingerprint: 'SHA256:3333333333333333333333333333333333333333333' }] } })),
-    error => error instanceof HostIdentityCredentialPolicyError && error.message === 'Approved known-hosts data is unavailable',
+    authorizeConnection(
+      selection,
+      dependencies({
+        knownHosts: { getEntries: async () => [{ host: '*', port: 22, fingerprint: 'SHA256:3333333333333333333333333333333333333333333' }] },
+      }),
+    ),
+    (error) => error instanceof HostIdentityCredentialPolicyError && error.message === 'Approved known-hosts data is unavailable',
   );
   await assert.rejects(
     authorizeConnection(
       selection,
       dependencies({
         profiles: { getProfile: async () => ({ ...baseProfile, authMode: 'password' as const, credentialReference: 'os://ssh/production-api' }) },
-        credentialResolver: { isApproved: async () => { throw new Error('credential secret'); } },
+        credentialResolver: {
+          isApproved: async () => {
+            throw new Error('credential secret');
+          },
+        },
       }),
     ),
-    error => error instanceof HostIdentityCredentialPolicyError && error.message === 'Credential reference approval is unavailable',
+    (error) => error instanceof HostIdentityCredentialPolicyError && error.message === 'Credential reference approval is unavailable',
   );
 });

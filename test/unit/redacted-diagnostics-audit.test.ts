@@ -83,11 +83,14 @@ test('maps discriminator fields on Error and custom class instances without copy
 });
 
 test('fails closed for hostile proxy errors', () => {
-  const hostile = new Proxy({}, {
-    getPrototypeOf() {
-      throw new Error('prototype lookup failed');
+  const hostile = new Proxy(
+    {},
+    {
+      getPrototypeOf() {
+        throw new Error('prototype lookup failed');
+      },
     },
-  });
+  );
   const mapped = mapConnectionError(hostile);
   assert.equal(mapped.code, 'unknown');
   assert.doesNotMatch(serializeDiagnosticError(hostile), /prototype lookup failed/iu);
