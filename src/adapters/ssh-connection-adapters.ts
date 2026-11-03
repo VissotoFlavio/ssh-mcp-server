@@ -229,7 +229,7 @@ function validateTrustedDescriptor(value: unknown, selectedProfileId: string): T
   return {
     profileId,
     host,
-    port,
+    port: port as number,
     user,
     authMode,
     knownHostsReference,

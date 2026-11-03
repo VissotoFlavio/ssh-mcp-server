@@ -13,7 +13,7 @@ import {
   type OpenSshExecutableResolver,
   type SshProcessRunner,
   type TrustedConnectionDescriptor,
-} from '../../src/adapters/ssh-connection-adapters.ts';
+} from '../../src/adapters/ssh-connection-adapters.js';
 
 const agentProfile: TrustedConnectionDescriptor = {
   profileId: 'production-api',
