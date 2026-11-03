@@ -40,10 +40,16 @@ export interface CredentialReferenceApproval {
   isApproved(reference: string): boolean | Promise<boolean>;
 }
 
+export interface TrustedProfileProvider {
+  /** Resolve operator-owned profile metadata from a validated profile id. */
+  getProfile(profileId: string): unknown | Promise<unknown>;
+}
+
 export interface HostIdentityCredentialPolicyDependencies {
   readonly knownHosts: ApprovedKnownHostsProvider;
   readonly agentIdentity: AgentIdentityAvailability;
   readonly credentialResolver: CredentialReferenceApproval;
+  readonly profiles: TrustedProfileProvider;
 }
 
 export interface AuthorizedConnection {
@@ -57,6 +63,9 @@ export interface AuthorizedConnection {
 
 export type HostIdentityCredentialPolicyErrorCode =
   | 'invalid-profile'
+  | 'invalid-selection'
+  | 'trusted-profile-unavailable'
+  | 'trusted-profile-not-found'
   | 'invalid-known-hosts-reference'
   | 'known-hosts-unavailable'
   | 'known-hosts-entry-missing'
@@ -91,10 +100,12 @@ const PROFILE_FIELDS = new Set([
 
 const CONTROL_CHARACTERS = /[\u0000-\u001F\u007F]/u;
 const WILDCARD_CHARACTERS = /[*?\[\]]/u;
+const FINGERPRINT = /^SHA256:[A-Za-z0-9_-]+$/u;
 const PROFILE_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
 const KNOWN_HOSTS_REFERENCE = /^known-hosts:\/\/[a-z0-9]+(?:-[a-z0-9]+)*$/u;
 const CREDENTIAL_REFERENCE = /^os:\/\/([a-z][a-z0-9-]{0,31})\/([a-z0-9][a-z0-9._:-]{0,127})$/u;
-const SECRET_CREDENTIAL_LOCATOR = /^(?:password|passphrase|private[._-]*key|secret|token)$/iu;
+const SECRET_CREDENTIAL_LOCATOR = /^(?:password|passphrase|private[\s._-]*key|secret|token)(?:[:=]|$)/iu;
+const PEM_CREDENTIAL_VALUE = /-----begin(?:\s+(?:open\s+)?ssh|\s+private\s+key)[^-]*-----/iu;
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -167,6 +178,31 @@ function validateProfileId(value: unknown): string {
   return profileId;
 }
 
+function validateFingerprint(value: unknown, field: string): string {
+  const fingerprint = requiredString(value, field);
+  if (!FINGERPRINT.test(fingerprint) || /\s|[*?\[\]{}]/u.test(fingerprint)) {
+    fail('invalid-profile', `Connection profile field ${field} is invalid`);
+  }
+  return fingerprint;
+}
+
+/** Validate the only untrusted input accepted by the connection capability. */
+export function validateProfileSelection(input: unknown): { readonly profileId: string } {
+  if (!isPlainRecord(input)) {
+    fail('invalid-selection', 'Connection selection must contain only profileId');
+  }
+  for (const key of Reflect.ownKeys(input)) {
+    if (typeof key !== 'string' || key !== 'profileId') {
+      fail('invalid-selection', 'Connection selection contains an unexpected field');
+    }
+  }
+  const prototype = Object.getPrototypeOf(input);
+  if (prototype !== null && Reflect.ownKeys(prototype).some(key => key === 'profileId')) {
+    fail('invalid-selection', 'Connection selection contains an unexpected inherited field');
+  }
+  return { profileId: validateProfileId(own(input, 'profileId')) };
+}
+
 function validateHost(value: unknown): string {
   const host = requiredString(value, 'host');
   if (WILDCARD_CHARACTERS.test(host)) {
@@ -187,6 +223,9 @@ function validateCredentialReference(value: unknown): string | undefined {
   const reference = optionalString(value, 'credentialReference');
   if (reference === undefined) {
     return undefined;
+  }
+  if (PEM_CREDENTIAL_VALUE.test(reference)) {
+    fail('invalid-profile', 'Credential reference is invalid');
   }
   const match = CREDENTIAL_REFERENCE.exec(reference);
   const locator = match?.[2];
@@ -230,7 +269,7 @@ export function validatePolicyProfile(input: unknown): ConnectionProfile {
     host: validateHost(own(input, 'host')),
     port: port as number,
     user: requiredString(own(input, 'user'), 'user'),
-    expectedHostFingerprint: requiredString(own(input, 'expectedHostFingerprint'), 'expectedHostFingerprint'),
+    expectedHostFingerprint: validateFingerprint(own(input, 'expectedHostFingerprint'), 'expectedHostFingerprint'),
     authMode: authMode as AuthenticationMode,
     approvedKnownHostsReference: validateReference(own(input, 'approvedKnownHostsReference')),
     ...(credentialReference === undefined ? {} : { credentialReference }),
@@ -258,7 +297,9 @@ function validateEntry(entry: unknown): ApprovedKnownHostsEntry {
     (entry.port as number) > 65535 ||
     typeof fingerprint !== 'string' ||
     fingerprint.trim() === '' ||
-    CONTROL_CHARACTERS.test(fingerprint)
+    CONTROL_CHARACTERS.test(fingerprint) ||
+    !FINGERPRINT.test(fingerprint) ||
+    /\s|[*?\[\]{}]/u.test(fingerprint)
   ) {
     fail('known-hosts-unavailable', 'Approved known-hosts data is unavailable');
   }
@@ -273,9 +314,23 @@ export async function authorizeConnection(
   input: unknown,
   dependencies: HostIdentityCredentialPolicyDependencies,
 ): Promise<AuthorizedConnection> {
-  const profile = validatePolicyProfile(input);
+  const selection = validateProfileSelection(input);
   if (!dependencies || typeof dependencies !== 'object') {
     fail('known-hosts-unavailable', 'Policy dependencies are unavailable');
+  }
+
+  let trustedProfile: unknown;
+  try {
+    trustedProfile = await dependencies.profiles.getProfile(selection.profileId);
+  } catch {
+    fail('trusted-profile-unavailable', 'Trusted connection profile is unavailable');
+  }
+  if (trustedProfile === undefined || trustedProfile === null) {
+    fail('trusted-profile-not-found', 'Trusted connection profile was not found');
+  }
+  const profile = validatePolicyProfile(trustedProfile);
+  if (profile.profileId !== selection.profileId) {
+    fail('trusted-profile-not-found', 'Trusted connection profile was not found');
   }
 
   let entries: readonly ApprovedKnownHostsEntry[];
