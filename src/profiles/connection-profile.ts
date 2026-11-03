@@ -142,10 +142,8 @@ export function validateConnectionProfile(input: unknown): ConnectionProfile {
 
   const knownHostsReference = requireOwnString(input, 'approvedKnownHostsReference');
 
-  const credentialReference = Object.prototype.hasOwnProperty.call(input, 'credentialReference') ? input.credentialReference : undefined;
-  if (credentialReference !== undefined) {
-    requireString(credentialReference, 'credentialReference');
-  }
+  const rawCredentialReference = Object.prototype.hasOwnProperty.call(input, 'credentialReference') ? input.credentialReference : undefined;
+  const credentialReference = rawCredentialReference === undefined ? undefined : requireString(rawCredentialReference, 'credentialReference');
   if (authMode === 'password' && credentialReference === undefined) {
     throw new TypeError('password authentication requires a credentialReference');
   }
