@@ -115,10 +115,10 @@ export class SshAdapterError extends Error {
 }
 
 const PROFILE_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
+// eslint-disable-next-line no-control-regex -- control characters are rejected at this trust boundary
 const CONTROL_CHARACTERS = /[\u0000-\u001F\u007F]/u;
 const ABSOLUTE_POSIX_PATH = /^\//u;
 const ABSOLUTE_WINDOWS_PATH = /^[A-Za-z]:[\\/]/u;
-const WILDCARD_CHARACTERS = /[*?\[\]]/u;
 const HOST_WILDCARD_CHARACTERS = /[*?]/u;
 const TARGET_DELIMITER_CHARACTERS = /[\s@:/\\]/u;
 const OPENSSH_SHA256_FINGERPRINT = /^SHA256:[A-Za-z0-9+/]{43}$/u;
@@ -246,12 +246,7 @@ function boundedTimeout(value: number | undefined): number {
 async function withAbortTimeout<T>(start: (signal: AbortSignal) => Promise<T>, timeoutMs: number): Promise<T> {
   const controller = new AbortController();
   let timedOut = false;
-  let operation: Promise<T>;
-  try {
-    operation = Promise.resolve(start(controller.signal));
-  } catch (error) {
-    throw error;
-  }
+  const operation = Promise.resolve(start(controller.signal));
   return new Promise((resolve, reject) => {
     let settled = false;
     let graceTimer: ReturnType<typeof setTimeout> | undefined;
@@ -601,7 +596,7 @@ export class NativeOpenSshProcessRunner implements SshProcessRunner {
       let readiness: Promise<boolean>;
       try {
         readiness = Promise.resolve(this.readinessProbe.waitUntilReady({ child, signal: readinessController.signal }));
-      } catch (error) {
+      } catch {
         terminate({ error: new SshAdapterError('ssh-connection-failed', 'SSH readiness probe failed') });
         return;
       }
