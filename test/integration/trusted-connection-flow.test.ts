@@ -81,8 +81,12 @@ test('agent-key flow accepts only a profile id and validates host identity befor
 
 test('password flow resolves an approved OS reference and keeps the password in transport memory', async () => {
   const passwordProfile = { ...profile, authMode: 'password' as const };
+  let credentialStoreCalls = 0;
   const commandRunner: CredentialStoreCommandRunner = {
-    run: async () => ({ stdout: 'super-secret\n' }),
+    run: async () => {
+      credentialStoreCalls += 1;
+      return { stdout: 'super-secret\n' };
+    },
   };
   const credentialResolver = new PlatformCredentialStoreResolver({
     platform: 'linux',
@@ -90,7 +94,8 @@ test('password flow resolves an approved OS reference and keeps the password in 
     approvedReferences: [profile.credentialReference],
   });
   const ref = validateCredentialReference(profile.credentialReference);
-  assert.equal(credentialResolver.resolve(ref) !== undefined, true);
+  const credentialStore = credentialResolver.resolve(ref);
+  assert.equal(credentialStore !== undefined, true);
   const authorized = await authorizeConnection({ profileId: profile.profileId }, policyDependencies({
     profiles: { getProfile: async () => passwordProfile },
     credentialResolver: { isApproved: async (reference: string) => reference === profile.credentialReference },
@@ -116,10 +121,15 @@ test('password flow resolves an approved OS reference and keeps the password in 
       expectedHostFingerprint: fingerprint,
       credentialReference: profile.credentialReference,
     }, { run: async () => ({ exitCode: 0, ready: true }) }),
-    credentials: { getPassword: async () => ({ password: 'super-secret' }) },
+    credentials: {
+      getPassword: async reference => credentialStore.getPassword(validateCredentialReference(reference)),
+    },
     transport,
   }).connect({ profileId: profile.profileId });
   assert.equal(transportedPassword, 'super-secret');
+  assert.equal(credentialStoreCalls, 1);
+  assert.throws(() => credentialResolver.resolve('os://ssh/staging-api'), /not approved/iu);
+  assert.equal(credentialStoreCalls, 1);
   assert.doesNotMatch(serializeDiagnosticError(new Error('super-secret /srv/private/key')), /super-secret|private-key/iu);
   assert.doesNotMatch(serializeAuditEvent({ profileId: profile.profileId, authMode: 'password', outcome: 'success', code: 'success' }), /super-secret|known_hosts/iu);
 });
@@ -134,6 +144,33 @@ test('host-key mismatch fails closed before authentication or transport', async 
     error => error instanceof HostIdentityCredentialPolicyError && error.code === 'known-hosts-entry-mismatch',
   );
   assert.equal(authenticated, false);
+
+  let credentialCalls = 0;
+  let transportCalls = 0;
+  const passwordDescriptor: TrustedConnectionDescriptor = {
+    profileId: profile.profileId,
+    host: profile.host,
+    port: profile.port,
+    user: profile.user,
+    authMode: 'password',
+    knownHostsReference: profile.approvedKnownHostsReference,
+    expectedHostFingerprint: fingerprint,
+    credentialReference: profile.credentialReference,
+  };
+  await assert.rejects(
+    new PasswordSshAdapter({
+      profiles: { getConnection: async () => passwordDescriptor },
+      knownHosts: { resolve: async () => ({ path: '/srv/ssh/approved/known_hosts', fingerprint: 'SHA256:2222222222222222222222222222222222222222222' }) },
+      trustedKnownHostsDirectory: '/srv/ssh',
+      targetPlatform: 'linux',
+      realpath: async (value: string) => value,
+      credentials: { getPassword: async () => { credentialCalls += 1; return { password: 'super-secret' }; } },
+      transport: { connect: async () => { transportCalls += 1; } },
+    }).connect({ profileId: profile.profileId }),
+    error => error instanceof SshAdapterError && error.code === 'known-hosts-fingerprint-mismatch',
+  );
+  assert.equal(credentialCalls, 0);
+  assert.equal(transportCalls, 0);
 });
 
 test('arbitrary profile inputs and adapter errors remain redacted', async () => {
