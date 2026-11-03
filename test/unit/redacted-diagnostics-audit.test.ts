@@ -41,6 +41,18 @@ test('maps class-instance adapter errors and rejects contradictory success state
   assert.equal(contradictory.outcome, 'failure');
 });
 
+test('maps credential-store and host-reference discriminator codes', () => {
+  class CredentialError extends Error {
+    readonly code = 'credential-store-failure';
+  }
+  class HostReferenceError extends Error {
+    readonly code = 'invalid-known-hosts-reference';
+  }
+
+  assert.equal(mapConnectionError(new CredentialError()).code, 'provider-failure');
+  assert.equal(mapConnectionError(new HostReferenceError()).code, 'invalid-input');
+});
+
 test('normalizes forged or mutated diagnostic objects at serialization', () => {
   const diagnostic = new RedactedDiagnosticError('success');
   const forged = { code: 'password=/tmp/secret', stage: 'transport', outcome: 'success' };
@@ -68,6 +80,17 @@ test('maps discriminator fields on Error and custom class instances without copy
   assert.equal(diagnostic.stage, 'host-key-verification');
   assert.equal(serializeDiagnosticError(error).includes('fingerprint=secret'), false);
   assert.equal(serializeDiagnosticError(error).includes('db.internal.example'), false);
+});
+
+test('fails closed for hostile proxy errors', () => {
+  const hostile = new Proxy({}, {
+    getPrototypeOf() {
+      throw new Error('prototype lookup failed');
+    },
+  });
+  const mapped = mapConnectionError(hostile);
+  assert.equal(mapped.code, 'unknown');
+  assert.doesNotMatch(serializeDiagnosticError(hostile), /prototype lookup failed/iu);
 });
 
 test('diagnostic serialization is an allowlisted safe payload', () => {

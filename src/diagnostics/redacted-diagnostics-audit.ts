@@ -105,6 +105,14 @@ function discriminator(value: unknown, key: string): unknown {
   }
 }
 
+function isRedactedDiagnosticError(value: unknown): value is RedactedDiagnosticError {
+  try {
+    return value instanceof RedactedDiagnosticError;
+  } catch {
+    return false;
+  }
+}
+
 function safeString(value: unknown): string | undefined {
   return typeof value === 'string' && value.length <= MAX_DIAGNOSTIC_CODE_LENGTH ? value : undefined;
 }
@@ -127,8 +135,8 @@ function normalizeOutcome(value: unknown): ConnectionDiagnosticOutcome | undefin
 function normalizeCode(value: unknown): ConnectionDiagnosticCode | undefined {
   if (value === 'success' || value === 'ok' || value === 'completed') return 'success';
   if (value === 'unknown') return 'unknown';
-  if (value === 'invalid-input' || value === 'invalid-selection' || value === 'invalid-profile') return 'invalid-input';
-  if (value === 'provider-failure' || value === 'provider' || value === 'trusted-profile-unavailable' || value === 'trusted-profile-not-found' || value === 'invalid-trusted-profile' || value === 'credential-resolver-unavailable') {
+  if (value === 'invalid-input' || value === 'invalid-selection' || value === 'invalid-profile' || value === 'invalid-reference' || value === 'invalid-known-hosts-reference') return 'invalid-input';
+  if (value === 'provider-failure' || value === 'provider' || value === 'trusted-profile-unavailable' || value === 'trusted-profile-not-found' || value === 'invalid-trusted-profile' || value === 'credential-resolver-unavailable' || value === 'unsupported-platform' || value === 'unsupported-provider' || value === 'unapproved-reference' || value === 'credential-unavailable' || value === 'credential-store-failure') {
     return 'provider-failure';
   }
   if (value === 'timeout' || value === 'ssh-timeout' || value === 'ETIMEDOUT' || value === 'TIMEOUT') return 'timeout';
@@ -233,7 +241,7 @@ function classifyProviderCode(value: unknown): ConnectionDiagnosticCode | undefi
  * serialized, used as a cause, or included in a message.
  */
 export function mapConnectionError(error: unknown, context?: unknown): RedactedDiagnosticError {
-  if (error instanceof RedactedDiagnosticError) {
+  if (isRedactedDiagnosticError(error)) {
     return new RedactedDiagnosticError({ code: error.code, stage: error.stage, outcome: error.outcome });
   }
 
@@ -341,7 +349,7 @@ export function buildAuditEvent(input: unknown): ConnectionAuditEvent {
 }
 
 export function serializeDiagnosticError(error: unknown): string {
-  const safeError = error instanceof RedactedDiagnosticError ? error : mapConnectionError(error);
+  const safeError = isRedactedDiagnosticError(error) ? error : mapConnectionError(error);
   return JSON.stringify(diagnosticErrorPayload(safeError));
 }
 
