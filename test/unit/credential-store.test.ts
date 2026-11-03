@@ -13,9 +13,11 @@ import {
 class FakeRunner implements CredentialStoreCommandRunner {
   public executable = '';
   public args: readonly string[] = [];
+  public calls = 0;
   public result: CredentialStoreCommandResult = { stdout: 'approved-password\n' };
 
   run(executable: string, args: readonly string[]): Promise<CredentialStoreCommandResult> {
+    this.calls += 1;
     this.executable = executable;
     this.args = args;
     return Promise.resolve(this.result);
@@ -53,7 +55,10 @@ test('rejects secret material, controls, and command-like reference values', () 
 });
 
 test('fails closed on unsupported platforms', () => {
-  const resolver = new PlatformCredentialStoreResolver({ platform: 'win32' });
+  const resolver = new PlatformCredentialStoreResolver({
+    platform: 'win32',
+    approvedReferences: ['os://ssh/production-api'],
+  });
 
   assert.throws(() => resolver.resolve('os://ssh/production-api'), error => {
     assert.ok(error instanceof CredentialStoreError);
@@ -65,13 +70,17 @@ test('fails closed on unsupported platforms', () => {
 
 test('passes only validated argv to a direct platform provider and never logs its output', async () => {
   const runner = new FakeRunner();
-  const resolver = new PlatformCredentialStoreResolver({ platform: 'linux', runner });
+  const resolver = new PlatformCredentialStoreResolver({
+    platform: 'linux',
+    runner,
+    approvedReferences: ['os://ssh/production-api'],
+  });
   const reference = validateCredentialReference('os://ssh/production-api');
   const store = resolver.resolve(reference);
   const credential = await store.getPassword(reference);
 
   assert.deepEqual(credential, { password: 'approved-password' });
-  assert.equal(runner.executable, 'secret-tool');
+  assert.equal(runner.executable, '/usr/bin/secret-tool');
   assert.deepEqual(runner.args, ['lookup', 'service', 'ssh', 'account', 'production-api']);
 });
 
@@ -81,7 +90,11 @@ test('redacts provider failures and does not surface command stderr', async () =
       throw new Error('stderr contained approved-password');
     },
   };
-  const resolver = new PlatformCredentialStoreResolver({ platform: 'darwin', runner });
+  const resolver = new PlatformCredentialStoreResolver({
+    platform: 'darwin',
+    runner,
+    approvedReferences: ['os://ssh/production-api'],
+  });
   const reference = validateCredentialReference('os://ssh/production-api');
 
   await assert.rejects(resolver.resolve(reference).getPassword(reference), error => {
@@ -91,6 +104,52 @@ test('redacts provider failures and does not surface command stderr', async () =
     assert.doesNotMatch(error.message, /approved-password/);
     return true;
   });
+});
+
+test('rejects unapproved references before invoking the runner', () => {
+  const runner = new FakeRunner();
+  const resolver = new PlatformCredentialStoreResolver({
+    platform: 'linux',
+    runner,
+    approvedReferences: ['os://ssh/production-api'],
+  });
+
+  assert.throws(() => resolver.resolve('os://ssh/staging-api'), error => {
+    assert.ok(error instanceof CredentialStoreError);
+    assert.equal(error.code, 'unapproved-reference');
+    assert.equal(error.message, 'Credential reference is not approved');
+    return true;
+  });
+  assert.equal(runner.calls, 0);
+});
+
+test('allows only the ssh provider before invoking the runner', () => {
+  const runner = new FakeRunner();
+  const resolver = new PlatformCredentialStoreResolver({
+    platform: 'linux',
+    runner,
+    approvedReferences: ['os://other/production-api'],
+  });
+
+  assert.throws(() => resolver.resolve('os://other/production-api'), error => {
+    assert.ok(error instanceof CredentialStoreError);
+    assert.equal(error.code, 'unsupported-provider');
+    assert.equal(error.message, 'Credential store provider is unsupported');
+    return true;
+  });
+  assert.equal(runner.calls, 0);
+});
+
+test('fails closed when no approved references are configured', () => {
+  const runner = new FakeRunner();
+  const resolver = new PlatformCredentialStoreResolver({ platform: 'linux', runner });
+
+  assert.throws(() => resolver.resolve('os://ssh/production-api'), error => {
+    assert.ok(error instanceof CredentialStoreError);
+    assert.equal(error.code, 'unapproved-reference');
+    return true;
+  });
+  assert.equal(runner.calls, 0);
 });
 
 test('rejects an overlong or malformed reference without echoing it', () => {

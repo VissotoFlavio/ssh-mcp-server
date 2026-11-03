@@ -29,6 +29,7 @@ export type CredentialStoreErrorCode =
   | 'invalid-reference'
   | 'unsupported-platform'
   | 'unsupported-provider'
+  | 'unapproved-reference'
   | 'credential-unavailable'
   | 'credential-store-failure';
 
@@ -104,7 +105,7 @@ export interface CredentialStoreCommandResult {
   readonly stdout: string;
 }
 
-export type CredentialStoreExecutable = 'security' | 'secret-tool';
+export type CredentialStoreExecutable = '/usr/bin/security' | '/usr/bin/secret-tool';
 
 export interface CredentialStoreCommandRunner {
   run(executable: CredentialStoreExecutable, args: readonly string[]): Promise<CredentialStoreCommandResult>;
@@ -114,6 +115,8 @@ export interface PlatformCredentialStoreResolverOptions {
   readonly platform?: string;
   readonly runner?: CredentialStoreCommandRunner;
   readonly timeoutMs?: number;
+  /** References configured by the operator; absent means no reference is approved. */
+  readonly approvedReferences?: readonly string[] | ReadonlySet<string>;
 }
 
 export type SupportedCredentialStorePlatform = 'darwin' | 'linux';
@@ -135,8 +138,8 @@ function requirePassword(stdout: string): PasswordCredential {
 
 /**
  * Platform adapter for the two OS stores whose command-line clients expose a
- * read operation. It is intentionally provider-agnostic: the provider and
- * locator become data arguments only after reference validation.
+ * read operation. The provider and locator become data arguments only after
+ * reference and approval validation.
  */
 class NativeCommandCredentialStore implements CredentialStore {
   constructor(
@@ -155,7 +158,7 @@ class NativeCommandCredentialStore implements CredentialStore {
       this.platform === 'darwin'
         ? ['find-generic-password', '-a', parsed.locator, '-s', parsed.provider, '-w']
         : ['lookup', 'service', parsed.provider, 'account', parsed.locator];
-    const executable = this.platform === 'darwin' ? 'security' : 'secret-tool';
+    const executable = this.platform === 'darwin' ? '/usr/bin/security' : '/usr/bin/secret-tool';
 
     let result: CredentialStoreCommandResult;
     try {
@@ -180,14 +183,24 @@ class NativeCommandCredentialStore implements CredentialStore {
 export class PlatformCredentialStoreResolver implements CredentialStoreResolver {
   private readonly platform: string;
   private readonly runner: CredentialStoreCommandRunner;
+  private readonly approvedReferences: ReadonlySet<string>;
 
   constructor(options: PlatformCredentialStoreResolverOptions = {}) {
     this.platform = options.platform ?? (typeof process === 'undefined' ? 'unknown' : process.platform);
     this.runner = options.runner ?? new DirectSpawnCredentialStoreCommandRunner(options.timeoutMs);
+    this.approvedReferences = new Set(
+      [...(options.approvedReferences ?? [])].map(reference => parseCredentialReference(reference).reference),
+    );
   }
 
   resolve(reference: string): CredentialStore {
     const parsed = parseCredentialReference(reference);
+    if (parsed.provider !== 'ssh') {
+      throw new CredentialStoreError('unsupported-provider', 'Credential store provider is unsupported');
+    }
+    if (!this.approvedReferences.has(parsed.reference)) {
+      throw new CredentialStoreError('unapproved-reference', 'Credential reference is not approved');
+    }
     if (!isSupportedPlatform(this.platform)) {
       throw new CredentialStoreError('unsupported-platform', 'OS credential store is unavailable');
     }
@@ -207,7 +220,10 @@ export class DirectSpawnCredentialStoreCommandRunner implements CredentialStoreC
     this.timeoutMs = Number.isInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= 60_000 ? timeoutMs : 10_000;
   }
 
-  run(executable: CredentialStoreExecutable, args: readonly string[]): Promise<CredentialStoreCommandResult> {
+  run(
+    executable: CredentialStoreExecutable,
+    args: readonly string[],
+  ): Promise<CredentialStoreCommandResult> {
     return new Promise((resolve, reject) => {
       const child = spawn(executable, [...args], {
         shell: false,
@@ -270,5 +286,6 @@ export function createPlatformCredentialStoreResolver(
     platform: options.platform ?? (typeof process === 'undefined' ? 'unknown' : process.platform),
     runner: options.runner,
     timeoutMs: options.timeoutMs,
+    approvedReferences: options.approvedReferences,
   });
 }
