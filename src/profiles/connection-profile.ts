@@ -48,6 +48,7 @@ function requireString(value: unknown, field: string): string {
     throw new TypeError(`${field} must be a non-empty string`);
   }
 
+  // eslint-disable-next-line no-control-regex, no-useless-escape -- reject control and delimiter characters
   if (/[\u0000-\u001F\u007F\[\]{}]/u.test(value)) {
     throw new TypeError(`${field} contains forbidden control characters`);
   }
