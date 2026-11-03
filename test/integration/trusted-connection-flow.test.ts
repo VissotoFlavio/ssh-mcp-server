@@ -1,13 +1,13 @@
 import { strict as assert } from 'node:assert';
 import test from 'node:test';
 
-import { validateConnectionProfile, validateProfileSelection } from '../../src/profiles/connection-profile.ts';
+import { validateConnectionProfile, validateProfileSelection } from '../../src/profiles/connection-profile.js';
 import {
   PlatformCredentialStoreResolver,
   validateCredentialReference,
   type CredentialStoreCommandRunner,
-} from '../../src/credentials/credential-store.ts';
-import { authorizeConnection, HostIdentityCredentialPolicyError } from '../../src/policy/host-identity-credential-policy.ts';
+} from '../../src/credentials/credential-store.js';
+import { authorizeConnection, HostIdentityCredentialPolicyError } from '../../src/policy/host-identity-credential-policy.js';
 import {
   OpenSshAgentAdapter,
   PasswordSshAdapter,
@@ -15,8 +15,8 @@ import {
   type InMemoryPasswordTransport,
   type SshProcessRunner,
   type TrustedConnectionDescriptor,
-} from '../../src/adapters/ssh-connection-adapters.ts';
-import { mapConnectionError, serializeAuditEvent, serializeDiagnosticError } from '../../src/diagnostics/redacted-diagnostics-audit.ts';
+} from '../../src/adapters/ssh-connection-adapters.js';
+import { mapConnectionError, serializeAuditEvent, serializeDiagnosticError } from '../../src/diagnostics/redacted-diagnostics-audit.js';
 
 const fingerprint = 'SHA256:1111111111111111111111111111111111111111111';
 const profile = {

@@ -7,7 +7,7 @@ import {
   HostIdentityCredentialPolicyError,
   validateProfileSelection,
   validatePolicyProfile,
-} from '../../src/policy/host-identity-credential-policy.ts';
+} from '../../src/policy/host-identity-credential-policy.js';
 
 const baseProfile = {
   profileId: 'production-api',
