@@ -14,7 +14,7 @@ const baseProfile = {
   host: 'api.internal.example',
   port: 22,
   user: 'deploy',
-  expectedHostFingerprint: 'SHA256:approved',
+  expectedHostFingerprint: 'SHA256:1111111111111111111111111111111111111111111',
   approvedKnownHostsReference: 'known-hosts://production-api',
   authMode: 'agent-key' as const,
 };
@@ -76,7 +76,7 @@ test('fails closed on missing, mismatched, and ambiguous entries', async () => {
     error => error instanceof HostIdentityCredentialPolicyError && error.code === 'known-hosts-entry-missing',
   );
   await assert.rejects(
-    authorizeConnection(selection, dependencies({ knownHosts: { getEntries: async () => [{ ...matchingEntry, fingerprint: 'SHA256:other' }] } })),
+    authorizeConnection(selection, dependencies({ knownHosts: { getEntries: async () => [{ ...matchingEntry, fingerprint: 'SHA256:2222222222222222222222222222222222222222222' }] } })),
     error => error instanceof HostIdentityCredentialPolicyError && error.code === 'known-hosts-entry-mismatch',
   );
   await assert.rejects(
@@ -176,7 +176,14 @@ test('public authorization resolves only a profile id from the trusted registry'
 });
 
 test('rejects malformed or pattern fingerprints at both trusted and known-host boundaries', async () => {
-  for (const fingerprint of ['SHA256:*', 'SHA256:with space', 'ssh-rsa AAAA', 'SHA256:']) {
+  for (const fingerprint of [
+    'SHA256:*',
+    'SHA256:with space',
+    'ssh-rsa AAAA',
+    'SHA256:',
+    `SHA256:${'ab-_'.repeat(10)}abc`,
+    `SHA256:${'a'.repeat(42)}=`,
+  ]) {
     assertPolicyError(
       () => validatePolicyProfile({ ...baseProfile, expectedHostFingerprint: fingerprint }),
       'invalid-profile',
@@ -190,6 +197,11 @@ test('rejects malformed or pattern fingerprints at both trusted and known-host b
     ),
     error => error instanceof HostIdentityCredentialPolicyError && error.message === 'Approved known-hosts data is unavailable',
   );
+});
+
+test('accepts a valid unpadded standard-Base64 SSH fingerprint', () => {
+  const fingerprint = `SHA256:${'ab+/'.repeat(10)}abc`;
+  assert.equal(validatePolicyProfile({ ...baseProfile, expectedHostFingerprint: fingerprint }).expectedHostFingerprint, fingerprint);
 });
 
 test('rejects secret-like credential locators and PEM material without echoing them', () => {
@@ -212,7 +224,7 @@ test('provider failures and malformed entries become deterministic redacted erro
     error => error instanceof HostIdentityCredentialPolicyError && error.message === 'Approved known-hosts data is unavailable',
   );
   await assert.rejects(
-    authorizeConnection(selection, dependencies({ knownHosts: { getEntries: async () => [{ host: '*', port: 22, fingerprint: 'SHA256:x' }] } })),
+    authorizeConnection(selection, dependencies({ knownHosts: { getEntries: async () => [{ host: '*', port: 22, fingerprint: 'SHA256:3333333333333333333333333333333333333333333' }] } })),
     error => error instanceof HostIdentityCredentialPolicyError && error.message === 'Approved known-hosts data is unavailable',
   );
   await assert.rejects(

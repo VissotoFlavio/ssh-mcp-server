@@ -100,7 +100,7 @@ const PROFILE_FIELDS = new Set([
 
 const CONTROL_CHARACTERS = /[\u0000-\u001F\u007F]/u;
 const WILDCARD_CHARACTERS = /[*?\[\]]/u;
-const FINGERPRINT = /^SHA256:[A-Za-z0-9_-]+$/u;
+const FINGERPRINT = /^SHA256:[A-Za-z0-9+/]{43}$/u;
 const PROFILE_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
 const KNOWN_HOSTS_REFERENCE = /^known-hosts:\/\/[a-z0-9]+(?:-[a-z0-9]+)*$/u;
 const CREDENTIAL_REFERENCE = /^os:\/\/([a-z][a-z0-9-]{0,31})\/([a-z0-9][a-z0-9._:-]{0,127})$/u;
