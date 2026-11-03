@@ -48,6 +48,30 @@ function adapterDependencies(descriptor: TrustedConnectionDescriptor, runner: Ss
   };
 }
 
+function descriptorFromAuthorized(authorizedProfile: {
+  profileId: string;
+  host: string;
+  port: number;
+  user: string;
+  authMode: 'agent-key' | 'password';
+  approvedKnownHostsReference: string;
+  expectedHostFingerprint: string;
+  credentialReference?: string;
+}): TrustedConnectionDescriptor {
+  return {
+    profileId: authorizedProfile.profileId,
+    host: authorizedProfile.host,
+    port: authorizedProfile.port,
+    user: authorizedProfile.user,
+    authMode: authorizedProfile.authMode,
+    knownHostsReference: authorizedProfile.approvedKnownHostsReference,
+    expectedHostFingerprint: authorizedProfile.expectedHostFingerprint,
+    ...(authorizedProfile.credentialReference === undefined
+      ? {}
+      : { credentialReference: authorizedProfile.credentialReference }),
+  };
+}
+
 test('agent-key flow accepts only a profile id and validates host identity before OpenSSH', async () => {
   const selection = validateProfileSelection({ profileId: profile.profileId });
   assert.deepEqual(validateConnectionProfile(profile), profile);
@@ -64,15 +88,7 @@ test('agent-key flow accepts only a profile id and validates host identity befor
       return { exitCode: 0, ready: true };
     },
   };
-  await new OpenSshAgentAdapter(adapterDependencies({
-    profileId: profile.profileId,
-    host: profile.host,
-    port: profile.port,
-    user: profile.user,
-    authMode: profile.authMode,
-    knownHostsReference: profile.approvedKnownHostsReference,
-    expectedHostFingerprint: fingerprint,
-  }, runner)).connect(selection);
+  await new OpenSshAgentAdapter(adapterDependencies(descriptorFromAuthorized(authorized.profile), runner)).connect(selection);
   assert.equal(calls, 1);
   await assert.rejects(authorizeConnection({ profileId: profile.profileId, host: 'attacker.example' }, policyDependencies()), error =>
     error instanceof HostIdentityCredentialPolicyError && error.code === 'invalid-selection',
@@ -111,16 +127,7 @@ test('password flow resolves an approved OS reference and keeps the password in 
     },
   };
   await new PasswordSshAdapter({
-    ...adapterDependencies({
-      profileId: profile.profileId,
-      host: profile.host,
-      port: profile.port,
-      user: profile.user,
-      authMode: 'password',
-      knownHostsReference: profile.approvedKnownHostsReference,
-      expectedHostFingerprint: fingerprint,
-      credentialReference: profile.credentialReference,
-    }, { run: async () => ({ exitCode: 0, ready: true }) }),
+    ...adapterDependencies(descriptorFromAuthorized(authorized.profile), { run: async () => ({ exitCode: 0, ready: true }) }),
     credentials: {
       getPassword: async reference => credentialStore.getPassword(validateCredentialReference(reference)),
     },
@@ -145,18 +152,12 @@ test('host-key mismatch fails closed before authentication or transport', async 
   );
   assert.equal(authenticated, false);
 
+  const approvedPassword = await authorizeConnection({ profileId: profile.profileId }, policyDependencies({
+    profiles: { getProfile: async () => ({ ...profile, authMode: 'password' as const }) },
+  }));
   let credentialCalls = 0;
   let transportCalls = 0;
-  const passwordDescriptor: TrustedConnectionDescriptor = {
-    profileId: profile.profileId,
-    host: profile.host,
-    port: profile.port,
-    user: profile.user,
-    authMode: 'password',
-    knownHostsReference: profile.approvedKnownHostsReference,
-    expectedHostFingerprint: fingerprint,
-    credentialReference: profile.credentialReference,
-  };
+  const passwordDescriptor = descriptorFromAuthorized(approvedPassword.profile);
   await assert.rejects(
     new PasswordSshAdapter({
       profiles: { getConnection: async () => passwordDescriptor },
