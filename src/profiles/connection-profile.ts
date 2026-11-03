@@ -14,8 +14,7 @@ export interface ConnectionProfile {
   readonly expectedHostFingerprint: string;
   readonly authMode: AuthenticationMode;
   readonly credentialReference?: string;
-  readonly approvedKnownHostsReference?: string;
-  readonly approvedKnownHostsPath?: string;
+  readonly approvedKnownHostsReference: string;
 }
 
 export interface ProfileSelectionInput {
@@ -31,7 +30,6 @@ const PROFILE_KEYS = new Set([
   'authMode',
   'credentialReference',
   'approvedKnownHostsReference',
-  'approvedKnownHostsPath',
 ]);
 
 const SECRET_KEYS = new Set([
@@ -45,7 +43,12 @@ const SECRET_KEYS = new Set([
 ]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
 }
 
 function requireString(value: unknown, field: string): string {
@@ -53,7 +56,7 @@ function requireString(value: unknown, field: string): string {
     throw new TypeError(`${field} must be a non-empty string`);
   }
 
-  if (/[\[\]{}\r\n\0]/u.test(value)) {
+  if (/[\u0000-\u001F\u007F\[\]{}]/u.test(value)) {
     throw new TypeError(`${field} contains forbidden control characters`);
   }
 
@@ -61,14 +64,58 @@ function requireString(value: unknown, field: string): string {
 }
 
 function rejectUnexpectedKeys(value: Record<string, unknown>, allowed: Set<string>): void {
-  for (const key of Object.keys(value)) {
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== 'string') {
+      throw new TypeError('Connection profile contains an unexpected field');
+    }
     if (SECRET_KEYS.has(key)) {
-      throw new TypeError(`${key} is secret material and is not accepted`);
+      throw new TypeError('Secret material fields are not accepted');
     }
     if (!allowed.has(key)) {
-      throw new TypeError(`Unexpected connection profile field: ${key}`);
+      throw new TypeError('Connection profile contains an unexpected field');
     }
   }
+}
+
+function rejectInheritedFields(value: Record<string, unknown>, allowed: Set<string>): void {
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype === null) {
+    return;
+  }
+
+  for (const key of Reflect.ownKeys(prototype)) {
+    if (typeof key !== 'string') {
+      continue;
+    }
+    if (SECRET_KEYS.has(key)) {
+      throw new TypeError('Secret material fields are not accepted');
+    }
+    if (allowed.has(key)) {
+      throw new TypeError('Connection profile contains an unexpected inherited field');
+    }
+  }
+}
+
+function requireOwnString(value: Record<string, unknown>, key: string): string {
+  if (!Object.prototype.hasOwnProperty.call(value, key)) {
+    return requireString(undefined, key);
+  }
+
+  return requireString(value[key], key);
+}
+
+function requireProfileId(value: unknown): string {
+  const profileId = requireString(value, 'profileId');
+  if (
+    profileId === '__proto__' ||
+    profileId === 'constructor' ||
+    profileId === 'prototype' ||
+    !/^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(profileId)
+  ) {
+    throw new TypeError('profileId must use the canonical lowercase hyphenated form');
+  }
+
+  return profileId;
 }
 
 /** Validate the only input exposed by the MCP connection capability. */
@@ -77,8 +124,10 @@ export function validateProfileSelection(input: unknown): ProfileSelectionInput 
     throw new TypeError('Connection input must contain only profileId');
   }
 
-  rejectUnexpectedKeys(input, new Set(['profileId']));
-  return { profileId: requireString(input.profileId, 'profileId') };
+  const allowedKeys = new Set(['profileId']);
+  rejectUnexpectedKeys(input, allowedKeys);
+  rejectInheritedFields(input, allowedKeys);
+  return { profileId: requireProfileId(requireOwnString(input, 'profileId')) };
 }
 
 /** Validate locally configured profile metadata and return a normalized copy. */
@@ -88,23 +137,27 @@ export function validateConnectionProfile(input: unknown): ConnectionProfile {
   }
 
   rejectUnexpectedKeys(input, PROFILE_KEYS);
+  rejectInheritedFields(input, PROFILE_KEYS);
 
-  const authMode = input.authMode;
+  const authMode = Object.prototype.hasOwnProperty.call(input, 'authMode') ? input.authMode : undefined;
   if (authMode !== 'agent-key' && authMode !== 'password') {
     throw new TypeError("authMode must be 'agent-key' or 'password'");
   }
 
-  if (!Number.isInteger(input.port) || (input.port as number) < 1 || (input.port as number) > 65535) {
+  if (
+    !Object.prototype.hasOwnProperty.call(input, 'port') ||
+    !Number.isInteger(input.port) ||
+    (input.port as number) < 1 ||
+    (input.port as number) > 65535
+  ) {
     throw new TypeError('port must be an integer between 1 and 65535');
   }
 
-  const knownHostsReference = input.approvedKnownHostsReference;
-  const knownHostsPath = input.approvedKnownHostsPath;
-  if ((knownHostsReference === undefined) === (knownHostsPath === undefined)) {
-    throw new TypeError('Exactly one approved known-hosts reference or path is required');
-  }
+  const knownHostsReference = requireOwnString(input, 'approvedKnownHostsReference');
 
-  const credentialReference = input.credentialReference;
+  const credentialReference = Object.prototype.hasOwnProperty.call(input, 'credentialReference')
+    ? input.credentialReference
+    : undefined;
   if (credentialReference !== undefined) {
     requireString(credentialReference, 'credentialReference');
   }
@@ -113,15 +166,13 @@ export function validateConnectionProfile(input: unknown): ConnectionProfile {
   }
 
   return {
-    profileId: requireString(input.profileId, 'profileId'),
-    host: requireString(input.host, 'host'),
+    profileId: requireProfileId(requireOwnString(input, 'profileId')),
+    host: requireOwnString(input, 'host'),
     port: input.port as number,
-    user: requireString(input.user, 'user'),
-    expectedHostFingerprint: requireString(input.expectedHostFingerprint, 'expectedHostFingerprint'),
+    user: requireOwnString(input, 'user'),
+    expectedHostFingerprint: requireOwnString(input, 'expectedHostFingerprint'),
     authMode,
     ...(credentialReference === undefined ? {} : { credentialReference }),
-    ...(knownHostsReference === undefined
-      ? { approvedKnownHostsPath: requireString(knownHostsPath, 'approvedKnownHostsPath') }
-      : { approvedKnownHostsReference: requireString(knownHostsReference, 'approvedKnownHostsReference') }),
+    approvedKnownHostsReference: knownHostsReference,
   };
 }
