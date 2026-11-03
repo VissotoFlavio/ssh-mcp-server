@@ -94,6 +94,17 @@ function own(value: Record<string, unknown>, key: string): unknown {
   }
 }
 
+/** Read only discriminator properties from class instances without inspecting
+ * or serializing their message, cause, stack, or other provider state. */
+function discriminator(value: unknown, key: string): unknown {
+  if ((typeof value !== 'object' || value === null) && typeof value !== 'function') return undefined;
+  try {
+    return (value as Record<string, unknown>)[key];
+  } catch {
+    return undefined;
+  }
+}
+
 function safeString(value: unknown): string | undefined {
   return typeof value === 'string' && value.length <= MAX_DIAGNOSTIC_CODE_LENGTH ? value : undefined;
 }
@@ -116,18 +127,18 @@ function normalizeOutcome(value: unknown): ConnectionDiagnosticOutcome | undefin
 function normalizeCode(value: unknown): ConnectionDiagnosticCode | undefined {
   if (value === 'success' || value === 'ok' || value === 'completed') return 'success';
   if (value === 'unknown') return 'unknown';
-  if (value === 'invalid-input' || value === 'invalid-selection') return 'invalid-input';
-  if (value === 'provider-failure' || value === 'provider' || value === 'trusted-profile-unavailable' || value === 'trusted-profile-not-found' || value === 'credential-resolver-unavailable') {
+  if (value === 'invalid-input' || value === 'invalid-selection' || value === 'invalid-profile') return 'invalid-input';
+  if (value === 'provider-failure' || value === 'provider' || value === 'trusted-profile-unavailable' || value === 'trusted-profile-not-found' || value === 'invalid-trusted-profile' || value === 'credential-resolver-unavailable') {
     return 'provider-failure';
   }
   if (value === 'timeout' || value === 'ssh-timeout' || value === 'ETIMEDOUT' || value === 'TIMEOUT') return 'timeout';
-  if (value === 'host-key-failure' || value === 'host-key' || value === 'known-hosts-unavailable' || value === 'known-hosts-fingerprint-mismatch' || value === 'known-hosts-entry-mismatch') {
+  if (value === 'host-key-failure' || value === 'host-key' || value === 'known-hosts-unavailable' || value === 'known-hosts-fingerprint-mismatch' || value === 'known-hosts-entry-missing' || value === 'known-hosts-entry-mismatch' || value === 'known-hosts-entry-ambiguous') {
     return 'host-key-failure';
   }
-  if (value === 'authentication-failure' || value === 'authentication' || value === 'auth' || value === 'permission-denied' || value === 'unsupported-authentication' || value === 'password-unavailable') {
+  if (value === 'authentication-failure' || value === 'authentication' || value === 'auth' || value === 'permission-denied' || value === 'unsupported-authentication' || value === 'password-unavailable' || value === 'agent-identity-unavailable' || value === 'credential-reference-missing' || value === 'credential-reference-unapproved') {
     return 'authentication-failure';
   }
-  if (value === 'connection-failure' || value === 'connection' || value === 'ssh-connection-failed') return 'connection-failure';
+  if (value === 'connection-failure' || value === 'connection' || value === 'ssh-connection-failed' || value === 'invalid-executable' || value === 'password-transport-unavailable') return 'connection-failure';
   return undefined;
 }
 
@@ -147,17 +158,21 @@ function safeOptions(value: RedactedDiagnosticErrorOptions | ConnectionDiagnosti
   const record = isRecord(value) ? value : undefined;
   const code = normalizeCode(record === undefined ? value : own(record, 'code')) ?? 'unknown';
   const requestedOutcome = normalizeOutcome(record === undefined ? undefined : own(record, 'outcome'));
-  const outcome = code === 'timeout' || requestedOutcome === 'timeout'
-    ? 'timeout'
-    : code === 'success'
-      ? 'success'
-      : requestedOutcome === 'success'
-        ? 'failure'
-        : requestedOutcome ?? 'failure';
+  let outcome: ConnectionDiagnosticOutcome;
+  let normalizedCode = code;
+  if (code === 'timeout' || requestedOutcome === 'timeout') {
+    normalizedCode = 'timeout';
+    outcome = 'timeout';
+  } else if (code === 'success' && requestedOutcome !== 'failure') {
+    outcome = 'success';
+  } else {
+    if (code === 'success') normalizedCode = 'unknown';
+    outcome = requestedOutcome === 'success' ? 'failure' : requestedOutcome ?? 'failure';
+  }
   const requestedStage = record === undefined ? undefined : own(record, 'stage');
   return {
-    code: outcome === 'timeout' ? 'timeout' : code === 'success' && outcome !== 'success' ? 'unknown' : code,
-    stage: normalizeStage(requestedStage ?? inferredStage(code)),
+    code: normalizedCode,
+    stage: normalizeStage(requestedStage ?? inferredStage(normalizedCode)),
     outcome,
   };
 }
@@ -168,13 +183,18 @@ export class RedactedDiagnosticError extends Error {
   readonly stage: ConnectionDiagnosticStage;
   readonly outcome: ConnectionDiagnosticOutcome;
 
-  constructor(options: RedactedDiagnosticErrorOptions | ConnectionDiagnosticCode) {
-    const normalized = safeOptions(options);
+  constructor(options: RedactedDiagnosticErrorOptions | ConnectionDiagnosticCode, stage?: unknown, outcome?: unknown) {
+    const normalized = safeOptions(
+      typeof options === 'string' && (stage !== undefined || outcome !== undefined)
+        ? { code: options, stage, outcome }
+        : options,
+    );
     super(SAFE_MESSAGES[normalized.code]);
     this.name = 'RedactedDiagnosticError';
     this.code = normalized.code;
     this.stage = normalized.stage;
     this.outcome = normalized.outcome;
+    Object.freeze(this);
   }
 
   /** JSON conversion deliberately excludes stack and every non-allowlisted field. */
@@ -183,13 +203,21 @@ export class RedactedDiagnosticError extends Error {
   }
 }
 
-export function diagnosticErrorPayload(error: RedactedDiagnosticError): DiagnosticErrorPayload {
+/** Descriptive alias for consumers that use the connection-oriented name. */
+export class ConnectionDiagnosticError extends RedactedDiagnosticError {}
+
+export function diagnosticErrorPayload(error: unknown): DiagnosticErrorPayload {
+  const normalized = safeOptions({
+    code: normalizeCode(discriminator(error, 'code')) ?? 'unknown',
+    stage: discriminator(error, 'stage'),
+    outcome: discriminator(error, 'outcome'),
+  });
   return {
     kind: 'connection-diagnostic-error',
-    code: error.code,
-    stage: error.stage,
-    outcome: error.outcome,
-    message: SAFE_MESSAGES[error.code],
+    code: normalized.code,
+    stage: normalized.stage,
+    outcome: normalized.outcome,
+    message: SAFE_MESSAGES[normalized.code],
   };
 }
 
@@ -209,9 +237,8 @@ export function mapConnectionError(error: unknown, context?: unknown): RedactedD
     return new RedactedDiagnosticError({ code: error.code, stage: error.stage, outcome: error.outcome });
   }
 
-  const record = isRecord(error) ? error : undefined;
-  const explicitCode = record === undefined ? undefined : classifyProviderCode(own(record, 'diagnosticCode')) ?? classifyProviderCode(own(record, 'code'));
-  const name = record === undefined ? undefined : safeString(own(record, 'name'));
+  const explicitCode = classifyProviderCode(discriminator(error, 'diagnosticCode')) ?? classifyProviderCode(discriminator(error, 'code'));
+  const name = safeString(discriminator(error, 'name'));
   const contextRecord = isRecord(context) ? context : undefined;
   const requestedStage = contextRecord === undefined
     ? typeof context === 'string' ? context : undefined
@@ -280,9 +307,11 @@ export function buildAuditMetadata(input: unknown): ConnectionAuditMetadata {
     code = 'unknown';
   }
 
-  const profileId = canonicalProfileId(own(record, 'profileId'));
-  const authMode = own(record, 'authMode') === 'agent-key' || own(record, 'authMode') === 'password'
-    ? own(record, 'authMode') as 'agent-key' | 'password'
+  const profileIdValue = own(record, 'profileId');
+  const authModeValue = own(record, 'authMode');
+  const profileId = canonicalProfileId(profileIdValue);
+  const authMode = authModeValue === 'agent-key' || authModeValue === 'password'
+    ? authModeValue as 'agent-key' | 'password'
     : undefined;
   const durationMs = boundedInteger(own(record, 'durationMs'), MAX_AUDIT_DURATION_MS, 0);
   const attempt = boundedInteger(own(record, 'attempt'), MAX_AUDIT_ATTEMPT, 1);
@@ -324,3 +353,7 @@ export function serializeAuditEvent(input: unknown): string {
 export const createRedactedDiagnosticError = (options: RedactedDiagnosticErrorOptions | ConnectionDiagnosticCode): RedactedDiagnosticError => new RedactedDiagnosticError(options);
 export const safeSerializeDiagnosticError = serializeDiagnosticError;
 export const safeSerializeAuditEvent = serializeAuditEvent;
+export const createAuditEvent = buildAuditEvent;
+export const serializeSafeDiagnostic = serializeDiagnosticError;
+export const serializeSafeAuditEvent = serializeAuditEvent;
+export const AUDIT_MAX_DURATION_MS = MAX_AUDIT_DURATION_MS;
