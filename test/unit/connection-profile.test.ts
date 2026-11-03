@@ -63,9 +63,12 @@ test('rejects control characters, including tabs and DEL', () => {
 });
 
 test('does not echo untrusted field names in errors', () => {
-  assert.throws(() => validateConnectionProfile({ ...validProfile, 'field attacker.example': true }), error => {
-    assert.match((error as Error).message, /unexpected field/);
-    assert.doesNotMatch((error as Error).message, /field attacker\.example/);
-    return true;
-  });
+  assert.throws(
+    () => validateConnectionProfile({ ...validProfile, 'field attacker.example': true }),
+    (error) => {
+      assert.match((error as Error).message, /unexpected field/);
+      assert.doesNotMatch((error as Error).message, /field attacker\.example/);
+      return true;
+    },
+  );
 });
