@@ -142,11 +142,19 @@ function requirePassword(stdout: string): PasswordCredential {
  * reference and approval validation.
  */
 class NativeCommandCredentialStore implements CredentialStore {
+  private readonly platform: SupportedCredentialStorePlatform;
+  private readonly parsedReference: ParsedCredentialReference;
+  private readonly runner: CredentialStoreCommandRunner;
+
   constructor(
-    private readonly platform: SupportedCredentialStorePlatform,
-    private readonly parsedReference: ParsedCredentialReference,
-    private readonly runner: CredentialStoreCommandRunner,
-  ) {}
+    platform: SupportedCredentialStorePlatform,
+    parsedReference: ParsedCredentialReference,
+    runner: CredentialStoreCommandRunner,
+  ) {
+    this.platform = platform;
+    this.parsedReference = parsedReference;
+    this.runner = runner;
+  }
 
   async getPassword(reference: CredentialReference): Promise<PasswordCredential> {
     const parsed = parseCredentialReference(reference);
