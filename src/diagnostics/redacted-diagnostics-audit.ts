@@ -118,9 +118,7 @@ function safeString(value: unknown): string | undefined {
 }
 
 function normalizeStage(value: unknown): ConnectionDiagnosticStage {
-  return typeof value === 'string' && STAGES.has(value as ConnectionDiagnosticStage)
-    ? value as ConnectionDiagnosticStage
-    : 'unknown';
+  return typeof value === 'string' && STAGES.has(value as ConnectionDiagnosticStage) ? (value as ConnectionDiagnosticStage) : 'unknown';
 }
 
 function normalizeOutcome(value: unknown): ConnectionDiagnosticOutcome | undefined {
@@ -135,18 +133,62 @@ function normalizeOutcome(value: unknown): ConnectionDiagnosticOutcome | undefin
 function normalizeCode(value: unknown): ConnectionDiagnosticCode | undefined {
   if (value === 'success' || value === 'ok' || value === 'completed') return 'success';
   if (value === 'unknown') return 'unknown';
-  if (value === 'invalid-input' || value === 'invalid-selection' || value === 'invalid-profile' || value === 'invalid-reference' || value === 'invalid-known-hosts-reference') return 'invalid-input';
-  if (value === 'provider-failure' || value === 'provider' || value === 'trusted-profile-unavailable' || value === 'trusted-profile-not-found' || value === 'invalid-trusted-profile' || value === 'credential-resolver-unavailable' || value === 'unsupported-platform' || value === 'unsupported-provider' || value === 'unapproved-reference' || value === 'credential-unavailable' || value === 'credential-store-failure') {
+  if (
+    value === 'invalid-input' ||
+    value === 'invalid-selection' ||
+    value === 'invalid-profile' ||
+    value === 'invalid-reference' ||
+    value === 'invalid-known-hosts-reference'
+  )
+    return 'invalid-input';
+  if (
+    value === 'provider-failure' ||
+    value === 'provider' ||
+    value === 'trusted-profile-unavailable' ||
+    value === 'trusted-profile-not-found' ||
+    value === 'invalid-trusted-profile' ||
+    value === 'credential-resolver-unavailable' ||
+    value === 'unsupported-platform' ||
+    value === 'unsupported-provider' ||
+    value === 'unapproved-reference' ||
+    value === 'credential-unavailable' ||
+    value === 'credential-store-failure'
+  ) {
     return 'provider-failure';
   }
   if (value === 'timeout' || value === 'ssh-timeout' || value === 'ETIMEDOUT' || value === 'TIMEOUT') return 'timeout';
-  if (value === 'host-key-failure' || value === 'host-key' || value === 'known-hosts-unavailable' || value === 'known-hosts-fingerprint-mismatch' || value === 'known-hosts-entry-missing' || value === 'known-hosts-entry-mismatch' || value === 'known-hosts-entry-ambiguous') {
+  if (
+    value === 'host-key-failure' ||
+    value === 'host-key' ||
+    value === 'known-hosts-unavailable' ||
+    value === 'known-hosts-fingerprint-mismatch' ||
+    value === 'known-hosts-entry-missing' ||
+    value === 'known-hosts-entry-mismatch' ||
+    value === 'known-hosts-entry-ambiguous'
+  ) {
     return 'host-key-failure';
   }
-  if (value === 'authentication-failure' || value === 'authentication' || value === 'auth' || value === 'permission-denied' || value === 'unsupported-authentication' || value === 'password-unavailable' || value === 'agent-identity-unavailable' || value === 'credential-reference-missing' || value === 'credential-reference-unapproved') {
+  if (
+    value === 'authentication-failure' ||
+    value === 'authentication' ||
+    value === 'auth' ||
+    value === 'permission-denied' ||
+    value === 'unsupported-authentication' ||
+    value === 'password-unavailable' ||
+    value === 'agent-identity-unavailable' ||
+    value === 'credential-reference-missing' ||
+    value === 'credential-reference-unapproved'
+  ) {
     return 'authentication-failure';
   }
-  if (value === 'connection-failure' || value === 'connection' || value === 'ssh-connection-failed' || value === 'invalid-executable' || value === 'password-transport-unavailable') return 'connection-failure';
+  if (
+    value === 'connection-failure' ||
+    value === 'connection' ||
+    value === 'ssh-connection-failed' ||
+    value === 'invalid-executable' ||
+    value === 'password-transport-unavailable'
+  )
+    return 'connection-failure';
   return undefined;
 }
 
@@ -175,7 +217,7 @@ function safeOptions(value: RedactedDiagnosticErrorOptions | ConnectionDiagnosti
     outcome = 'success';
   } else {
     if (code === 'success') normalizedCode = 'unknown';
-    outcome = requestedOutcome === 'success' ? 'failure' : requestedOutcome ?? 'failure';
+    outcome = requestedOutcome === 'success' ? 'failure' : (requestedOutcome ?? 'failure');
   }
   const requestedStage = record === undefined ? undefined : own(record, 'stage');
   return {
@@ -193,9 +235,7 @@ export class RedactedDiagnosticError extends Error {
 
   constructor(options: RedactedDiagnosticErrorOptions | ConnectionDiagnosticCode, stage?: unknown, outcome?: unknown) {
     const normalized = safeOptions(
-      typeof options === 'string' && (stage !== undefined || outcome !== undefined)
-        ? { code: options, stage, outcome }
-        : options,
+      typeof options === 'string' && (stage !== undefined || outcome !== undefined) ? { code: options, stage, outcome } : options,
     );
     super(SAFE_MESSAGES[normalized.code]);
     this.name = 'RedactedDiagnosticError';
@@ -248,9 +288,7 @@ export function mapConnectionError(error: unknown, context?: unknown): RedactedD
   const explicitCode = classifyProviderCode(discriminator(error, 'diagnosticCode')) ?? classifyProviderCode(discriminator(error, 'code'));
   const name = safeString(discriminator(error, 'name'));
   const contextRecord = isRecord(context) ? context : undefined;
-  const requestedStage = contextRecord === undefined
-    ? typeof context === 'string' ? context : undefined
-    : own(contextRecord, 'stage');
+  const requestedStage = contextRecord === undefined ? (typeof context === 'string' ? context : undefined) : own(contextRecord, 'stage');
   const stage = normalizeStage(requestedStage);
 
   let code = explicitCode;
@@ -318,9 +356,7 @@ export function buildAuditMetadata(input: unknown): ConnectionAuditMetadata {
   const profileIdValue = own(record, 'profileId');
   const authModeValue = own(record, 'authMode');
   const profileId = canonicalProfileId(profileIdValue);
-  const authMode = authModeValue === 'agent-key' || authModeValue === 'password'
-    ? authModeValue as 'agent-key' | 'password'
-    : undefined;
+  const authMode = authModeValue === 'agent-key' || authModeValue === 'password' ? (authModeValue as 'agent-key' | 'password') : undefined;
   const durationMs = boundedInteger(own(record, 'durationMs'), MAX_AUDIT_DURATION_MS, 0);
   const attempt = boundedInteger(own(record, 'attempt'), MAX_AUDIT_ATTEMPT, 1);
 
@@ -358,7 +394,8 @@ export function serializeAuditEvent(input: unknown): string {
 }
 
 // Names kept as explicit aliases for callers that prefer "safe" terminology.
-export const createRedactedDiagnosticError = (options: RedactedDiagnosticErrorOptions | ConnectionDiagnosticCode): RedactedDiagnosticError => new RedactedDiagnosticError(options);
+export const createRedactedDiagnosticError = (options: RedactedDiagnosticErrorOptions | ConnectionDiagnosticCode): RedactedDiagnosticError =>
+  new RedactedDiagnosticError(options);
 export const safeSerializeDiagnosticError = serializeDiagnosticError;
 export const safeSerializeAuditEvent = serializeAuditEvent;
 export const createAuditEvent = buildAuditEvent;
