@@ -188,9 +188,7 @@ export class PlatformCredentialStoreResolver implements CredentialStoreResolver 
   constructor(options: PlatformCredentialStoreResolverOptions = {}) {
     this.platform = options.platform ?? (typeof process === 'undefined' ? 'unknown' : process.platform);
     this.runner = options.runner ?? new DirectSpawnCredentialStoreCommandRunner(options.timeoutMs);
-    this.approvedReferences = new Set(
-      [...(options.approvedReferences ?? [])].map(reference => parseCredentialReference(reference).reference),
-    );
+    this.approvedReferences = new Set([...(options.approvedReferences ?? [])].map((reference) => parseCredentialReference(reference).reference));
   }
 
   resolve(reference: string): CredentialStore {
@@ -220,10 +218,7 @@ export class DirectSpawnCredentialStoreCommandRunner implements CredentialStoreC
     this.timeoutMs = Number.isInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= 60_000 ? timeoutMs : 10_000;
   }
 
-  run(
-    executable: CredentialStoreExecutable,
-    args: readonly string[],
-  ): Promise<CredentialStoreCommandResult> {
+  run(executable: CredentialStoreExecutable, args: readonly string[]): Promise<CredentialStoreCommandResult> {
     return new Promise((resolve, reject) => {
       const child = spawn(executable, [...args], {
         shell: false,
@@ -265,7 +260,7 @@ export class DirectSpawnCredentialStoreCommandRunner implements CredentialStoreC
         clearTimeout(timer);
         reject(new CredentialStoreError('credential-store-failure', 'Credential store lookup failed'));
       });
-      child.once('close', code => {
+      child.once('close', (code) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
@@ -279,9 +274,7 @@ export class DirectSpawnCredentialStoreCommandRunner implements CredentialStoreC
   }
 }
 
-export function createPlatformCredentialStoreResolver(
-  options: PlatformCredentialStoreResolverOptions = {},
-): CredentialStoreResolver {
+export function createPlatformCredentialStoreResolver(options: PlatformCredentialStoreResolverOptions = {}): CredentialStoreResolver {
   return new PlatformCredentialStoreResolver({
     platform: options.platform ?? (typeof process === 'undefined' ? 'unknown' : process.platform),
     runner: options.runner,
