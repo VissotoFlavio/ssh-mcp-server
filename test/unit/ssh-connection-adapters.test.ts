@@ -53,11 +53,16 @@ class FakeExecutable implements OpenSshExecutableResolver {
 
 function agentDependencies(runner: SshProcessRunner = new FakeRunner()) {
   return {
-    profiles: { getConnection: async (profileId: string) => profileId === agentProfile.profileId ? agentProfile : undefined },
-    knownHosts: { resolve: async (reference: string) => reference === agentProfile.knownHostsReference ? {
-      path: '/srv/ssh/approved/known_hosts',
-      fingerprint: agentProfile.expectedHostFingerprint,
-    } : undefined },
+    profiles: { getConnection: async (profileId: string) => (profileId === agentProfile.profileId ? agentProfile : undefined) },
+    knownHosts: {
+      resolve: async (reference: string) =>
+        reference === agentProfile.knownHostsReference
+          ? {
+              path: '/srv/ssh/approved/known_hosts',
+              fingerprint: agentProfile.expectedHostFingerprint,
+            }
+          : undefined,
+    },
     trustedKnownHostsDirectory: '/srv/ssh',
     targetPlatform: 'linux',
     realpath: async (path: string) => path,
@@ -74,17 +79,29 @@ test('accepts only profileId and builds a fixed non-interactive agent command', 
   assert.equal(runner.executable, '/usr/bin/ssh');
   assert.equal(runner.options?.shell, false);
   assert.deepEqual(runner.args, [
-    '-N', '-T', '-n',
-    '-o', 'BatchMode=yes',
-    '-o', 'StrictHostKeyChecking=yes',
-    '-o', 'UserKnownHostsFile=/srv/ssh/approved/known_hosts',
-    '-o', 'GlobalKnownHostsFile=/dev/null',
-    '-o', 'PasswordAuthentication=no',
-    '-o', 'KbdInteractiveAuthentication=no',
-    '-o', 'NumberOfPasswordPrompts=0',
-    '-o', 'IdentitiesOnly=yes',
-    '-o', 'ConnectTimeout=12',
-    '-p', '22',
+    '-N',
+    '-T',
+    '-n',
+    '-o',
+    'BatchMode=yes',
+    '-o',
+    'StrictHostKeyChecking=yes',
+    '-o',
+    'UserKnownHostsFile=/srv/ssh/approved/known_hosts',
+    '-o',
+    'GlobalKnownHostsFile=/dev/null',
+    '-o',
+    'PasswordAuthentication=no',
+    '-o',
+    'KbdInteractiveAuthentication=no',
+    '-o',
+    'NumberOfPasswordPrompts=0',
+    '-o',
+    'IdentitiesOnly=yes',
+    '-o',
+    'ConnectTimeout=12',
+    '-p',
+    '22',
     '--',
     'deploy@api.internal.example',
   ]);
@@ -93,10 +110,15 @@ test('accepts only profileId and builds a fixed non-interactive agent command', 
 test('rejects arbitrary connection fields before consulting the trusted provider', async () => {
   let calls = 0;
   const dependencies = agentDependencies();
-  dependencies.profiles = { getConnection: async () => { calls += 1; return agentProfile; } };
+  dependencies.profiles = {
+    getConnection: async () => {
+      calls += 1;
+      return agentProfile;
+    },
+  };
   await assert.rejects(
     new OpenSshAgentAdapter(dependencies).connect({ profileId: 'production-api', host: 'attacker.example', command: 'rm -rf /' }),
-    error => error instanceof SshAdapterError && error.code === 'invalid-selection' && error.message === 'Connection selection is invalid',
+    (error) => error instanceof SshAdapterError && error.code === 'invalid-selection' && error.message === 'Connection selection is invalid',
   );
   assert.equal(calls, 0);
 });
@@ -106,14 +128,14 @@ test('fails closed when known-hosts resolution or OpenSSH execution fails', asyn
   dependencies.knownHosts = { resolve: async () => ({ path: 'relative/should-fail', fingerprint: agentProfile.expectedHostFingerprint }) };
   await assert.rejects(
     new OpenSshAgentAdapter(dependencies).connect({ profileId: 'production-api' }),
-    error => error instanceof SshAdapterError && error.code === 'known-hosts-unavailable',
+    (error) => error instanceof SshAdapterError && error.code === 'known-hosts-unavailable',
   );
 
   const runner = new FakeRunner();
   runner.result = { exitCode: 255, ready: false };
   await assert.rejects(
     new OpenSshAgentAdapter(agentDependencies(runner)).connect({ profileId: 'production-api' }),
-    error => error instanceof SshAdapterError && error.code === 'ssh-connection-failed' && error.message === 'SSH connection failed',
+    (error) => error instanceof SshAdapterError && error.code === 'ssh-connection-failed' && error.message === 'SSH connection failed',
   );
 });
 
@@ -136,14 +158,16 @@ test('native runner uses the injected readiness probe and terminates the -N-styl
 
 test('native runner never infers readiness from stderr and requires a trusted probe', async () => {
   const runner = new NativeOpenSshProcessRunner({ waitUntilReady: async () => false });
-  await assert.rejects(runner.run(
-    process.execPath,
-    ['-e', "process.stderr.write('debug1: Authentication succeeded (publickey).\\n'); setInterval(() => {}, 1000);"],
-    { timeoutMs: 100, shell: false },
-  ), error => error instanceof SshAdapterError && error.code === 'ssh-connection-failed');
+  await assert.rejects(
+    runner.run(process.execPath, ['-e', "process.stderr.write('debug1: Authentication succeeded (publickey).\\n'); setInterval(() => {}, 1000);"], {
+      timeoutMs: 100,
+      shell: false,
+    }),
+    (error) => error instanceof SshAdapterError && error.code === 'ssh-connection-failed',
+  );
   await assert.rejects(
     new NativeOpenSshProcessRunner().run(process.execPath, ['-e', 'setInterval(() => {}, 1000);'], { timeoutMs: 100, shell: false }),
-    error => error instanceof SshAdapterError && error.message === 'SSH readiness probe is unavailable',
+    (error) => error instanceof SshAdapterError && error.message === 'SSH readiness probe is unavailable',
   );
 });
 
@@ -154,8 +178,9 @@ test('rejects target delimiters and never turns them into an SSH destination', a
       ...agentDependencies(),
       profiles: { getConnection: async () => profile },
     });
-    await assert.rejects(adapter.connect({ profileId: 'production-api' }), error =>
-      error instanceof SshAdapterError && error.code === 'invalid-trusted-profile',
+    await assert.rejects(
+      adapter.connect({ profileId: 'production-api' }),
+      (error) => error instanceof SshAdapterError && error.code === 'invalid-trusted-profile',
     );
   }
 });
@@ -163,26 +188,31 @@ test('rejects target delimiters and never turns them into an SSH destination', a
 test('requires the exact approved fingerprint and confines known-hosts paths', async () => {
   const mismatch = new OpenSshAgentAdapter({
     ...agentDependencies(),
-    knownHosts: { resolve: async () => ({ path: '/srv/ssh/approved/known_hosts', fingerprint: 'SHA256:2222222222222222222222222222222222222222222' }) },
+    knownHosts: {
+      resolve: async () => ({ path: '/srv/ssh/approved/known_hosts', fingerprint: 'SHA256:2222222222222222222222222222222222222222222' }),
+    },
   });
-  await assert.rejects(mismatch.connect({ profileId: 'production-api' }), error =>
-    error instanceof SshAdapterError && error.code === 'known-hosts-fingerprint-mismatch',
+  await assert.rejects(
+    mismatch.connect({ profileId: 'production-api' }),
+    (error) => error instanceof SshAdapterError && error.code === 'known-hosts-fingerprint-mismatch',
   );
 
   const broadPath = new OpenSshAgentAdapter({
     ...agentDependencies(),
     knownHosts: { resolve: async () => ({ path: '/etc/known_hosts', fingerprint: agentProfile.expectedHostFingerprint }) },
   });
-  await assert.rejects(broadPath.connect({ profileId: 'production-api' }), error =>
-    error instanceof SshAdapterError && error.code === 'known-hosts-unavailable',
+  await assert.rejects(
+    broadPath.connect({ profileId: 'production-api' }),
+    (error) => error instanceof SshAdapterError && error.code === 'known-hosts-unavailable',
   );
 
   const windowsPathOnPosix = new OpenSshAgentAdapter({
     ...agentDependencies(),
     knownHosts: { resolve: async () => ({ path: 'C:\\srv\\ssh\\known_hosts', fingerprint: agentProfile.expectedHostFingerprint }) },
   });
-  await assert.rejects(windowsPathOnPosix.connect({ profileId: 'production-api' }), error =>
-    error instanceof SshAdapterError && error.code === 'known-hosts-unavailable',
+  await assert.rejects(
+    windowsPathOnPosix.connect({ profileId: 'production-api' }),
+    (error) => error instanceof SshAdapterError && error.code === 'known-hosts-unavailable',
   );
 
   const windowsPath = new OpenSshAgentAdapter({
@@ -211,7 +241,7 @@ test('supports only bracketed IPv6 literals in the trusted target', async () => 
         ...agentDependencies(),
         profiles: { getConnection: async () => ({ ...agentProfile, host: invalid }) },
       }).connect({ profileId: 'production-api' }),
-      error => error instanceof SshAdapterError && error.code === 'invalid-trusted-profile',
+      (error) => error instanceof SshAdapterError && error.code === 'invalid-trusted-profile',
     );
   }
 });
@@ -219,7 +249,9 @@ test('supports only bracketed IPv6 literals in the trusted target', async () => 
 test('passes password only to the injected in-memory transport', async () => {
   const requests: Array<{ password: string; knownHostsPath: string }> = [];
   const transport: InMemoryPasswordTransport = {
-    connect: async request => { requests.push({ password: request.password, knownHostsPath: request.knownHostsPath }); },
+    connect: async (request) => {
+      requests.push({ password: request.password, knownHostsPath: request.knownHostsPath });
+    },
   };
   const adapter = new PasswordSshAdapter({
     profiles: { getConnection: async () => passwordProfile },
@@ -246,7 +278,7 @@ test('does not use a shell workaround and fails closed without password transpor
   });
   await assert.rejects(
     adapter.connect({ profileId: 'production-api' }),
-    error => error instanceof SshAdapterError && error.code === 'password-transport-unavailable' && !error.message.includes('secret'),
+    (error) => error instanceof SshAdapterError && error.code === 'password-transport-unavailable' && !error.message.includes('secret'),
   );
 });
 
@@ -259,15 +291,16 @@ test('bounds a password transport that never completes', async () => {
     realpath: async (path: string) => path,
     credentials: { getPassword: async () => ({ password: 'secret' }) },
     transport: {
-      connect: async (_request, signal) => new Promise<void>(resolve => {
-        signal?.addEventListener('abort', () => setTimeout(resolve, 10), { once: true });
-      }),
+      connect: async (_request, signal) =>
+        new Promise<void>((resolve) => {
+          signal?.addEventListener('abort', () => setTimeout(resolve, 10), { once: true });
+        }),
     },
     timeoutMs: 5,
   });
   await assert.rejects(
     adapter.connect({ profileId: 'production-api' }),
-    error => error instanceof SshAdapterError && error.code === 'ssh-timeout' && error.message === 'SSH connection timed out',
+    (error) => error instanceof SshAdapterError && error.code === 'ssh-timeout' && error.message === 'SSH connection timed out',
   );
 });
 
@@ -280,16 +313,14 @@ test('returns a hard timeout for a non-cooperative password transport', async ()
     targetPlatform: 'linux',
     realpath: async (path: string) => path,
     credentials: { getPassword: async () => ({ password: 'secret' }) },
-    transport: { connect: async () => new Promise<void>(resolve => setTimeout(resolve, 500)) },
+    transport: { connect: async () => new Promise<void>((resolve) => setTimeout(resolve, 500)) },
     timeoutMs: 5,
   });
-  await assert.rejects(adapter.connect({ profileId: 'production-api' }), error =>
-    error instanceof SshAdapterError && error.code === 'ssh-timeout',
-  );
+  await assert.rejects(adapter.connect({ profileId: 'production-api' }), (error) => error instanceof SshAdapterError && error.code === 'ssh-timeout');
   assert.ok(Date.now() - started < 300);
 });
 
-test('canonicalizes known-hosts files and rejects symlink escapes', async t => {
+test('canonicalizes known-hosts files and rejects symlink escapes', async (t) => {
   const platform = process.platform === 'win32' ? 'win32' : 'linux';
   const root = await mkdtemp(join(tmpdir(), 'ssh-adapter-'));
   const approved = join(root, 'approved');
@@ -321,7 +352,7 @@ test('canonicalizes known-hosts files and rejects symlink escapes', async t => {
         ...base,
         knownHosts: { resolve: async () => ({ path: link, fingerprint: agentProfile.expectedHostFingerprint }) },
       }).connect({ profileId: 'production-api' }),
-      error => error instanceof SshAdapterError && error.code === 'known-hosts-unavailable',
+      (error) => error instanceof SshAdapterError && error.code === 'known-hosts-unavailable',
     );
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -336,10 +367,18 @@ test('redacts credential and child-process failures', async () => {
     trustedKnownHostsDirectory: '/srv/ssh',
     targetPlatform: 'linux',
     realpath: async (path: string) => path,
-    credentials: { getPassword: async () => { throw new Error('secret-password'); } },
-    transport: { connect: async () => { throw new Error('secret-password'); } },
+    credentials: {
+      getPassword: async () => {
+        throw new Error('secret-password');
+      },
+    },
+    transport: {
+      connect: async () => {
+        throw new Error('secret-password');
+      },
+    },
   });
-  await assert.rejects(adapter.connect({ profileId: 'production-api' }), error => {
+  await assert.rejects(adapter.connect({ profileId: 'production-api' }), (error) => {
     assert.ok(error instanceof SshAdapterError);
     assert.equal(error.code, 'password-unavailable');
     assert.equal(error.message, 'Password is unavailable');

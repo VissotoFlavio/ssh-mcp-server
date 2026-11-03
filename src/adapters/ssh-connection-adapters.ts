@@ -48,11 +48,7 @@ export interface SshProcessResult {
 }
 
 export interface SshProcessRunner {
-  run(
-    executable: string,
-    args: readonly string[],
-    options: { readonly timeoutMs: number; readonly shell: false },
-  ): Promise<SshProcessResult>;
+  run(executable: string, args: readonly string[], options: { readonly timeoutMs: number; readonly shell: false }): Promise<SshProcessResult>;
 }
 
 /** Trusted local/structured readiness signal; never infer readiness from SSH output. */
@@ -160,7 +156,7 @@ export function validateProfileSelection(input: unknown): ProfileSelection {
     fail('invalid-selection', 'Connection selection is invalid');
   }
   const prototype = Object.getPrototypeOf(input);
-  if (prototype !== null && Reflect.ownKeys(prototype).some(key => key === 'profileId')) {
+  if (prototype !== null && Reflect.ownKeys(prototype).some((key) => key === 'profileId')) {
     fail('invalid-selection', 'Connection selection is invalid');
   }
   return { profileId: validateProfileId(own(input, 'profileId')) };
@@ -195,7 +191,7 @@ type TrustedRealpath = (path: string) => Promise<string>;
 function validateTrustedDescriptor(value: unknown, selectedProfileId: string): TrustedConnectionDescriptor {
   if (!isPlainRecord(value)) fail('invalid-trusted-profile', 'Trusted connection profile is invalid');
   const allowed = new Set(['profileId', 'host', 'port', 'user', 'authMode', 'knownHostsReference', 'expectedHostFingerprint', 'credentialReference']);
-  if (Reflect.ownKeys(value).some(key => typeof key !== 'string' || !allowed.has(key))) {
+  if (Reflect.ownKeys(value).some((key) => typeof key !== 'string' || !allowed.has(key))) {
     fail('invalid-trusted-profile', 'Trusted connection profile is invalid');
   }
   const profileId = own(value, 'profileId');
@@ -206,12 +202,20 @@ function validateTrustedDescriptor(value: unknown, selectedProfileId: string): T
   const knownHostsReference = own(value, 'knownHostsReference');
   const expectedHostFingerprint = own(value, 'expectedHostFingerprint');
   if (
-    typeof profileId !== 'string' || !PROFILE_ID.test(profileId) || profileId !== selectedProfileId ||
+    typeof profileId !== 'string' ||
+    !PROFILE_ID.test(profileId) ||
+    profileId !== selectedProfileId ||
     !validTrustedHost(host) ||
-    !validText(user) || TARGET_DELIMITER_CHARACTERS.test(user) || user.startsWith('-') ||
-    !Number.isInteger(port) || (port as number) < 1 || (port as number) > 65535 ||
-    (authMode !== 'agent-key' && authMode !== 'password') || !validText(knownHostsReference) ||
-    typeof expectedHostFingerprint !== 'string' || !OPENSSH_SHA256_FINGERPRINT.test(expectedHostFingerprint)
+    !validText(user) ||
+    TARGET_DELIMITER_CHARACTERS.test(user) ||
+    user.startsWith('-') ||
+    !Number.isInteger(port) ||
+    (port as number) < 1 ||
+    (port as number) > 65535 ||
+    (authMode !== 'agent-key' && authMode !== 'password') ||
+    !validText(knownHostsReference) ||
+    typeof expectedHostFingerprint !== 'string' ||
+    !OPENSSH_SHA256_FINGERPRINT.test(expectedHostFingerprint)
   ) {
     fail('invalid-trusted-profile', 'Trusted connection profile is invalid');
   }
@@ -265,7 +269,7 @@ async function withAbortTimeout<T>(start: (signal: AbortSignal) => Promise<T>, t
     };
     const timer = setTimeout(timeout, timeoutMs);
     operation.then(
-      result => {
+      (result) => {
         if (settled) return;
         clearTimeout(timer);
         if (graceTimer !== undefined) clearTimeout(graceTimer);
@@ -273,7 +277,7 @@ async function withAbortTimeout<T>(start: (signal: AbortSignal) => Promise<T>, t
         if (timedOut) reject(new SshAdapterError('ssh-timeout', 'SSH connection timed out'));
         else resolve(result);
       },
-      error => {
+      (error) => {
         if (settled) return;
         clearTimeout(timer);
         if (graceTimer !== undefined) clearTimeout(graceTimer);
@@ -285,10 +289,7 @@ async function withAbortTimeout<T>(start: (signal: AbortSignal) => Promise<T>, t
   });
 }
 
-async function resolveTrustedConnection(
-  input: unknown,
-  provider: TrustedConnectionProvider,
-): Promise<TrustedConnectionDescriptor> {
+async function resolveTrustedConnection(input: unknown, provider: TrustedConnectionProvider): Promise<TrustedConnectionDescriptor> {
   const selection = validateProfileSelection(input);
   let descriptor: unknown;
   try {
@@ -319,9 +320,12 @@ async function resolveKnownHostsPath(
   const path = own(resolution, 'path');
   const fingerprint = own(resolution, 'fingerprint');
   if (
-    typeof path !== 'string' || !isAbsolutePath(path, targetPlatform) || CONTROL_CHARACTERS.test(path) ||
+    typeof path !== 'string' ||
+    !isAbsolutePath(path, targetPlatform) ||
+    CONTROL_CHARACTERS.test(path) ||
     path.includes('%') ||
-    typeof fingerprint !== 'string' || !OPENSSH_SHA256_FINGERPRINT.test(fingerprint) ||
+    typeof fingerprint !== 'string' ||
+    !OPENSSH_SHA256_FINGERPRINT.test(fingerprint) ||
     CONTROL_CHARACTERS.test(trustedKnownHostsDirectory) ||
     trustedKnownHostsDirectory.includes('%') ||
     !isAbsolutePath(trustedKnownHostsDirectory, targetPlatform) ||
@@ -360,23 +364,38 @@ export interface OpenSshAgentAdapterDependencies extends SshAdapterDependencies 
   readonly runner: SshProcessRunner;
 }
 
-function buildAgentArguments(descriptor: TrustedConnectionDescriptor, knownHostsPath: string, timeoutMs: number, targetPlatform: string): readonly string[] {
+function buildAgentArguments(
+  descriptor: TrustedConnectionDescriptor,
+  knownHostsPath: string,
+  timeoutMs: number,
+  targetPlatform: string,
+): readonly string[] {
   const connectTimeoutSeconds = Math.max(1, Math.ceil(timeoutMs / 1000));
   const globalKnownHosts = targetPlatform === 'win32' ? 'NUL' : '/dev/null';
   return [
     '-N',
     '-T',
     '-n',
-    '-o', 'BatchMode=yes',
-    '-o', 'StrictHostKeyChecking=yes',
-    '-o', `UserKnownHostsFile=${knownHostsPath}`,
-    '-o', `GlobalKnownHostsFile=${globalKnownHosts}`,
-    '-o', 'PasswordAuthentication=no',
-    '-o', 'KbdInteractiveAuthentication=no',
-    '-o', 'NumberOfPasswordPrompts=0',
-    '-o', 'IdentitiesOnly=yes',
-    '-o', `ConnectTimeout=${connectTimeoutSeconds}`,
-    '-p', String(descriptor.port),
+    '-o',
+    'BatchMode=yes',
+    '-o',
+    'StrictHostKeyChecking=yes',
+    '-o',
+    `UserKnownHostsFile=${knownHostsPath}`,
+    '-o',
+    `GlobalKnownHostsFile=${globalKnownHosts}`,
+    '-o',
+    'PasswordAuthentication=no',
+    '-o',
+    'KbdInteractiveAuthentication=no',
+    '-o',
+    'NumberOfPasswordPrompts=0',
+    '-o',
+    'IdentitiesOnly=yes',
+    '-o',
+    `ConnectTimeout=${connectTimeoutSeconds}`,
+    '-p',
+    String(descriptor.port),
     '--',
     `${descriptor.user}@${descriptor.host}`,
   ];
@@ -406,13 +425,7 @@ export class OpenSshAgentAdapter {
   async connect(input: unknown): Promise<void> {
     const descriptor = await resolveTrustedConnection(input, this.profiles);
     if (descriptor.authMode !== 'agent-key') fail('unsupported-authentication', 'Connection authentication mode is unsupported');
-    const knownHosts = await resolveKnownHostsPath(
-      descriptor,
-      this.knownHosts,
-      this.targetPlatform,
-      this.trustedKnownHostsDirectory,
-      this.realpath,
-    );
+    const knownHosts = await resolveKnownHostsPath(descriptor, this.knownHosts, this.targetPlatform, this.trustedKnownHostsDirectory, this.realpath);
     let executable: unknown;
     try {
       executable = this.executable.resolve();
@@ -422,12 +435,7 @@ export class OpenSshAgentAdapter {
     if (typeof executable !== 'string' || !isAbsolutePath(executable, this.targetPlatform) || CONTROL_CHARACTERS.test(executable)) {
       fail('invalid-executable', 'OpenSSH executable is unavailable');
     }
-    const args = buildAgentArguments(
-      descriptor,
-      knownHosts.path,
-      this.timeoutMs,
-      this.targetPlatform,
-    );
+    const args = buildAgentArguments(descriptor, knownHosts.path, this.timeoutMs, this.targetPlatform);
     let result: SshProcessResult;
     try {
       result = await this.runner.run(executable, args, { timeoutMs: this.timeoutMs, shell: false });
@@ -475,7 +483,7 @@ export class PasswordSshAdapter {
     let credential: PasswordCredential | string;
     try {
       credential = await withAbortTimeout(
-        signal => Promise.resolve(this.dependencies.credentials!.getPassword(descriptor.credentialReference!, signal)),
+        (signal) => Promise.resolve(this.dependencies.credentials!.getPassword(descriptor.credentialReference!, signal)),
         this.timeoutMs,
       );
     } catch (error) {
@@ -488,17 +496,21 @@ export class PasswordSshAdapter {
     }
     try {
       await withAbortTimeout(
-        signal => this.dependencies.transport!.connect({
-          profileId: descriptor.profileId,
-          host: descriptor.host,
-          port: descriptor.port,
-          user: descriptor.user,
-          password,
-          knownHostsPath: knownHosts.path,
-          expectedHostFingerprint: knownHosts.fingerprint,
-          timeoutMs: this.timeoutMs,
-          strictHostKeyChecking: 'yes',
-        }, signal),
+        (signal) =>
+          this.dependencies.transport!.connect(
+            {
+              profileId: descriptor.profileId,
+              host: descriptor.host,
+              port: descriptor.port,
+              user: descriptor.user,
+              password,
+              knownHostsPath: knownHosts.path,
+              expectedHostFingerprint: knownHosts.fingerprint,
+              timeoutMs: this.timeoutMs,
+              strictHostKeyChecking: 'yes',
+            },
+            signal,
+          ),
         this.timeoutMs,
       );
     } catch (error) {
@@ -549,10 +561,18 @@ export class NativeOpenSshProcessRunner implements SshProcessRunner {
         outcome = nextOutcome;
         clearTimeout(deadlineTimer);
         readinessController.abort();
-        try { child.kill(); } catch { /* process may have exited */ }
+        try {
+          child.kill();
+        } catch {
+          /* process may have exited */
+        }
         closeGraceTimer = setTimeout(() => {
           if (closeSeen || finalized) return;
-          try { child.kill('SIGKILL'); } catch { /* best effort escalation */ }
+          try {
+            child.kill('SIGKILL');
+          } catch {
+            /* best effort escalation */
+          }
           escalationTimer = setTimeout(() => {
             if (!closeSeen) {
               forceFinalize = true;
@@ -568,11 +588,11 @@ export class NativeOpenSshProcessRunner implements SshProcessRunner {
         if (outputBytes > MAX_OUTPUT_BYTES) terminate({ error: new SshAdapterError('ssh-connection-failed', 'SSH connection failed') });
       };
       child.stdout.on('data', drain);
-      child.stderr.on('data', chunk => {
+      child.stderr.on('data', (chunk) => {
         drain(chunk);
       });
       child.once('error', () => terminate({ error: new SshAdapterError('ssh-connection-failed', 'SSH connection failed') }));
-      child.once('close', code => {
+      child.once('close', (code) => {
         closeSeen = true;
         readinessController.abort();
         if (outcome === undefined) outcome = { result: { exitCode: code, ready: false } };
@@ -586,7 +606,7 @@ export class NativeOpenSshProcessRunner implements SshProcessRunner {
         return;
       }
       readiness.then(
-        ready => {
+        (ready) => {
           if (ready === true) terminate({ result: { exitCode: 0, ready: true } });
           else terminate({ error: new SshAdapterError('ssh-connection-failed', 'SSH readiness probe failed') });
         },
