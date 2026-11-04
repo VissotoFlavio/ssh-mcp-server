@@ -13,7 +13,10 @@ const nativeRequire = createRequire(import.meta.url);
 // processes. Native-boundary fixtures must use PowerShell 7+ explicitly.
 const fixtureShell = 'pwsh.exe';
 
-function runFixture(mode: 'safe' | 'unsafe-root' | 'unsafe-leaf' | 'overlap' | 'dot-alias' | 'junction' | 'cleanup', root: string): void {
+function runFixture(
+  mode: 'safe' | 'unsafe-root' | 'unsafe-leaf' | 'unsafe-registry' | 'overlap' | 'dot-alias' | 'junction' | 'cleanup',
+  root: string,
+): void {
   execFileSync(fixtureShell, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', fixture, '-Mode', mode], {
     env: { ...process.env, SSH_MCP_WINDOWS_STORAGE_TEST_ROOT: root },
     stdio: 'pipe',
@@ -36,7 +39,7 @@ if (process.platform !== 'win32' || !existsSync(addonPath)) {
     }
   });
 
-  for (const mode of ['unsafe-root', 'unsafe-leaf', 'overlap', 'dot-alias', 'junction'] as const) {
+  for (const mode of ['unsafe-root', 'unsafe-leaf', 'unsafe-registry', 'overlap', 'dot-alias', 'junction'] as const) {
     test(`fails closed for ${mode}`, async () => {
       const root = join(homedir(), `ssh-mcp-native-boundary-${process.pid}-${Date.now()}-${mode}`);
       let configured = false;

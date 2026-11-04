@@ -1,4 +1,4 @@
-param([Parameter(Mandatory = $true)][ValidateSet('safe', 'unsafe-root', 'unsafe-leaf', 'overlap', 'dot-alias', 'junction', 'cleanup')][string]$Mode)
+param([Parameter(Mandatory = $true)][ValidateSet('safe', 'unsafe-root', 'unsafe-leaf', 'unsafe-registry', 'overlap', 'dot-alias', 'junction', 'cleanup')][string]$Mode)
 
 $ErrorActionPreference = 'Stop'
 $keyPath = 'Software\Vissoto\ssh-mcp-server'
@@ -65,3 +65,12 @@ if ($Mode -eq 'junction') {
   $state = $link
 }
 Set-Configuration $state $knownHosts
+if ($Mode -eq 'unsafe-registry') {
+  $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($keyPath, $true)
+  try {
+    $acl = $key.GetAccessControl()
+    $everyone = [System.Security.Principal.SecurityIdentifier]::new('S-1-1-0')
+    $acl.AddAccessRule([System.Security.AccessControl.RegistryAccessRule]::new($everyone, [System.Security.AccessControl.RegistryRights]::SetValue, [System.Security.AccessControl.AccessControlType]::Allow))
+    $key.SetAccessControl($acl)
+  } finally { $key.Close() }
+}
