@@ -4,7 +4,8 @@ import { PassThrough } from 'node:stream';
 import test from 'node:test';
 
 import type { ApprovedProfileListingProvider } from '../../src/profiles/approved-profile-listing.js';
-import { listApprovedProfilesToolName, runStdioServer, serverName, type StdioServerOptions } from '../../src/server.js';
+import { listApprovedProfilesToolName, runStdioServer, serverName, validateConnectionToolName, type StdioServerOptions } from '../../src/server.js';
+import type { ConnectionValidationProvider } from '../../src/validation/trusted-connection-validation.js';
 
 function requestResponse(input: PassThrough, output: PassThrough, request: Record<string, unknown>): Promise<Record<string, unknown>> {
   const response = once(output, 'data');
@@ -12,7 +13,10 @@ function requestResponse(input: PassThrough, output: PassThrough, request: Recor
   return response.then(([chunk]) => JSON.parse(String(chunk)) as Record<string, unknown>);
 }
 
-function createDiscoveryRuntime(provider: ApprovedProfileListingProvider): {
+function createDiscoveryRuntime(
+  provider: ApprovedProfileListingProvider,
+  connectionValidationProvider?: ConnectionValidationProvider,
+): {
   readonly input: PassThrough;
   readonly output: PassThrough;
   readonly errors: PassThrough;
@@ -27,6 +31,7 @@ function createDiscoveryRuntime(provider: ApprovedProfileListingProvider): {
     errorOutput: errors,
     installSignalHandlers: false,
     approvedProfileListingProvider: provider,
+    connectionValidationProvider,
   };
   return { input, output, errors, runtime: runStdioServer(options) };
 }
@@ -241,6 +246,126 @@ test('fails closed for hostile provider result arrays without serializing their 
   }
   assert.equal(mapCalls, 0);
 
+  input.end();
+  await runtime;
+  assert.equal(errors.readableLength, 0);
+});
+
+test('validates an approved profile through the trusted readiness provider', async () => {
+  const provider: ApprovedProfileListingProvider = {
+    async listApprovedProfiles() {
+      return [];
+    },
+  };
+  let received: unknown;
+  const connectionValidationProvider: ConnectionValidationProvider = {
+    async validateConnection(input) {
+      received = input;
+      return { profileId: 'production-api', ready: true };
+    },
+  };
+  const { input, output, errors, runtime } = createDiscoveryRuntime(provider, connectionValidationProvider);
+
+  await requestResponse(input, output, {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'initialize',
+    params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'test-client', version: '1.0.0' } },
+  });
+  const listedTools = await requestResponse(input, output, {
+    jsonrpc: '2.0',
+    id: 2,
+    method: 'tools/list',
+  });
+  assert.equal(
+    (listedTools.result as { tools: readonly { readonly name: string }[] }).tools.some((tool) => tool.name === validateConnectionToolName),
+    true,
+  );
+  const response = await requestResponse(input, output, {
+    jsonrpc: '2.0',
+    id: 3,
+    method: 'tools/call',
+    params: { name: validateConnectionToolName, arguments: { profileId: 'production-api' } },
+  });
+
+  assert.deepEqual(response.result, { content: [{ type: 'text', text: JSON.stringify({ profileId: 'production-api', ready: true }) }] });
+  assert.deepEqual(received, { profileId: 'production-api' });
+  input.end();
+  await runtime;
+  assert.equal(errors.readableLength, 0);
+});
+
+test('rejects unexpected validation input before consulting the readiness provider', async () => {
+  const provider: ApprovedProfileListingProvider = {
+    async listApprovedProfiles() {
+      return [];
+    },
+  };
+  let calls = 0;
+  const connectionValidationProvider: ConnectionValidationProvider = {
+    async validateConnection() {
+      calls += 1;
+      return { profileId: 'production-api', ready: true };
+    },
+  };
+  const { input, output, errors, runtime } = createDiscoveryRuntime(provider, connectionValidationProvider);
+
+  await requestResponse(input, output, {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'initialize',
+    params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'test-client', version: '1.0.0' } },
+  });
+  const response = await requestResponse(input, output, {
+    jsonrpc: '2.0',
+    id: 2,
+    method: 'tools/call',
+    params: { name: validateConnectionToolName, arguments: { profileId: 'production-api', command: 'uname -a' } },
+  });
+
+  assert.deepEqual(response.result, {
+    content: [{ type: 'text', text: JSON.stringify({ ready: false, outcome: 'failure', code: 'invalid-input' }) }],
+    isError: true,
+  });
+  assert.equal(calls, 0);
+  input.end();
+  await runtime;
+  assert.equal(errors.readableLength, 0);
+});
+
+test('redacts host and credential validation failures', async () => {
+  const provider: ApprovedProfileListingProvider = {
+    async listApprovedProfiles() {
+      return [];
+    },
+  };
+  let call = 0;
+  const connectionValidationProvider: ConnectionValidationProvider = {
+    async validateConnection() {
+      call += 1;
+      const error = new Error(call === 1 ? 'fingerprint=SHA256:private host=prod.internal' : 'credential=os://ssh/private password=secret');
+      Object.assign(error, { code: call === 1 ? 'known-hosts-entry-mismatch' : 'credential-reference-unapproved' });
+      throw error;
+    },
+  };
+  const { input, output, errors, runtime } = createDiscoveryRuntime(provider, connectionValidationProvider);
+
+  await requestResponse(input, output, {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'initialize',
+    params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'test-client', version: '1.0.0' } },
+  });
+  for (const id of [2, 3]) {
+    const response = await requestResponse(input, output, {
+      jsonrpc: '2.0',
+      id,
+      method: 'tools/call',
+      params: { name: validateConnectionToolName, arguments: { profileId: 'production-api' } },
+    });
+    assert.equal(JSON.stringify(response).includes('private'), false);
+    assert.equal(JSON.stringify(response).includes('secret'), false);
+  }
   input.end();
   await runtime;
   assert.equal(errors.readableLength, 0);

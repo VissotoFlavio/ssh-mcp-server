@@ -78,10 +78,23 @@ test('accepts only profileId and builds a fixed non-interactive agent command', 
 
   assert.equal(runner.executable, '/usr/bin/ssh');
   assert.equal(runner.options?.shell, false);
+  assert.equal(runner.args.includes('HostKeyAlias=none'), false);
+  assert.equal(runner.args.includes('ProxyCommand=none'), true);
+  assert.equal(runner.args.includes('ProxyJump=none'), true);
   assert.deepEqual(runner.args, [
+    '-F',
+    'none',
     '-N',
     '-T',
     '-n',
+    '-o',
+    'CanonicalizeHostname=no',
+    '-o',
+    'ProxyCommand=none',
+    '-o',
+    'ProxyJump=none',
+    '-o',
+    'HostName=api.internal.example',
     '-o',
     'BatchMode=yes',
     '-o',

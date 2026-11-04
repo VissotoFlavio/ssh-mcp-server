@@ -11,19 +11,29 @@ import {
   createRuntimeApprovedProfileListingProvider,
   type ApprovedProfileListingProvider,
 } from './profiles/approved-profile-listing.js';
+import {
+  toConnectionValidationFailure,
+  type ConnectionValidationOutcome,
+  type ConnectionValidationProvider,
+} from './validation/trusted-connection-validation.js';
 
 export const serverName = 'ssh-mcp-server';
 export const serverVersion = '0.1.0';
 export const listApprovedProfilesToolName = 'list_approved_profiles';
+export const validateConnectionToolName = 'validate_connection';
 
 const LIST_APPROVED_PROFILES_DESCRIPTION =
   'Lists the identifiers of profiles approved by the operator. Connection, credential, and host details are not disclosed.';
+const VALIDATE_CONNECTION_DESCRIPTION =
+  'Validates readiness for an operator-approved SSH connection. It accepts only a profile identifier and never accepts commands or connection settings.';
 const SAFE_PROFILE_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
 const MAX_DISCOVERABLE_PROFILES = 256;
 
 export interface ServerOptions {
   /** Trusted provider that exposes only minimized, approved profile summaries. */
   readonly approvedProfileListingProvider?: ApprovedProfileListingProvider;
+  /** Trusted provider composed from the connection policy and SSH readiness adapter. */
+  readonly connectionValidationProvider?: ConnectionValidationProvider;
 }
 
 export interface StdioServerOptions {
@@ -32,6 +42,7 @@ export interface StdioServerOptions {
   errorOutput?: Writable;
   installSignalHandlers?: boolean;
   approvedProfileListingProvider?: ApprovedProfileListingProvider;
+  connectionValidationProvider?: ConnectionValidationProvider;
 }
 
 function isEmptyDiscoveryInput(input: unknown): boolean {
@@ -46,7 +57,24 @@ function isEmptyDiscoveryInput(input: unknown): boolean {
 }
 
 function isSafeProfileId(value: unknown): value is string {
-  return typeof value === 'string' && SAFE_PROFILE_ID.test(value);
+  return typeof value === 'string' && value !== 'constructor' && value !== 'prototype' && value !== '__proto__' && SAFE_PROFILE_ID.test(value);
+}
+
+/** Validate the exact public input before a trusted validation provider runs. */
+function isConnectionValidationInput(input: unknown): input is { readonly profileId: string } {
+  if (typeof input !== 'object' || input === null || Array.isArray(input)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(input);
+  if (prototype !== Object.prototype && prototype !== null) {
+    return false;
+  }
+  const keys = Reflect.ownKeys(input);
+  if (keys.length !== 1 || keys[0] !== 'profileId') {
+    return false;
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(input, 'profileId');
+  return descriptor !== undefined && Object.prototype.hasOwnProperty.call(descriptor, 'value') && isSafeProfileId(descriptor.value);
 }
 
 /**
@@ -126,7 +154,50 @@ function unavailableDiscoveryResult(): ReturnType<typeof textToolResult> {
   return textToolResult('Approved profile discovery is unavailable.', true);
 }
 
-function registerApprovedProfileDiscovery(server: Server, approvedProfileListingProvider: ApprovedProfileListingProvider | undefined): void {
+function validationResult(outcome: unknown, isError = false): ReturnType<typeof textToolResult> {
+  return textToolResult(JSON.stringify(outcome), isError);
+}
+
+function unavailableConnectionValidationResult(): ReturnType<typeof textToolResult> {
+  return validationResult({ ready: false, outcome: 'failure', code: 'provider-failure' }, true);
+}
+
+function invalidConnectionValidationResult(): ReturnType<typeof textToolResult> {
+  return validationResult({ ready: false, outcome: 'failure', code: 'invalid-input' }, true);
+}
+
+function safeValidationOutcome(value: unknown): ConnectionValidationOutcome {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new TypeError('Trusted connection validation provider returned an invalid result');
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new TypeError('Trusted connection validation provider returned an invalid result');
+  }
+  const keys = Reflect.ownKeys(value);
+  if (keys.length !== 2 || !keys.includes('profileId') || !keys.includes('ready')) {
+    throw new TypeError('Trusted connection validation provider returned an invalid result');
+  }
+  const profileId = Object.getOwnPropertyDescriptor(value, 'profileId');
+  const ready = Object.getOwnPropertyDescriptor(value, 'ready');
+  if (
+    profileId === undefined ||
+    ready === undefined ||
+    !Object.prototype.hasOwnProperty.call(profileId, 'value') ||
+    !Object.prototype.hasOwnProperty.call(ready, 'value') ||
+    !isSafeProfileId(profileId.value) ||
+    ready.value !== true
+  ) {
+    throw new TypeError('Trusted connection validation provider returned an invalid result');
+  }
+  return { profileId: profileId.value, ready: true };
+}
+
+function registerTools(
+  server: Server,
+  approvedProfileListingProvider: ApprovedProfileListingProvider | undefined,
+  connectionValidationProvider: ConnectionValidationProvider | undefined,
+): void {
   server.setRequestHandler(ListToolsRequestSchema, () => ({
     tools: [
       {
@@ -138,30 +209,58 @@ function registerApprovedProfileDiscovery(server: Server, approvedProfileListing
           additionalProperties: false,
         },
       },
+      ...(connectionValidationProvider === undefined
+        ? []
+        : [
+            {
+              name: validateConnectionToolName,
+              description: VALIDATE_CONNECTION_DESCRIPTION,
+              inputSchema: {
+                type: 'object',
+                properties: { profileId: { type: 'string', pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$' } },
+                required: ['profileId'],
+                additionalProperties: false,
+              },
+            },
+          ]),
     ],
   }));
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    if (request.params.name !== listApprovedProfilesToolName || !isEmptyDiscoveryInput(request.params.arguments)) {
-      return unavailableDiscoveryResult();
-    }
-    if (approvedProfileListingProvider === undefined) {
-      return unavailableDiscoveryResult();
+    if (request.params.name === listApprovedProfilesToolName) {
+      if (!isEmptyDiscoveryInput(request.params.arguments) || approvedProfileListingProvider === undefined) {
+        return unavailableDiscoveryResult();
+      }
+      try {
+        const profiles = await approvedProfileListingProvider.listApprovedProfiles();
+        return textToolResult(JSON.stringify(toSafeProfileResponse(profiles)));
+      } catch {
+        // Provider failures and malformed provider output stay inside the trusted boundary.
+        return unavailableDiscoveryResult();
+      }
     }
 
-    try {
-      const profiles = await approvedProfileListingProvider.listApprovedProfiles();
-      return textToolResult(JSON.stringify(toSafeProfileResponse(profiles)));
-    } catch {
-      // Provider failures and malformed provider output stay inside the trusted boundary.
+    if (request.params.name !== validateConnectionToolName) {
       return unavailableDiscoveryResult();
+    }
+    if (!isConnectionValidationInput(request.params.arguments)) {
+      return invalidConnectionValidationResult();
+    }
+    if (connectionValidationProvider === undefined) {
+      return unavailableConnectionValidationResult();
+    }
+    try {
+      const outcome = await connectionValidationProvider.validateConnection({ profileId: request.params.arguments.profileId });
+      return validationResult(safeValidationOutcome(outcome));
+    } catch (error) {
+      return validationResult(toConnectionValidationFailure(error), true);
     }
   });
 }
 
-export function createServer({ approvedProfileListingProvider }: ServerOptions = {}): Server {
+export function createServer({ approvedProfileListingProvider, connectionValidationProvider }: ServerOptions = {}): Server {
   const server = new Server({ name: serverName, version: serverVersion }, { capabilities: { tools: {} } });
-  registerApprovedProfileDiscovery(server, approvedProfileListingProvider);
+  registerTools(server, approvedProfileListingProvider, connectionValidationProvider);
   return server;
 }
 
@@ -175,8 +274,9 @@ export async function runStdioServer({
   errorOutput = process.stderr,
   installSignalHandlers = input === process.stdin,
   approvedProfileListingProvider,
+  connectionValidationProvider,
 }: StdioServerOptions = {}): Promise<void> {
-  const server = createServer({ approvedProfileListingProvider });
+  const server = createServer({ approvedProfileListingProvider, connectionValidationProvider });
   const transport = new StdioServerTransport(input, output);
 
   let completeLifecycle: () => void;
