@@ -368,9 +368,22 @@ function buildAgentArguments(
   const connectTimeoutSeconds = Math.max(1, Math.ceil(timeoutMs / 1000));
   const globalKnownHosts = targetPlatform === 'win32' ? 'NUL' : '/dev/null';
   return [
+    // Do not load user or system configuration. The remaining connection
+    // options are pinned below so ProxyCommand/Jump and host aliases cannot
+    // replace the policy-authorized destination.
+    '-F',
+    'none',
     '-N',
     '-T',
     '-n',
+    '-o',
+    'CanonicalizeHostname=no',
+    '-o',
+    'ProxyCommand=none',
+    '-o',
+    'ProxyJump=none',
+    '-o',
+    `HostName=${descriptor.host}`,
     '-o',
     'BatchMode=yes',
     '-o',
