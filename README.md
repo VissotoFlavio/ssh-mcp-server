@@ -2,6 +2,11 @@
 
 A secure, policy-driven Model Context Protocol server for approved SSH operations.
 
+The planned native Windows alpha has a separate, fail-closed
+[Windows trust model](docs/windows-trust-model.md), including its
+machine-scoped configuration boundary. The current production runtime remains
+supported on Linux and macOS only.
+
 ## Runtime configuration
 
 Set `SSH_MCP_STATE_ROOT` to the absolute operator-owned directory containing the fixed `connection-profiles.json` state file. Set `SSH_MCP_KNOWN_HOSTS_ROOT` to a separate absolute operator-owned directory containing one `<profile-id>.known_hosts` file for each approved `known-hosts://<profile-id>` reference. On supported POSIX hosts, both roots and their files must be owned by the MCP process user, have no group/other write bits, and contain no symbolic links. Discovery returns only approved profile identifiers and a fixed `operator-approved` classification; it never returns connection, credential, path, or host-identity details.
