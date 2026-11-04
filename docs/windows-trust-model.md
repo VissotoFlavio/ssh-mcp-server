@@ -143,9 +143,15 @@ does not permit modification by an untrusted principal. The executable must
 be a regular file on the system volume whose final handle path and identity
 match the resolved path. Launch occurs only while that verified component
 chain remains intact; an identity change or verification failure before launch
-is unavailable. Authenticode verification must succeed and the signer must be
-pinned to the Microsoft Windows OpenSSH publisher policy recorded with the
-release evidence.
+is unavailable. Authenticode verification must succeed for the executable's
+catalog membership, and the signer accepted by WinTrust for that catalog must
+match the Microsoft Windows publisher policy recorded with the release
+evidence.
+
+The alpha's approved signer allowlist is the Microsoft Windows certificate
+with SHA-1 thumbprint `667BBA1E1F478221AA65DE4F75187A751B03A453`. Certificate
+rotation is a fail-closed release change: it requires a reviewed update to the
+native allowlist and this evidence before the new signer is accepted.
 
 The runtime uses direct process APIs with `shell: false`, fixed executable
 paths, allowlisted arguments, bounded execution, and redacted output. It does
