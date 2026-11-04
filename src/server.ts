@@ -6,6 +6,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 
+import { serializeAuditEvent } from './diagnostics/redacted-diagnostics-audit.js';
 import {
   APPROVED_PROFILE_CLASSIFICATION,
   createRuntimeApprovedProfileListingProvider,
@@ -34,6 +35,8 @@ export interface ServerOptions {
   readonly approvedProfileListingProvider?: ApprovedProfileListingProvider;
   /** Trusted provider composed from the connection policy and SSH readiness adapter. */
   readonly connectionValidationProvider?: ConnectionValidationProvider;
+  /** Internal sink for already-allowlisted validation audit records. */
+  readonly auditSink?: (serializedEvent: string) => void;
 }
 
 export interface StdioServerOptions {
@@ -166,7 +169,7 @@ function invalidConnectionValidationResult(): ReturnType<typeof textToolResult> 
   return validationResult({ ready: false, outcome: 'failure', code: 'invalid-input' }, true);
 }
 
-function safeValidationOutcome(value: unknown): ConnectionValidationOutcome {
+function safeValidationOutcome(value: unknown, requestedProfileId: string): ConnectionValidationOutcome {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     throw new TypeError('Trusted connection validation provider returned an invalid result');
   }
@@ -186,6 +189,7 @@ function safeValidationOutcome(value: unknown): ConnectionValidationOutcome {
     !Object.prototype.hasOwnProperty.call(profileId, 'value') ||
     !Object.prototype.hasOwnProperty.call(ready, 'value') ||
     !isSafeProfileId(profileId.value) ||
+    profileId.value !== requestedProfileId ||
     ready.value !== true
   ) {
     throw new TypeError('Trusted connection validation provider returned an invalid result');
@@ -193,10 +197,25 @@ function safeValidationOutcome(value: unknown): ConnectionValidationOutcome {
   return { profileId: profileId.value, ready: true };
 }
 
+/** Emit a fixed startup diagnostic without exposing the triggering failure. */
+export function reportEntrypointFailure(errorOutput: Pick<Writable, 'write'>, _error: unknown): void {
+  errorOutput.write('MCP server failed to start\n');
+}
+
+function writeAudit(sink: ((serializedEvent: string) => void) | undefined, input: unknown): void {
+  if (sink === undefined) return;
+  try {
+    sink(serializeAuditEvent(input));
+  } catch {
+    // Diagnostics must never interfere with an MCP result.
+  }
+}
+
 function registerTools(
   server: Server,
   approvedProfileListingProvider: ApprovedProfileListingProvider | undefined,
   connectionValidationProvider: ConnectionValidationProvider | undefined,
+  auditSink: ((serializedEvent: string) => void) | undefined,
 ): void {
   server.setRequestHandler(ListToolsRequestSchema, () => ({
     tools: [
@@ -244,23 +263,41 @@ function registerTools(
       return unavailableDiscoveryResult();
     }
     if (!isConnectionValidationInput(request.params.arguments)) {
+      writeAudit(auditSink, { code: 'invalid-input', outcome: 'failure', stage: 'selection' });
       return invalidConnectionValidationResult();
     }
     if (connectionValidationProvider === undefined) {
+      writeAudit(auditSink, { profileId: request.params.arguments.profileId, code: 'provider-failure', outcome: 'failure', stage: 'provider' });
       return unavailableConnectionValidationResult();
     }
+    const startedAt = Date.now();
     try {
       const outcome = await connectionValidationProvider.validateConnection({ profileId: request.params.arguments.profileId });
-      return validationResult(safeValidationOutcome(outcome));
+      const safeOutcome = safeValidationOutcome(outcome, request.params.arguments.profileId);
+      writeAudit(auditSink, {
+        profileId: safeOutcome.profileId,
+        code: 'success',
+        outcome: 'success',
+        stage: 'readiness',
+        durationMs: Date.now() - startedAt,
+      });
+      return validationResult(safeOutcome);
     } catch (error) {
-      return validationResult(toConnectionValidationFailure(error), true);
+      const failure = toConnectionValidationFailure(error);
+      writeAudit(auditSink, {
+        profileId: request.params.arguments.profileId,
+        ...failure,
+        stage: 'readiness',
+        durationMs: Date.now() - startedAt,
+      });
+      return validationResult(failure, true);
     }
   });
 }
 
-export function createServer({ approvedProfileListingProvider, connectionValidationProvider }: ServerOptions = {}): Server {
+export function createServer({ approvedProfileListingProvider, connectionValidationProvider, auditSink }: ServerOptions = {}): Server {
   const server = new Server({ name: serverName, version: serverVersion }, { capabilities: { tools: {} } });
-  registerTools(server, approvedProfileListingProvider, connectionValidationProvider);
+  registerTools(server, approvedProfileListingProvider, connectionValidationProvider, auditSink);
   return server;
 }
 
@@ -276,7 +313,11 @@ export async function runStdioServer({
   approvedProfileListingProvider,
   connectionValidationProvider,
 }: StdioServerOptions = {}): Promise<void> {
-  const server = createServer({ approvedProfileListingProvider, connectionValidationProvider });
+  const server = createServer({
+    approvedProfileListingProvider,
+    connectionValidationProvider,
+    auditSink: (serializedEvent) => errorOutput.write(`${serializedEvent}\n`),
+  });
   const transport = new StdioServerTransport(input, output);
 
   let completeLifecycle: () => void;
@@ -286,9 +327,8 @@ export async function runStdioServer({
   let completed = false;
   let closing = false;
 
-  const reportError = (error: unknown): void => {
-    const message = error instanceof Error ? error.message : String(error);
-    errorOutput.write(`MCP server error: ${message}\n`);
+  const reportError = (_error: unknown): void => {
+    errorOutput.write('MCP server error\n');
   };
 
   const cleanup = (): void => {
@@ -364,8 +404,7 @@ if (isEntrypoint) {
   };
 
   runProductionServer().catch((error: unknown) => {
-    const message = error instanceof Error ? error.message : 'unknown failure';
-    process.stderr.write(`MCP server failed to start: ${message}\n`);
+    reportEntrypointFailure(process.stderr, error);
     process.exitCode = 1;
   });
 }

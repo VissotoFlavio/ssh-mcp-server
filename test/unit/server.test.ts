@@ -4,7 +4,14 @@ import { PassThrough } from 'node:stream';
 import test from 'node:test';
 
 import type { ApprovedProfileListingProvider } from '../../src/profiles/approved-profile-listing.js';
-import { listApprovedProfilesToolName, runStdioServer, serverName, validateConnectionToolName, type StdioServerOptions } from '../../src/server.js';
+import {
+  listApprovedProfilesToolName,
+  reportEntrypointFailure,
+  runStdioServer,
+  serverName,
+  validateConnectionToolName,
+  type StdioServerOptions,
+} from '../../src/server.js';
 import type { ConnectionValidationProvider } from '../../src/validation/trusted-connection-validation.js';
 
 function requestResponse(input: PassThrough, output: PassThrough, request: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -90,7 +97,23 @@ test('writes transport errors to stderr instead of stdout', async () => {
   await runtime;
 
   assert.equal(output.readableLength, 0);
-  assert.match(diagnostics, /^MCP server error:/);
+  assert.equal(diagnostics, 'MCP server error\n');
+});
+
+test('redacts secret-bearing entrypoint startup failures', () => {
+  let diagnostic = '';
+  reportEntrypointFailure(
+    {
+      write(chunk: string) {
+        diagnostic += chunk;
+        return true;
+      },
+    },
+    new Error('credential-secret'),
+  );
+
+  assert.equal(diagnostic, 'MCP server failed to start\n');
+  assert.equal(diagnostic.includes('credential-secret'), false);
 });
 
 test('exposes only allowlisted approved profile metadata through the discovery tool', async () => {
@@ -265,6 +288,10 @@ test('validates an approved profile through the trusted readiness provider', asy
     },
   };
   const { input, output, errors, runtime } = createDiscoveryRuntime(provider, connectionValidationProvider);
+  let audit = '';
+  errors.on('data', (chunk) => {
+    audit += String(chunk);
+  });
 
   await requestResponse(input, output, {
     jsonrpc: '2.0',
@@ -290,6 +317,77 @@ test('validates an approved profile through the trusted readiness provider', asy
 
   assert.deepEqual(response.result, { content: [{ type: 'text', text: JSON.stringify({ profileId: 'production-api', ready: true }) }] });
   assert.deepEqual(received, { profileId: 'production-api' });
+  const successAudit = JSON.parse(audit) as { readonly durationMs?: number; readonly [key: string]: unknown };
+  assert.deepEqual(
+    { ...successAudit, durationMs: 0 },
+    {
+      kind: 'connection-audit-event',
+      version: 1,
+      stage: 'readiness',
+      profileId: 'production-api',
+      outcome: 'success',
+      code: 'success',
+      durationMs: 0,
+    },
+  );
+  assert.equal(typeof successAudit.durationMs, 'number');
+  input.end();
+  await runtime;
+  assert.equal(errors.readableLength, 0);
+});
+
+test('rejects a valid provider outcome for a different profile and audits the requested profile', async () => {
+  const provider: ApprovedProfileListingProvider = {
+    async listApprovedProfiles() {
+      return [];
+    },
+  };
+  const connectionValidationProvider: ConnectionValidationProvider = {
+    async validateConnection() {
+      return { profileId: 'staging-api', ready: true };
+    },
+  };
+  const { input, output, errors, runtime } = createDiscoveryRuntime(provider, connectionValidationProvider);
+  let audit = '';
+  errors.on('data', (chunk) => {
+    audit += String(chunk);
+  });
+
+  await requestResponse(input, output, {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'initialize',
+    params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'test-client', version: '1.0.0' } },
+  });
+  const response = await requestResponse(input, output, {
+    jsonrpc: '2.0',
+    id: 2,
+    method: 'tools/call',
+    params: { name: validateConnectionToolName, arguments: { profileId: 'production-api' } },
+  });
+
+  assert.deepEqual(response.result, {
+    content: [{ type: 'text', text: JSON.stringify({ ready: false, outcome: 'failure', code: 'unknown' }) }],
+    isError: true,
+  });
+  assert.equal(JSON.stringify(response).includes('staging-api'), false);
+  const event = JSON.parse(audit) as {
+    readonly profileId?: string;
+    readonly outcome?: string;
+    readonly code?: string;
+    readonly durationMs?: number;
+  };
+  assert.deepEqual(event, {
+    kind: 'connection-audit-event',
+    version: 1,
+    stage: 'readiness',
+    profileId: 'production-api',
+    outcome: 'failure',
+    code: 'unknown',
+    durationMs: event.durationMs,
+  });
+  assert.equal(typeof event.durationMs, 'number');
+  assert.equal(audit.includes('staging-api'), false);
   input.end();
   await runtime;
   assert.equal(errors.readableLength, 0);
@@ -309,6 +407,10 @@ test('rejects unexpected validation input before consulting the readiness provid
     },
   };
   const { input, output, errors, runtime } = createDiscoveryRuntime(provider, connectionValidationProvider);
+  let audit = '';
+  errors.on('data', (chunk) => {
+    audit += String(chunk);
+  });
 
   await requestResponse(input, output, {
     jsonrpc: '2.0',
@@ -328,6 +430,13 @@ test('rejects unexpected validation input before consulting the readiness provid
     isError: true,
   });
   assert.equal(calls, 0);
+  assert.deepEqual(JSON.parse(audit), {
+    kind: 'connection-audit-event',
+    version: 1,
+    stage: 'selection',
+    outcome: 'failure',
+    code: 'invalid-input',
+  });
   input.end();
   await runtime;
   assert.equal(errors.readableLength, 0);
@@ -343,12 +452,26 @@ test('redacts host and credential validation failures', async () => {
   const connectionValidationProvider: ConnectionValidationProvider = {
     async validateConnection() {
       call += 1;
-      const error = new Error(call === 1 ? 'fingerprint=SHA256:private host=prod.internal' : 'credential=os://ssh/private password=secret');
+      if (call === 3) {
+        return {
+          profileId: 'production-api',
+          ready: true,
+          credentialReference: 'os://ssh/private',
+          fingerprint: 'SHA256:private',
+        } as unknown as { readonly profileId: string; readonly ready: true };
+      }
+      const error = new Error(
+        call === 1 ? 'fingerprint=SHA256:private host=prod.internal user=deploy' : 'credential=os://ssh/private password=secret',
+      );
       Object.assign(error, { code: call === 1 ? 'known-hosts-entry-mismatch' : 'credential-reference-unapproved' });
       throw error;
     },
   };
   const { input, output, errors, runtime } = createDiscoveryRuntime(provider, connectionValidationProvider);
+  let audit = '';
+  errors.on('data', (chunk) => {
+    audit += String(chunk);
+  });
 
   await requestResponse(input, output, {
     jsonrpc: '2.0',
@@ -356,7 +479,7 @@ test('redacts host and credential validation failures', async () => {
     method: 'initialize',
     params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'test-client', version: '1.0.0' } },
   });
-  for (const id of [2, 3]) {
+  for (const id of [2, 3, 4]) {
     const response = await requestResponse(input, output, {
       jsonrpc: '2.0',
       id,
@@ -365,7 +488,24 @@ test('redacts host and credential validation failures', async () => {
     });
     assert.equal(JSON.stringify(response).includes('private'), false);
     assert.equal(JSON.stringify(response).includes('secret'), false);
+    assert.equal(JSON.stringify(response).includes('private'), false);
   }
+  assert.equal(audit.includes('private'), false);
+  assert.equal(audit.includes('secret'), false);
+  assert.equal(audit.includes('prod.internal'), false);
+  assert.equal(audit.includes('deploy'), false);
+  const events = audit
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line) as { readonly code: string; readonly stage: string });
+  assert.deepEqual(
+    events.map((event) => ({ code: event.code, stage: event.stage })),
+    [
+      { code: 'host-key-failure', stage: 'readiness' },
+      { code: 'authentication-failure', stage: 'readiness' },
+      { code: 'unknown', stage: 'readiness' },
+    ],
+  );
   input.end();
   await runtime;
   assert.equal(errors.readableLength, 0);
