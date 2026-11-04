@@ -492,6 +492,10 @@ export class PasswordSshAdapter {
     const descriptor = await resolveTrustedConnection(input, this.dependencies.profiles);
     if (descriptor.authMode !== 'password') fail('unsupported-authentication', 'Connection authentication mode is unsupported');
     const targetPlatform = this.dependencies.targetPlatform ?? (typeof process === 'undefined' ? 'unknown' : process.platform);
+    // Windows must use the native Credential Manager plus in-memory transport
+    // boundary; this generic adapter retrieves a password too early to prove
+    // the required host-key-before-credential ordering.
+    if (targetPlatform === 'win32') fail('password-transport-unavailable', 'Password transport is unavailable');
     const knownHosts = await resolveKnownHostsPath(
       descriptor,
       this.dependencies.knownHosts,
