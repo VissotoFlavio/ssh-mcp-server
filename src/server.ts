@@ -16,10 +16,7 @@ export interface StdioServerOptions {
 }
 
 export function createServer(): Server {
-  return new Server(
-    { name: serverName, version: serverVersion },
-    { capabilities: {} },
-  );
+  return new Server({ name: serverName, version: serverVersion }, { capabilities: {} });
 }
 
 /**
