@@ -2,7 +2,7 @@ import { strict as assert } from 'node:assert';
 import { constants } from 'node:fs';
 import { lstat, mkdtemp, mkdir, open, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import test from 'node:test';
 
 import {
@@ -161,7 +161,7 @@ test('bounds state bytes and profile cardinality before accepting state', async 
 });
 
 test('does not parse a descriptor when the state path is substituted after open', async () => {
-  const stateRoot = 'C:\\approved-state';
+  const stateRoot = resolve(tmpdir(), 'approved-state');
   const stateFile = join(stateRoot, CONNECTION_PROFILE_STATE_FILE);
   const root = directoryStats(1, 1);
   const openedFile = fileStats(1, 2, 2);
@@ -189,7 +189,7 @@ test('does not parse a descriptor when the state path is substituted after open'
 });
 
 test('fails closed when the configured root changes identity after opening state', async () => {
-  const stateRoot = 'C:\\approved-state';
+  const stateRoot = resolve(tmpdir(), 'approved-state');
   const stateFile = join(stateRoot, CONNECTION_PROFILE_STATE_FILE);
   const originalRoot = directoryStats(1, 1);
   const replacementRoot = directoryStats(1, 4);
@@ -225,7 +225,7 @@ test('fails closed when the configured root changes identity after opening state
 
 test('fails closed when no-follow descriptor access is unavailable', async () => {
   const registry = new LocalConnectionProfileRegistry(
-    { stateRoot: 'C:\\approved-state' },
+    { stateRoot: resolve(tmpdir(), 'approved-state') },
     {
       supportsNoFollow: false,
       lstat: async () => directoryStats(1, 1),
