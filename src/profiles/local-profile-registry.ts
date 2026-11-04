@@ -12,6 +12,8 @@ export const MAX_CONNECTION_PROFILES = 256;
 export interface LocalProfileRegistryOptions {
   /** Absolute, operator-configured directory containing connection-profiles.json. */
   readonly stateRoot: string;
+  /** When set, require the root and state file to be privately owned by this UID. */
+  readonly operatorUid?: number;
 }
 
 export interface LocalProfileRegistry {
@@ -31,6 +33,8 @@ export interface LocalProfileRegistryFileStats {
   readonly dev: number;
   readonly ino: number;
   readonly size: number;
+  readonly uid?: number;
+  readonly mode?: number;
   isDirectory(): boolean;
   isFile(): boolean;
   isSymbolicLink(): boolean;
@@ -100,6 +104,16 @@ function hasSameIdentity(left: LocalProfileRegistryFileStats, right: LocalProfil
   return left.dev === right.dev && left.ino === right.ino;
 }
 
+function isOperatorOwned(stats: LocalProfileRegistryFileStats, uid: number, directory: boolean): boolean {
+  return (
+    stats.uid === uid &&
+    typeof stats.mode === 'number' &&
+    (stats.mode & 0o022) === 0 &&
+    !stats.isSymbolicLink() &&
+    (directory ? stats.isDirectory() : stats.isFile())
+  );
+}
+
 function validateStateRoot(stateRoot: string): string {
   if (typeof stateRoot !== 'string' || stateRoot.trim() === '' || !isAbsolute(stateRoot) || hasParentTraversal(stateRoot)) {
     throw new TypeError('stateRoot must be an absolute path without parent traversal');
@@ -148,6 +162,7 @@ export class LocalConnectionProfileRegistry implements LocalProfileRegistry {
   private readonly stateRoot: string;
   private readonly stateFile: string;
   private readonly fileSystem: LocalProfileRegistryFileSystem;
+  private readonly operatorUid: number | undefined;
 
   constructor(options: LocalProfileRegistryOptions, fileSystem: LocalProfileRegistryFileSystem = nodeFileSystem) {
     if (!options || typeof options !== 'object') {
@@ -160,6 +175,7 @@ export class LocalConnectionProfileRegistry implements LocalProfileRegistry {
       throw new TypeError('Connection profile state file escapes stateRoot');
     }
     this.fileSystem = fileSystem;
+    this.operatorUid = options.operatorUid;
   }
 
   async getProfile(profileId: string): Promise<ConnectionProfile | undefined> {
@@ -182,14 +198,18 @@ export class LocalConnectionProfileRegistry implements LocalProfileRegistry {
     let handle: LocalProfileRegistryFileHandle | undefined;
     try {
       const rootStats = await this.fileSystem.lstat(this.stateRoot);
-      if (rootStats.isSymbolicLink() || !rootStats.isDirectory()) {
+      if (
+        rootStats.isSymbolicLink() ||
+        !rootStats.isDirectory() ||
+        (this.operatorUid !== undefined && !isOperatorOwned(rootStats, this.operatorUid, true))
+      ) {
         return unavailableState();
       }
       const rootPath = await this.fileSystem.realpath(this.stateRoot);
 
       handle = await this.fileSystem.openReadOnlyNoFollow(this.stateFile);
       const handleStats = await handle.stat();
-      if (!handleStats.isFile()) {
+      if (!handleStats.isFile() || (this.operatorUid !== undefined && !isOperatorOwned(handleStats, this.operatorUid, false))) {
         return unavailableState();
       }
       if (handleStats.size < 0 || handleStats.size > MAX_CONNECTION_PROFILE_STATE_BYTES) {
@@ -197,7 +217,12 @@ export class LocalConnectionProfileRegistry implements LocalProfileRegistry {
       }
 
       const rootAfterOpen = await this.fileSystem.lstat(this.stateRoot);
-      if (rootAfterOpen.isSymbolicLink() || !rootAfterOpen.isDirectory() || !hasSameIdentity(rootStats, rootAfterOpen)) {
+      if (
+        rootAfterOpen.isSymbolicLink() ||
+        !rootAfterOpen.isDirectory() ||
+        !hasSameIdentity(rootStats, rootAfterOpen) ||
+        (this.operatorUid !== undefined && !isOperatorOwned(rootAfterOpen, this.operatorUid, true))
+      ) {
         return unavailableState();
       }
       if ((await this.fileSystem.realpath(this.stateRoot)) !== rootPath) {
@@ -205,7 +230,12 @@ export class LocalConnectionProfileRegistry implements LocalProfileRegistry {
       }
 
       const fileAfterOpen = await this.fileSystem.lstat(this.stateFile);
-      if (fileAfterOpen.isSymbolicLink() || !fileAfterOpen.isFile() || !hasSameIdentity(handleStats, fileAfterOpen)) {
+      if (
+        fileAfterOpen.isSymbolicLink() ||
+        !fileAfterOpen.isFile() ||
+        !hasSameIdentity(handleStats, fileAfterOpen) ||
+        (this.operatorUid !== undefined && !isOperatorOwned(fileAfterOpen, this.operatorUid, false))
+      ) {
         return unavailableState();
       }
       const statePath = await this.fileSystem.realpath(this.stateFile);

@@ -239,6 +239,33 @@ test('fails closed when no-follow descriptor access is unavailable', async () =>
   await expectRegistryFailure(() => registry.listProfiles(), 'state-unavailable');
 });
 
+test('requires an operator-owned, non-writable state file when operatorUid is configured', async () => {
+  const stateRoot = resolve(tmpdir(), 'approved-state');
+  const stateFile = join(stateRoot, CONNECTION_PROFILE_STATE_FILE);
+  const root = { ...directoryStats(1, 1), uid: 1000, mode: 0o700 };
+  const foreignState = { ...fileStats(1, 2, 2), uid: 1001, mode: 0o600 };
+  let readCalled = false;
+  const registry = new LocalConnectionProfileRegistry(
+    { stateRoot, operatorUid: 1000 },
+    {
+      supportsNoFollow: true,
+      lstat: async (path) => (path === stateRoot ? root : foreignState),
+      realpath: async (path) => (path === stateRoot ? stateRoot : stateFile),
+      openReadOnlyNoFollow: async () => ({
+        stat: async () => foreignState,
+        read: async () => {
+          readCalled = true;
+          return { bytesRead: 0 };
+        },
+        close: async () => undefined,
+      }),
+    },
+  );
+
+  await expectRegistryFailure(() => registry.listProfiles(), 'state-unavailable');
+  assert.equal(readCalled, false);
+});
+
 test('rejects state roots with traversal and does not allow alternate state filenames', async () => {
   await withStateRoot(async (stateRoot) => {
     assert.throws(() => new LocalConnectionProfileRegistry({ stateRoot: `${stateRoot}\\..\\other` }), /parent traversal/);

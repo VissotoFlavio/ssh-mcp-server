@@ -12,6 +12,7 @@ import {
   createRuntimeApprovedProfileListingProvider,
   type ApprovedProfileListingProvider,
 } from './profiles/approved-profile-listing.js';
+import { createRuntimeConnectionValidationProvider } from './runtime/posix-runtime-validation.js';
 import {
   toConnectionValidationFailure,
   type ConnectionValidationOutcome,
@@ -400,7 +401,8 @@ const isEntrypoint = process.argv[1] !== undefined && import.meta.url === pathTo
 if (isEntrypoint) {
   const runProductionServer = async (): Promise<void> => {
     const approvedProfileListingProvider = createRuntimeApprovedProfileListingProvider();
-    await runStdioServer({ approvedProfileListingProvider });
+    const connectionValidationProvider = createRuntimeConnectionValidationProvider();
+    await runStdioServer({ approvedProfileListingProvider, connectionValidationProvider });
   };
 
   runProductionServer().catch((error: unknown) => {
