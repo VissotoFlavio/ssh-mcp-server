@@ -32,8 +32,10 @@ if (process.platform !== 'win32' || !existsSync(addonPath)) {
     try {
       runFixture('safe', root);
       configured = true;
-      const binding = nativeRequire(addonPath) as { readProfileState(): Buffer };
+      const binding = nativeRequire(addonPath) as { readProfileState(): Buffer; resolveOpenSsh(): { ssh: string; sshAdd: string } };
       assert.equal(binding.readProfileState().toString('utf8'), '{"profiles":[]}');
+      assert.match(binding.resolveOpenSsh().ssh, /\\System32\\OpenSSH\\ssh\.exe$/iu);
+      assert.match(binding.resolveOpenSsh().sshAdd, /\\System32\\OpenSSH\\ssh-add\.exe$/iu);
     } finally {
       if (configured) runFixture('cleanup', root);
     }

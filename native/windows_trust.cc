@@ -3,6 +3,10 @@
 #include <windows.h>
 #include <aclapi.h>
 #include <sddl.h>
+#include <softpub.h>
+#include <mscat.h>
+#include <wincrypt.h>
+#include <wintrust.h>
 
 #include <string>
 #include <cstring>
@@ -20,6 +24,15 @@ class Handle final {
   ~Handle() { if (value_ != INVALID_HANDLE_VALUE) CloseHandle(value_); }
   Handle(const Handle&) = delete;
   Handle& operator=(const Handle&) = delete;
+  Handle(Handle&& other) noexcept : value_(other.value_) { other.value_ = INVALID_HANDLE_VALUE; }
+  Handle& operator=(Handle&& other) noexcept {
+    if (this != &other) {
+      if (value_ != INVALID_HANDLE_VALUE) CloseHandle(value_);
+      value_ = other.value_;
+      other.value_ = INVALID_HANDLE_VALUE;
+    }
+    return *this;
+  }
   HANDLE get() const { return value_; }
  private:
   HANDLE value_;
@@ -48,6 +61,15 @@ bool IsWellKnown(PSID sid, WELL_KNOWN_SID_TYPE type) {
 
 bool IsTrustedSid(PSID sid, PSID operator_sid) {
   return EqualSid(sid, operator_sid) || IsWellKnown(sid, WinLocalSystemSid) || IsWellKnown(sid, WinBuiltinAdministratorsSid);
+}
+
+bool IsTrustedSystemSid(PSID sid) {
+  static const wchar_t kTrustedInstallerSid[] = L"S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+  PSID trusted_installer = nullptr;
+  const bool converted = ConvertStringSidToSidW(kTrustedInstallerSid, &trusted_installer) != 0;
+  const bool trusted = IsWellKnown(sid, WinLocalSystemSid) || IsWellKnown(sid, WinBuiltinAdministratorsSid) || (converted && EqualSid(sid, trusted_installer));
+  if (trusted_installer != nullptr) LocalFree(trusted_installer);
+  return trusted;
 }
 
 bool IsSafeDacl(PACL dacl, PSID operator_sid, const GENERIC_MAPPING& mapping, ACCESS_MASK mutation_rights) {
@@ -164,6 +186,42 @@ bool VerifyFile(HANDLE handle, PSID operator_sid, bool directory, bool require_o
   return safe;
 }
 
+bool VerifySystemDacl(PACL dacl) {
+  if (dacl == nullptr) return false;
+  ACL_SIZE_INFORMATION info{};
+  if (!GetAclInformation(dacl, &info, sizeof(info), AclSizeInformation)) return false;
+  GENERIC_MAPPING mapping{FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_GENERIC_EXECUTE, FILE_ALL_ACCESS};
+  const ACCESS_MASK mutation = FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | FILE_DELETE_CHILD | DELETE | WRITE_DAC | WRITE_OWNER;
+  for (DWORD index = 0; index < info.AceCount; ++index) {
+    void* raw_ace = nullptr;
+    if (!GetAce(dacl, index, &raw_ace)) return false;
+    auto* header = static_cast<ACE_HEADER*>(raw_ace);
+    if ((header->AceFlags & INHERIT_ONLY_ACE) != 0 || header->AceType == ACCESS_DENIED_ACE_TYPE) continue;
+    if (header->AceType != ACCESS_ALLOWED_ACE_TYPE) return false;
+    auto* ace = static_cast<ACCESS_ALLOWED_ACE*>(raw_ace);
+    ACCESS_MASK mask = ace->Mask;
+    MapGenericMask(&mask, &mapping);
+    PSID sid = reinterpret_cast<PSID>(&ace->SidStart);
+    if (!IsTrustedSystemSid(sid) && (mask & mutation) != 0) return false;
+  }
+  return true;
+}
+
+bool VerifyTrustedSystemObject(HANDLE handle, bool directory) {
+  FILE_ATTRIBUTE_TAG_INFO tag{};
+  if (!GetFileInformationByHandleEx(handle, FileAttributeTagInfo, &tag, sizeof(tag)) || (tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) return false;
+  BY_HANDLE_FILE_INFORMATION info{};
+  if (!GetFileInformationByHandle(handle, &info) || ((info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) != directory) return false;
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  PSID owner = nullptr;
+  PACL dacl = nullptr;
+  const DWORD result = GetSecurityInfo(handle, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, &owner, nullptr, &dacl, nullptr, &descriptor);
+  if (result != ERROR_SUCCESS || descriptor == nullptr || owner == nullptr) { if (descriptor != nullptr) LocalFree(descriptor); return false; }
+  const bool safe = IsTrustedSystemSid(owner) && VerifySystemDacl(dacl);
+  LocalFree(descriptor);
+  return safe;
+}
+
 bool SameIdentity(HANDLE left, HANDLE right) {
   FILE_ID_INFO first{};
   FILE_ID_INFO second{};
@@ -193,6 +251,119 @@ bool FinalPath(HANDLE handle, std::wstring* value) {
   if (GetFinalPathNameByHandleW(handle, buffer.data(), static_cast<DWORD>(buffer.size()), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS) == 0) return false;
   value->assign(buffer.data());
   return true;
+}
+
+std::wstring StripExtendedPrefix(const std::wstring& path) {
+  return path.rfind(L"\\\\?\\", 0) == 0 ? path.substr(4) : path;
+}
+
+bool HasMicrosoftPublisher(PCCERT_CONTEXT context) {
+  if (context == nullptr) return false;
+  static constexpr BYTE kAllowedThumbprints[][20] = {{0x66, 0x7B, 0xBA, 0x1E, 0x1F, 0x47, 0x82, 0x21, 0xAA, 0x65, 0xDE, 0x4F, 0x75, 0x18, 0x7A, 0x75, 0x1B, 0x03, 0xA4, 0x53}};
+  BYTE thumbprint[20]{};
+  DWORD thumbprint_size = sizeof(thumbprint);
+  if (!CertGetCertificateContextProperty(context, CERT_SHA1_HASH_PROP_ID, thumbprint, &thumbprint_size) || thumbprint_size != sizeof(thumbprint)) return false;
+  bool thumbprint_allowed = false;
+  for (const auto& allowed : kAllowedThumbprints) {
+    if (std::memcmp(thumbprint, allowed, sizeof(thumbprint)) == 0) { thumbprint_allowed = true; break; }
+  }
+  if (!thumbprint_allowed) return false;
+  const DWORD subject_size = CertGetNameStringW(context, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr, nullptr, 0);
+  std::vector<wchar_t> subject(subject_size + 1);
+  const bool trusted = subject_size > 1 && CertGetNameStringW(context, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr, subject.data(), static_cast<DWORD>(subject.size())) != 0 && _wcsicmp(subject.data(), L"Microsoft Windows") == 0;
+  return trusted;
+}
+
+bool VerifyCatalogMember(const std::wstring& path) {
+  Handle file(CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+  if (file.get() == INVALID_HANDLE_VALUE) return false;
+  HCATADMIN administrator = nullptr;
+  if (!CryptCATAdminAcquireContext(&administrator, nullptr, 0)) return false;
+  DWORD hash_size = 0;
+  if (!CryptCATAdminCalcHashFromFileHandle(file.get(), &hash_size, nullptr, 0) || hash_size == 0) { CryptCATAdminReleaseContext(administrator, 0); return false; }
+  std::vector<BYTE> hash(hash_size);
+  if (!CryptCATAdminCalcHashFromFileHandle(file.get(), &hash_size, hash.data(), 0)) { CryptCATAdminReleaseContext(administrator, 0); return false; }
+  static constexpr wchar_t kHex[] = L"0123456789ABCDEF";
+  std::wstring tag;
+  tag.reserve(hash_size * 2);
+  for (DWORD index = 0; index < hash_size; ++index) { tag.push_back(kHex[(hash[index] >> 4) & 0x0f]); tag.push_back(kHex[hash[index] & 0x0f]); }
+  HCATINFO previous = nullptr;
+  bool trusted = false;
+  while (HCATINFO catalog = CryptCATAdminEnumCatalogFromHash(administrator, hash.data(), hash_size, 0, &previous)) {
+    previous = catalog;
+    CATALOG_INFO info{};
+    info.cbStruct = sizeof(info);
+    if (!CryptCATCatalogInfoFromContext(catalog, &info, 0)) continue;
+    WINTRUST_CATALOG_INFO member{};
+    member.cbStruct = sizeof(member);
+    member.pcwszCatalogFilePath = info.wszCatalogFile;
+    member.pcwszMemberTag = tag.c_str();
+    member.pcwszMemberFilePath = path.c_str();
+    member.hMemberFile = file.get();
+    member.pbCalculatedFileHash = hash.data();
+    member.cbCalculatedFileHash = hash_size;
+    member.hCatAdmin = administrator;
+    WINTRUST_DATA trust_data{};
+    trust_data.cbStruct = sizeof(trust_data);
+    trust_data.dwUIChoice = WTD_UI_NONE;
+    trust_data.fdwRevocationChecks = WTD_REVOKE_NONE;
+    trust_data.dwUnionChoice = WTD_CHOICE_CATALOG;
+    trust_data.pCatalog = &member;
+    trust_data.dwStateAction = WTD_STATEACTION_VERIFY;
+    GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    const LONG status = WinVerifyTrust(nullptr, &action, &trust_data);
+    bool publisher_matches = false;
+    if (status == ERROR_SUCCESS) {
+      CRYPT_PROVIDER_DATA* provider = WTHelperProvDataFromStateData(trust_data.hWVTStateData);
+      CRYPT_PROVIDER_SGNR* signer = provider == nullptr ? nullptr : WTHelperGetProvSignerFromChain(provider, 0, FALSE, 0);
+      publisher_matches = signer != nullptr && signer->csCertChain > 0 && signer->pasCertChain != nullptr && HasMicrosoftPublisher(signer->pasCertChain[0].pCert);
+    }
+    trust_data.dwStateAction = WTD_STATEACTION_CLOSE;
+    WinVerifyTrust(nullptr, &action, &trust_data);
+    if (status == ERROR_SUCCESS && publisher_matches) { trusted = true; break; }
+  }
+  if (previous != nullptr) CryptCATAdminReleaseCatalogContext(administrator, previous, 0);
+  CryptCATAdminReleaseContext(administrator, 0);
+  return trusted;
+}
+
+bool IsMicrosoftSigned(const std::wstring& path) {
+  return VerifyCatalogMember(path);
+}
+
+bool OpenTrustedSystemObject(const std::wstring& path, bool directory, Handle* result) {
+  const DWORD flags = (directory ? FILE_FLAG_BACKUP_SEMANTICS : 0) | FILE_FLAG_OPEN_REPARSE_POINT;
+  Handle handle(CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES | READ_CONTROL, FILE_SHARE_READ, nullptr, OPEN_EXISTING, flags, nullptr));
+  if (handle.get() == INVALID_HANDLE_VALUE || !VerifyTrustedSystemObject(handle.get(), directory)) return false;
+  std::wstring final_path;
+  if (!FinalPath(handle.get(), &final_path) || _wcsicmp(StripExtendedPrefix(final_path).c_str(), path.c_str()) != 0) return false;
+  *result = std::move(handle);
+  return true;
+}
+
+bool SystemDirectory(std::wstring* value) {
+  std::vector<wchar_t> buffer(MAX_PATH);
+  const UINT required = GetSystemDirectoryW(buffer.data(), static_cast<UINT>(buffer.size()));
+  if (required == 0 || required >= 32768) return false;
+  if (required >= buffer.size()) {
+    buffer.resize(required + 1);
+    if (GetSystemDirectoryW(buffer.data(), static_cast<UINT>(buffer.size())) == 0) return false;
+  }
+  value->assign(buffer.data());
+  return IsAbsoluteLocalPath(*value) && IsLocalNtfsPath(*value);
+}
+
+bool TrustedOpenSsh(std::wstring* ssh, std::wstring* ssh_add) {
+  std::wstring system;
+  if (!SystemDirectory(&system)) return false;
+  const std::wstring directory = system + L"\\OpenSSH";
+  *ssh = directory + L"\\ssh.exe";
+  *ssh_add = directory + L"\\ssh-add.exe";
+  Handle system_handle;
+  Handle openssh_handle;
+  Handle ssh_handle;
+  Handle ssh_add_handle;
+  return OpenTrustedSystemObject(system, true, &system_handle) && OpenTrustedSystemObject(directory, true, &openssh_handle) && OpenTrustedSystemObject(*ssh, false, &ssh_handle) && OpenTrustedSystemObject(*ssh_add, false, &ssh_add_handle) && IsMicrosoftSigned(*ssh) && IsMicrosoftSigned(*ssh_add);
 }
 
 bool RootsAreDistinct(const std::wstring& state_root, const std::wstring& known_hosts_root, PSID operator_sid) {
@@ -269,12 +440,26 @@ napi_value ReadKnownHosts(napi_env env, napi_callback_info info) {
   return ToBuffer(env, data);
 }
 
+napi_value ResolveOpenSsh(napi_env env, napi_callback_info info) {
+  size_t count = 0;
+  if (napi_get_cb_info(env, info, &count, nullptr, nullptr, nullptr) != napi_ok || count != 0) return Unavailable(env);
+  std::wstring ssh;
+  std::wstring ssh_add;
+  if (!TrustedOpenSsh(&ssh, &ssh_add)) return Unavailable(env);
+  napi_value result{};
+  napi_value ssh_value{};
+  napi_value ssh_add_value{};
+  if (napi_create_object(env, &result) != napi_ok || napi_create_string_utf16(env, reinterpret_cast<const char16_t*>(ssh.c_str()), ssh.size(), &ssh_value) != napi_ok || napi_create_string_utf16(env, reinterpret_cast<const char16_t*>(ssh_add.c_str()), ssh_add.size(), &ssh_add_value) != napi_ok || napi_set_named_property(env, result, "ssh", ssh_value) != napi_ok || napi_set_named_property(env, result, "sshAdd", ssh_add_value) != napi_ok) return Unavailable(env);
+  return result;
+}
+
 }  // namespace
 
 NAPI_MODULE_INIT() {
   napi_property_descriptor properties[] = {
     {"readProfileState", nullptr, ReadProfileState, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"readKnownHosts", nullptr, ReadKnownHosts, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"resolveOpenSsh", nullptr, ResolveOpenSsh, nullptr, nullptr, nullptr, napi_default, nullptr},
   };
   if (napi_define_properties(env, exports, sizeof(properties) / sizeof(properties[0]), properties) != napi_ok) return nullptr;
   return exports;

@@ -1,7 +1,8 @@
 import { createRequire } from 'node:module';
-import { release } from 'node:os';
 
 import { validateConnectionProfile, validateProfileSelection, type ConnectionProfile } from '../profiles/connection-profile.js';
+
+import { supportsWindowsAlphaRuntime } from './windows-runtime-support.js';
 
 const require = createRequire(import.meta.url);
 const MAX_STATE_BYTES = 1024 * 1024;
@@ -24,15 +25,8 @@ function unavailable(): never {
   throw new WindowsSecureStorageError();
 }
 
-function supportedWindowsRuntime(): boolean {
-  if (process.platform !== 'win32' || process.arch !== 'x64') return false;
-  const nodeMajor = Number.parseInt(process.versions.node.split('.')[0] ?? '', 10);
-  const windowsBuild = Number.parseInt(release().split('.')[2] ?? '', 10);
-  return Number.isSafeInteger(nodeMajor) && nodeMajor >= 22 && Number.isSafeInteger(windowsBuild) && windowsBuild >= 20_348;
-}
-
 function loadNativeBinding(): WindowsTrustBinding {
-  if (!supportedWindowsRuntime()) {
+  if (!supportsWindowsAlphaRuntime()) {
     return unavailable();
   }
 

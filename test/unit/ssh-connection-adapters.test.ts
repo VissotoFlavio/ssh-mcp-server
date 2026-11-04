@@ -233,9 +233,60 @@ test('requires the exact approved fingerprint and confines known-hosts paths', a
     targetPlatform: 'win32',
     trustedKnownHostsDirectory: 'C:\\trusted\\ssh',
     executable: { resolve: () => 'C:\\Windows\\System32\\OpenSSH\\ssh.exe' },
+    agentIdentity: { isAvailable: async () => true },
     knownHosts: { resolve: async () => ({ path: 'C:\\trusted\\ssh\\known_hosts', fingerprint: agentProfile.expectedHostFingerprint }) },
   });
   await windowsPath.connect({ profileId: 'production-api' });
+});
+
+test('requires a Windows agent identity before it starts a readiness child', async () => {
+  const runner = new FakeRunner();
+  const dependencies = {
+    ...agentDependencies(runner),
+    targetPlatform: 'win32',
+    trustedKnownHostsDirectory: 'C:\\trusted\\ssh',
+    executable: { resolve: () => 'C:\\Windows\\System32\\OpenSSH\\ssh.exe' },
+    knownHosts: { resolve: async () => ({ path: 'C:\\trusted\\ssh\\known_hosts', fingerprint: agentProfile.expectedHostFingerprint }) },
+  };
+  await assert.rejects(
+    new OpenSshAgentAdapter(dependencies).connect({ profileId: 'production-api' }),
+    (error) => error instanceof SshAdapterError && error.code === 'ssh-connection-failed',
+  );
+  assert.equal(runner.executable, '');
+
+  const order: string[] = [];
+  const identityRunner = new FakeRunner();
+  const runReadiness = identityRunner.run.bind(identityRunner);
+  identityRunner.run = (executable, args, options) => {
+    order.push('readiness');
+    return runReadiness(executable, args, options);
+  };
+  await new OpenSshAgentAdapter({
+    ...dependencies,
+    runner: identityRunner,
+    agentIdentity: {
+      isAvailable: async () => {
+        order.push('identity');
+        return true;
+      },
+    },
+  }).connect({ profileId: 'production-api' });
+  assert.deepEqual(order, ['identity', 'readiness']);
+});
+
+test('does not provide an unverified Windows OpenSSH default', async () => {
+  const runner = new FakeRunner();
+  await assert.rejects(
+    new OpenSshAgentAdapter({
+      ...agentDependencies(runner),
+      targetPlatform: 'win32',
+      trustedKnownHostsDirectory: 'C:\\trusted\\ssh',
+      knownHosts: { resolve: async () => ({ path: 'C:\\trusted\\ssh\\known_hosts', fingerprint: agentProfile.expectedHostFingerprint }) },
+      agentIdentity: { isAvailable: async () => true },
+    }).connect({ profileId: 'production-api' }),
+    (error) => error instanceof SshAdapterError && error.code === 'invalid-executable',
+  );
+  assert.equal(runner.executable, '');
 });
 
 test('supports only bracketed IPv6 literals in the trusted target', async () => {
@@ -350,6 +401,7 @@ test('canonicalizes known-hosts files and rejects symlink escapes', async (t) =>
       targetPlatform: platform,
       knownHosts: { resolve: async () => ({ path: knownHosts, fingerprint: agentProfile.expectedHostFingerprint }) },
       executable: { resolve: () => process.execPath },
+      agentIdentity: platform === 'win32' ? { isAvailable: async () => true } : undefined,
       runner: new FakeRunner(),
     };
     await new OpenSshAgentAdapter(base).connect({ profileId: 'production-api' });

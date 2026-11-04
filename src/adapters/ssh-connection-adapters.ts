@@ -3,6 +3,8 @@ import { realpath as fsRealpath } from 'node:fs/promises';
 import { isIP } from 'node:net';
 import { posix as posixPath, win32 as win32Path } from 'node:path';
 
+import type { AgentIdentityAvailability } from '../policy/host-identity-credential-policy.js';
+
 /**
  * The only value accepted from an untrusted caller.  All connection details
  * are resolved by a trusted provider after this selection has been checked.
@@ -355,6 +357,8 @@ export interface SshAdapterDependencies {
 
 export interface OpenSshAgentAdapterDependencies extends SshAdapterDependencies {
   readonly executable?: OpenSshExecutableResolver;
+  /** Required for Windows before an OpenSSH readiness child can start. */
+  readonly agentIdentity?: AgentIdentityAvailability;
   /** A runner with a trusted local readiness probe. */
   readonly runner: SshProcessRunner;
 }
@@ -417,6 +421,7 @@ export class OpenSshAgentAdapter {
   private readonly realpath: TrustedRealpath;
   private readonly targetPlatform: string;
   private readonly executable: OpenSshExecutableResolver;
+  private readonly agentIdentity: AgentIdentityAvailability | undefined;
   private readonly runner: SshProcessRunner;
 
   constructor(dependencies: OpenSshAgentAdapterDependencies) {
@@ -426,6 +431,7 @@ export class OpenSshAgentAdapter {
     this.realpath = dependencies.realpath ?? fsRealpath;
     this.targetPlatform = dependencies.targetPlatform ?? (typeof process === 'undefined' ? 'unknown' : process.platform);
     this.executable = dependencies.executable ?? new PlatformOpenSshExecutableResolver();
+    this.agentIdentity = dependencies.agentIdentity;
     this.runner = dependencies.runner;
     this.timeoutMs = boundedTimeout(dependencies.timeoutMs);
   }
@@ -434,6 +440,15 @@ export class OpenSshAgentAdapter {
     const descriptor = await resolveTrustedConnection(input, this.profiles);
     if (descriptor.authMode !== 'agent-key') fail('unsupported-authentication', 'Connection authentication mode is unsupported');
     const knownHosts = await resolveKnownHostsPath(descriptor, this.knownHosts, this.targetPlatform, this.trustedKnownHostsDirectory, this.realpath);
+    if (this.targetPlatform === 'win32') {
+      let available: unknown;
+      try {
+        available = this.agentIdentity === undefined ? false : await this.agentIdentity.isAvailable();
+      } catch {
+        available = false;
+      }
+      if (available !== true) fail('ssh-connection-failed', 'SSH connection failed');
+    }
     let executable: unknown;
     try {
       executable = this.executable.resolve();
@@ -632,7 +647,6 @@ export class PlatformOpenSshExecutableResolver implements OpenSshExecutableResol
   }
 
   resolve(): string {
-    if (this.platform === 'win32') return 'C:\\Windows\\System32\\OpenSSH\\ssh.exe';
     if (this.platform === 'darwin' || this.platform === 'linux') return '/usr/bin/ssh';
     throw new SshAdapterError('invalid-executable', 'OpenSSH executable is unavailable');
   }
