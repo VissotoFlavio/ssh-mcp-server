@@ -9,6 +9,8 @@
   },
   "scripts": {
     "build": "tsc --project tsconfig.json",
+    "build:native": "node -e \"if (process.platform !== 'win32') process.exit(0)\" && node-gyp rebuild",
+    "install": "node -e \"process.exit(0)\"",
     "check": "tsc --project tsconfig.test.json --noEmit",
     "lint": "npm run check && eslint src test",
     "lint:fix": "prettier --write --ignore-path .gitignore . && eslint src test --fix",
@@ -26,6 +28,7 @@
     "eslint-import-resolver-typescript": "^4.4.4",
     "eslint-plugin-import": "^2.32.0",
     "eslint-plugin-prettier": "^5.5.5",
+    "node-gyp": "^12.4.0",
     "prettier": "^3.8.1",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",

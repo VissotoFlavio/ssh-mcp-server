@@ -6,6 +6,10 @@ This document is the authoritative security model for the native Windows
 runtime proposed for `v0.1.0-alpha.1`. It is a design boundary, not a claim
 that the current POSIX runtime supports Windows.
 
+The Windows runtime is **per-user only**. It never requires elevation, reads
+no machine-wide configuration, and never shares approved profile or
+known-hosts state between Windows users.
+
 The alpha supports only all of the following:
 
 - 64-bit Windows 11, version 23H2 or later, or Windows Server 2022 or later;
@@ -33,17 +37,22 @@ volume/file identity. A profile identifier is never converted into an
 arbitrary path: it selects one fixed known-hosts leaf beneath the already
 verified known-hosts root.
 
-On Windows, root paths and the operator SID are read only from the
-machine-scoped `HKLM\\Software\\Vissoto\\ssh-mcp-server` configuration key by
-the native boundary. The key supplies fixed `StateRoot`, `KnownHostsRoot`, and
-`OperatorSid` values. Its inspected DACL must allow mutation only by `SYSTEM`
-and local Administrators, and reject for every other principal `KEY_SET_VALUE`,
-`KEY_CREATE_SUB_KEY`, delete, `WRITE_DAC`, `WRITE_OWNER`, generic, or
-equivalent rights that can change the key, its values, its subkeys, or its
-access control. Process environment variables, command-line arguments,
-current-directory data, and user-scoped registry values must not override or
-supply these values. Missing, malformed, unreadable, or unsafe configuration
+On Windows, root paths are read only from the current user's
+`HKCU\\Software\\Vissoto\\ssh-mcp-server` configuration key by the native
+boundary. The key supplies fixed `StateRoot` and `KnownHostsRoot` values; the
+operator SID is derived from the current process token, never configured as a
+value. Its inspected owner and protected DACL must belong to that SID and
+reject `KEY_SET_VALUE`, `KEY_CREATE_SUB_KEY`, delete, `WRITE_DAC`,
+`WRITE_OWNER`, generic, or equivalent mutation rights for every other
+principal. Process environment variables, command-line arguments,
+current-directory data, and other user-registry values must not override or
+supply these roots. Missing, malformed, unreadable, or unsafe configuration
 makes Windows discovery and validation unavailable.
+
+The configuration key, both roots, and every accepted file must be owned by
+that same token SID. A different user's hive, profile directory, root, SID, or
+process is not a fallback and is rejected. This is an isolation boundary, not
+a mechanism for sharing configuration between local accounts.
 
 Only local NTFS volumes are supported. UNC paths, mapped or substituted
 drives, device paths, alternate data streams, network filesystems, and any
@@ -81,6 +90,9 @@ runtime must apply all of these rules before reading or trusting content:
 
 - Each root and every traversed component is a directory, is not a reparse
   point, and remains the same volume/file identity throughout the operation.
+  The terminal root is owned by the configured operator SID with a protected
+  DACL; ancestors must reject untrusted replacement, deletion, ACL, ownership,
+  attribute, and child-creation rights before traversal continues.
 - A leaf is a regular file, is not a reparse point, and is opened before it is
   inspected or read. The opened handle identity must still match the pathname
   object after the open.
@@ -162,10 +174,10 @@ The Windows implementation must include deterministic tests for:
 - each supported Windows, Node.js, and OpenSSH version combination;
 - safe roots and files, wrong owners, broad or inherited unsafe DACLs, and
   unreadable security descriptors, including an untrusted `WRITE_DAC` ACE;
-- environment, command-line, current-directory, and user-registry attempts
-  to replace the fixed machine-scoped root or operator-SID configuration,
+- environment, command-line, current-directory, and alternate-registry
+  attempts to replace the fixed per-user root configuration,
   including untrusted `KEY_SET_VALUE`, `KEY_CREATE_SUB_KEY`, `WRITE_DAC`, and
-  delete rights on the machine configuration key. The registry DACL suite is
+  delete rights on the per-user configuration key. The registry DACL suite is
   table-driven and includes separate failing cases for `WRITE_OWNER`,
   `GENERIC_WRITE`, and every generic/equivalent mutation mapping;
 - symbolic links, junctions, mount points, unknown reparse tags, substituted

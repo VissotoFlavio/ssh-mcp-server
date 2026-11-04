@@ -4,8 +4,10 @@ A secure, policy-driven Model Context Protocol server for approved SSH operation
 
 The planned native Windows alpha has a separate, fail-closed
 [Windows trust model](docs/windows-trust-model.md), including its
-machine-scoped configuration boundary. The current production runtime remains
-supported on Linux and macOS only.
+per-user configuration boundary. Windows configuration and approved state are
+never shared across local users, and the MCP does not require administrator
+execution. The current production runtime remains supported on Linux and macOS
+only.
 
 ## Runtime configuration
 
