@@ -42,6 +42,29 @@ async function expectRegistryFailure(action: () => Promise<unknown>, code: Local
   await assert.rejects(action, (error: unknown) => error instanceof LocalProfileRegistryError && error.code === code);
 }
 
+function isUnavailableSymlinkCapability(error: unknown): error is NodeJS.ErrnoException & { code: 'EACCES' | 'ENOSYS' | 'EPERM' } {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  const { code } = error as NodeJS.ErrnoException;
+  return code === 'EACCES' || code === 'ENOSYS' || code === 'EPERM';
+}
+
+async function createSymlinkWhenAvailable(t: { skip(message: string): void }, description: string, operation: () => Promise<void>): Promise<boolean> {
+  try {
+    await operation();
+    return true;
+  } catch (error) {
+    if (!isUnavailableSymlinkCapability(error)) {
+      throw error;
+    }
+
+    t.skip(`${description} creation is unavailable (${error.code}): ${error.message}`);
+    return false;
+  }
+}
+
 function fileStats(dev: number, ino: number, size: number): LocalProfileRegistryFileStats {
   return {
     dev,
@@ -276,26 +299,63 @@ test('rejects state roots with traversal and does not allow alternate state file
   });
 });
 
-test('rejects symbolic-link roots and state files', async (t) => {
+test('skips only unavailable symbolic-link capabilities', async () => {
+  const skipped: string[] = [];
+
+  const created = await createSymlinkWhenAvailable({ skip: (message) => skipped.push(message) }, 'file symbolic link', async () => {
+    throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' });
+  });
+
+  assert.equal(created, false);
+  assert.deepEqual(skipped, ['file symbolic link creation is unavailable (EPERM): operation not permitted']);
+});
+
+test('propagates unexpected symbolic-link creation failures', async () => {
+  const unexpected = Object.assign(new Error('disk failure'), { code: 'EIO' });
+
+  await assert.rejects(
+    () =>
+      createSymlinkWhenAvailable({ skip: () => assert.fail('unexpected error must not skip') }, 'file symbolic link', async () => {
+        throw unexpected;
+      }),
+    (error: unknown) => error === unexpected,
+  );
+});
+
+test('rejects symbolic-link state roots', async (t) => {
   await withStateRoot(async (stateRoot) => {
     const targetRoot = await mkdtemp(join(tmpdir(), 'ssh-mcp-profile-target-'));
     try {
       await writeState(targetRoot, { profiles: [validProfile] });
       const linkedRoot = join(stateRoot, 'linked-root');
-      try {
-        await symlink(targetRoot, linkedRoot, 'junction');
-      } catch (error) {
-        t.skip(`symbolic links are unavailable: ${(error as Error).message}`);
+      if (!(await createSymlinkWhenAvailable(t, 'directory symbolic link', () => symlink(targetRoot, linkedRoot, 'junction')))) {
         return;
       }
 
       const linkedRegistry = createRegistry(linkedRoot);
       await expectRegistryFailure(() => linkedRegistry.listProfiles(), 'state-unavailable');
+    } finally {
+      await rm(targetRoot, { recursive: true, force: true });
+    }
+  });
+});
 
+test('rejects symbolic-link state files', async (t) => {
+  await withStateRoot(async (stateRoot) => {
+    const targetRoot = await mkdtemp(join(tmpdir(), 'ssh-mcp-profile-target-'));
+    try {
+      await writeState(targetRoot, { profiles: [validProfile] });
       const fileRoot = join(stateRoot, 'file-root');
       await mkdir(fileRoot);
       const externalState = join(targetRoot, CONNECTION_PROFILE_STATE_FILE);
-      await symlink(externalState, join(fileRoot, CONNECTION_PROFILE_STATE_FILE), 'file');
+      if (
+        !(await createSymlinkWhenAvailable(t, 'file symbolic link', () =>
+          symlink(externalState, join(fileRoot, CONNECTION_PROFILE_STATE_FILE), 'file'),
+        ))
+      ) {
+        return;
+      }
+
       const fileRegistry = createRegistry(fileRoot);
       await expectRegistryFailure(() => fileRegistry.listProfiles(), 'state-unavailable');
     } finally {
