@@ -174,10 +174,13 @@ environment variables, files, logs, diagnostics, audit events, or MCP
 responses.
 
 Windows Credential Manager secrets are generic credentials whose target name
-is fixed to `Vissoto/ssh-mcp-server/<opaque-locator>`. The native boundary
-accepts only the locator of an approved `os://ssh/<opaque-locator>` reference;
-it does not accept target names, shell commands, paths, or profile fields as
-credential input. The `ssh2` 1.17.0 in-process client is the approved alpha
+is fixed to `Vissoto/ssh-mcp-server/<opaque-locator>`. The TypeScript
+Credential Manager wrapper is the approval boundary: it accepts only an
+operator-approved `os://ssh/<opaque-locator>` reference and rejects it before
+calling native code otherwise. The native boundary receives only that already
+approved opaque locator, validates its narrow character grammar, derives the
+fixed target name, and does not accept target names, shell commands, paths, or
+profile fields as credential input. The `ssh2` 1.17.0 in-process client is the approved alpha
 transport: its host verifier checks the approved SHA-256 fingerprint before
 its authentication callback retrieves the password. It launches no child
 process and does not request a shell, command, environment, or forwarding
