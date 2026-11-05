@@ -24,6 +24,7 @@ function session(overrides: { readonly profile?: ConnectionProfile; readonly byt
   let captures = 0;
   let disposals = 0;
   const requests: unknown[] = [];
+  const agentRequests: unknown[] = [];
   const candidate = new WindowsValidationSession({
     storage: {
       getProfile: (profileId) => (profileId === profile.profileId ? (overrides.profile ?? profile) : undefined),
@@ -38,13 +39,18 @@ function session(overrides: { readonly profile?: ConnectionProfile; readonly byt
       },
     },
     agentIdentity: { isAvailable: async () => true },
+    agentReadiness: {
+      validate: async (...values) => {
+        agentRequests.push(values);
+      },
+    },
     createPasswordTransport: () => ({
       connect: async (request) => {
         requests.push(request);
       },
     }),
   });
-  return { candidate, captures: () => captures, disposals: () => disposals, requests };
+  return { candidate, captures: () => captures, disposals: () => disposals, requests, agentRequests };
 }
 
 test('composes captured known-hosts bytes, policy, and in-memory password readiness without caller connection fields', async () => {
@@ -76,12 +82,18 @@ test('rejects caller-controlled connection fields before profile lookup, snapsho
   assert.deepEqual(candidate.requests, []);
 });
 
-test('fails closed for agent-key profiles because native readiness is not cancellable', async () => {
+test('uses cancellable native readiness for an approved agent-key profile', async () => {
   const candidate = session({ profile: { ...profile, authMode: 'agent-key' } });
-  await assert.rejects(candidate.candidate.validate({ profileId: profile.profileId }), WindowsValidationSessionError);
+  await candidate.candidate.validate({ profileId: profile.profileId });
   assert.equal(candidate.captures(), 1);
   assert.equal(candidate.disposals(), 1);
   assert.deepEqual(candidate.requests, []);
+  assert.equal(candidate.agentRequests.length, 1);
+  const [capability, descriptor, timeout, signal] = candidate.agentRequests[0] as [object, unknown, number, unknown];
+  assert.deepEqual(capability, {});
+  assert.deepEqual(descriptor, { host: profile.host, port: profile.port, user: profile.user });
+  assert.ok(timeout > 0 && timeout <= 10_000);
+  assert.equal(signal, undefined);
 });
 
 test('disposes the captured snapshot when known-hosts parsing rejects unsafe data', async () => {
@@ -112,6 +124,7 @@ test('uses one remaining validation budget after snapshot capture', async () => 
       },
     },
     agentIdentity: { isAvailable: () => false },
+    agentReadiness: { validate: async () => undefined },
     createPasswordTransport: () => ({
       connect: async (request, signal) => {
         observed.push({ timeoutMs: request.timeoutMs, signal });

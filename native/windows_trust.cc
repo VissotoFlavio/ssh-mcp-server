@@ -15,6 +15,7 @@
 #include <string>
 #include <array>
 #include <algorithm>
+#include <atomic>
 #include <climits>
 #include <cmath>
 #include <cstdlib>
@@ -733,7 +734,7 @@ void FinalizeSnapshotCapability(napi_env, void* data, void*) {
 
 enum class LaunchResult { kCompleted, kTimedOut, kFailed };
 
-LaunchResult LaunchHiddenProcess(const std::wstring& application, std::wstring command, DWORD timeout, DWORD* exit_code) {
+LaunchResult LaunchHiddenProcess(const std::wstring& application, std::wstring command, DWORD timeout, DWORD* exit_code, const std::atomic<bool>* cancelled = nullptr) {
   SECURITY_ATTRIBUTES inheritable{};
   inheritable.nLength = sizeof(inheritable);
   inheritable.bInheritHandle = TRUE;
@@ -749,8 +750,14 @@ LaunchResult LaunchHiddenProcess(const std::wstring& application, std::wstring c
   if (!CreateProcessW(application.c_str(), command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) return LaunchResult::kFailed;
   Handle process_handle(process.hProcess);
   Handle thread_handle(process.hThread);
-  const DWORD wait = WaitForSingleObject(process_handle.get(), timeout);
-  if (wait == WAIT_TIMEOUT) {
+  const ULONGLONG started = GetTickCount64();
+  DWORD wait = WAIT_TIMEOUT;
+  while ((cancelled == nullptr || !cancelled->load()) && GetTickCount64() - started < timeout) {
+    const DWORD remaining = static_cast<DWORD>(timeout - (GetTickCount64() - started));
+    wait = WaitForSingleObject(process_handle.get(), std::min<DWORD>(remaining, 25));
+    if (wait == WAIT_OBJECT_0 || wait == WAIT_FAILED) break;
+  }
+  if (wait == WAIT_TIMEOUT || (cancelled != nullptr && cancelled->load())) {
     if (!TerminateProcess(process_handle.get(), 1) || WaitForSingleObject(process_handle.get(), INFINITE) != WAIT_OBJECT_0) return LaunchResult::kFailed;
     return LaunchResult::kTimedOut;
   }
@@ -869,17 +876,22 @@ bool ReadReadinessDescriptor(napi_env env, napi_value descriptor, std::wstring* 
   return true;
 }
 
-bool StopMaster(Handle* master, const std::wstring& ssh, const std::wstring& control_path, const std::wstring& destination, DWORD timeout) {
+bool StopMaster(Handle* master, const std::wstring& ssh, const std::wstring& control_path, const std::wstring& destination, DWORD timeout, const std::atomic<bool>* cancelled = nullptr) {
   DWORD ignored = 1;
   const std::vector<std::wstring> exit_arguments = {L"-F", L"none", L"-S", control_path, L"-O", L"exit", L"--", destination};
-  if (timeout > 0) LaunchHiddenProcess(ssh, FixedCommandLine(ssh, exit_arguments), timeout, &ignored);
-  DWORD wait = WaitForSingleObject(master->get(), timeout);
+  if (timeout > 0) LaunchHiddenProcess(ssh, FixedCommandLine(ssh, exit_arguments), timeout, &ignored, cancelled);
+  DWORD wait = WAIT_TIMEOUT;
+  const ULONGLONG started = GetTickCount64();
+  while (GetTickCount64() - started < timeout) {
+    wait = WaitForSingleObject(master->get(), std::min<DWORD>(static_cast<DWORD>(timeout - (GetTickCount64() - started)), 25));
+    if (wait == WAIT_OBJECT_0 || wait == WAIT_FAILED) break;
+  }
   if (wait == WAIT_OBJECT_0) return true;
   if (master->get() == INVALID_HANDLE_VALUE || !TerminateProcess(master->get(), 1)) return false;
   return WaitForSingleObject(master->get(), 1'000) == WAIT_OBJECT_0;
 }
 
-bool ValidateAgentKeyReadiness(SnapshotSession* snapshot, const std::wstring& host, DWORD port, const std::wstring& user, DWORD timeout) {
+bool ValidateAgentKeyReadiness(SnapshotSession* snapshot, const std::wstring& host, DWORD port, const std::wstring& user, DWORD timeout, const std::atomic<bool>* cancelled = nullptr) {
   std::wstring known_hosts;
   std::wstring snapshot_directory;
   std::wstring ssh;
@@ -889,7 +901,7 @@ bool ValidateAgentKeyReadiness(SnapshotSession* snapshot, const std::wstring& ho
   Handle openssh_handle;
   Handle ssh_add_handle;
   Handle ssh_handle;
-  if (!snapshot->ReadyKnownHostsPath(&known_hosts, &snapshot_directory) || !TrustedOpenSsh(&ssh, &ssh_add, &version, &system_handle, &openssh_handle, &ssh_add_handle, &ssh_handle)) return false;
+  if ((cancelled != nullptr && cancelled->load()) || !snapshot->ReadyKnownHostsPath(&known_hosts, &snapshot_directory) || !TrustedOpenSsh(&ssh, &ssh_add, &version, &system_handle, &openssh_handle, &ssh_add_handle, &ssh_handle)) return false;
   const std::wstring control_path = snapshot_directory + L"\\control";
   const std::wstring destination = user + L"@" + host;
   const std::vector<std::wstring> master_arguments = {
@@ -902,20 +914,20 @@ bool ValidateAgentKeyReadiness(SnapshotSession* snapshot, const std::wstring& ho
   if (!StartHiddenProcess(ssh, FixedCommandLine(ssh, master_arguments), &master)) return false;
   const ULONGLONG started = GetTickCount64();
   bool ready = false;
-  while (GetTickCount64() - started < timeout) {
+  while ((cancelled == nullptr || !cancelled->load()) && GetTickCount64() - started < timeout) {
     DWORD master_exit = STILL_ACTIVE;
     if (!GetExitCodeProcess(master.get(), &master_exit) || master_exit != STILL_ACTIVE) break;
     const DWORD remaining = static_cast<DWORD>(timeout - (GetTickCount64() - started));
     DWORD check_exit = 1;
     const std::vector<std::wstring> check_arguments = {L"-F", L"none", L"-S", control_path, L"-O", L"check", L"--", destination};
-    if (LaunchHiddenProcess(ssh, FixedCommandLine(ssh, check_arguments), std::max<DWORD>(1, std::min<DWORD>(remaining, 250)), &check_exit) == LaunchResult::kCompleted && check_exit == 0) {
+    if (LaunchHiddenProcess(ssh, FixedCommandLine(ssh, check_arguments), std::max<DWORD>(1, std::min<DWORD>(remaining, 250)), &check_exit, cancelled) == LaunchResult::kCompleted && check_exit == 0) {
       ready = true;
       break;
     }
   }
   const ULONGLONG elapsed = GetTickCount64() - started;
   const DWORD cleanup = elapsed < timeout ? static_cast<DWORD>(timeout - elapsed) : 0;
-  return StopMaster(&master, ssh, control_path, destination, cleanup) && ready;
+  return StopMaster(&master, ssh, control_path, destination, cleanup, cancelled) && ready && (cancelled == nullptr || !cancelled->load());
 }
 
 bool ReadArgumentString(napi_env env, napi_callback_info info, std::string* value) {
@@ -1042,6 +1054,89 @@ napi_value ValidateNativeAgentKeyReadiness(napi_env env, napi_callback_info info
     return Unavailable(env);
   napi_value result{};
   return napi_get_undefined(env, &result) == napi_ok ? result : Unavailable(env);
+}
+
+struct AgentReadinessCancellation final { std::atomic<bool> requested{false}; };
+struct AgentReadinessWork final {
+  napi_env env;
+  napi_async_work work = nullptr;
+  napi_deferred deferred = nullptr;
+  napi_ref snapshot_reference = nullptr;
+  SnapshotSession* snapshot = nullptr;
+  std::wstring host;
+  std::wstring user;
+  DWORD port = 0;
+  DWORD timeout = 0;
+  std::shared_ptr<AgentReadinessCancellation> cancellation;
+  bool succeeded = false;
+};
+
+void ExecuteAgentReadiness(napi_env, void* data) {
+  auto* job = static_cast<AgentReadinessWork*>(data);
+  job->succeeded = !job->cancellation->requested.load() && ValidateAgentKeyReadiness(job->snapshot, job->host, job->port, job->user, job->timeout, &job->cancellation->requested);
+}
+
+void CompleteAgentReadiness(napi_env env, napi_status, void* data) {
+  std::unique_ptr<AgentReadinessWork> job(static_cast<AgentReadinessWork*>(data));
+  if (job->snapshot_reference != nullptr) napi_delete_reference(env, job->snapshot_reference);
+  if (job->work != nullptr) napi_delete_async_work(env, job->work);
+  if (job->succeeded) {
+    napi_value result{};
+    napi_get_undefined(env, &result);
+    napi_resolve_deferred(env, job->deferred, result);
+  } else {
+    napi_value message{};
+    napi_value error{};
+    napi_create_string_utf8(env, "Windows connection validation is unavailable", NAPI_AUTO_LENGTH, &message);
+    napi_create_error(env, nullptr, message, &error);
+    napi_reject_deferred(env, job->deferred, error);
+  }
+}
+
+void FinalizeAgentReadinessCancellation(napi_env, void* data, void*) { delete static_cast<std::shared_ptr<AgentReadinessCancellation>*>(data); }
+
+napi_value CancelAgentReadiness(napi_env env, napi_callback_info info) {
+  void* data = nullptr;
+  size_t count = 0;
+  if (napi_get_cb_info(env, info, &count, nullptr, &data, nullptr) != napi_ok || data == nullptr) return Unavailable(env);
+  static_cast<std::shared_ptr<AgentReadinessCancellation>*>(data)->get()->requested.store(true);
+  napi_value result{};
+  return napi_get_undefined(env, &result) == napi_ok ? result : Unavailable(env);
+}
+
+napi_value StartNativeAgentKeyReadiness(napi_env env, napi_callback_info info) {
+  size_t count = 3;
+  napi_value arguments[3]{};
+  int32_t timeout = 0;
+  auto job = std::make_unique<AgentReadinessWork>();
+  job->env = env;
+  if (napi_get_cb_info(env, info, &count, arguments, nullptr, nullptr) != napi_ok || count != 3 || !ReadSnapshotCapabilityValue(env, arguments[0], &job->snapshot) || !ReadReadinessDescriptor(env, arguments[1], &job->host, &job->port, &job->user) || napi_get_value_int32(env, arguments[2], &timeout) != napi_ok || timeout <= 0 || timeout > 60000) return Unavailable(env);
+  job->timeout = static_cast<DWORD>(timeout);
+  job->cancellation = std::make_shared<AgentReadinessCancellation>();
+  napi_value promise{};
+  napi_value resource_name{};
+  napi_value cancel{};
+  napi_value result{};
+  auto cancellation_handle = std::make_unique<std::shared_ptr<AgentReadinessCancellation>>(job->cancellation);
+  if (napi_create_promise(env, &job->deferred, &promise) != napi_ok || napi_create_string_utf8(env, "sshMcpAgentReadiness", NAPI_AUTO_LENGTH, &resource_name) != napi_ok || napi_create_function(env, "cancel", NAPI_AUTO_LENGTH, CancelAgentReadiness, cancellation_handle.get(), &cancel) != napi_ok) return Unavailable(env);
+  if (napi_add_finalizer(env, cancel, cancellation_handle.get(), FinalizeAgentReadinessCancellation, nullptr, nullptr) != napi_ok) return Unavailable(env);
+  cancellation_handle.release();
+  if (napi_create_object(env, &result) != napi_ok || napi_set_named_property(env, result, "promise", promise) != napi_ok || napi_set_named_property(env, result, "cancel", cancel) != napi_ok) return Unavailable(env);
+  if (napi_create_reference(env, arguments[0], 1, &job->snapshot_reference) != napi_ok) return Unavailable(env);
+  if (napi_create_async_work(env, nullptr, resource_name, ExecuteAgentReadiness, CompleteAgentReadiness, job.get(), &job->work) != napi_ok) {
+    napi_delete_reference(env, job->snapshot_reference);
+    job->snapshot_reference = nullptr;
+    return Unavailable(env);
+  }
+  if (napi_queue_async_work(env, job->work) != napi_ok) {
+    napi_delete_async_work(env, job->work);
+    job->work = nullptr;
+    napi_delete_reference(env, job->snapshot_reference);
+    job->snapshot_reference = nullptr;
+    return Unavailable(env);
+  }
+  job.release();
+  return result;
 }
 
 napi_value ResolveOpenSsh(napi_env env, napi_callback_info info) {
@@ -1363,6 +1458,7 @@ NAPI_MODULE_INIT() {
     {"captureKnownHostsSnapshot", nullptr, CaptureKnownHostsSnapshot, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"disposeKnownHostsSnapshot", nullptr, DisposeKnownHostsSnapshot, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"validateAgentKeyReadiness", nullptr, ValidateNativeAgentKeyReadiness, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"startAgentKeyReadiness", nullptr, StartNativeAgentKeyReadiness, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"resolveOpenSsh", nullptr, ResolveOpenSsh, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"probeSshAdd", nullptr, ProbeSshAdd, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"readCredential", nullptr, ReadCredential, nullptr, nullptr, nullptr, napi_default, nullptr},

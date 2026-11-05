@@ -4,6 +4,7 @@ import { HostIdentityCredentialPolicy, type ApprovedKnownHostsEntry } from '../p
 import { validateProfileSelection } from '../profiles/connection-profile.js';
 
 import { WindowsCredentialManager } from './windows-credential-manager.js';
+import { WindowsNativeAgentReadiness } from './windows-native-agent-readiness.js';
 import { WindowsInMemoryPasswordTransport, type WindowsPasswordValidationRequest } from './windows-password-transport.js';
 import { WindowsSecureStorage } from './windows-secure-storage.js';
 
@@ -64,16 +65,20 @@ export interface WindowsPasswordReadinessTransport {
 export interface WindowsValidationSessionDependencies {
   readonly storage: Pick<WindowsSecureStorage, 'getProfile' | 'withKnownHostsSnapshot'>;
   readonly agentIdentity: { isAvailable(): boolean | Promise<boolean> };
+  readonly agentReadiness: Pick<WindowsNativeAgentReadiness, 'validate'>;
   readonly createPasswordTransport: (approvedReference: string) => WindowsPasswordReadinessTransport;
   readonly timeoutMs?: number;
 }
 
-function defaultDependencies(): WindowsValidationSessionDependencies {
-  const storage = new WindowsSecureStorage();
+function defaultDependencies(
+  storage: Pick<WindowsSecureStorage, 'getProfile' | 'withKnownHostsSnapshot'> = new WindowsSecureStorage(),
+): WindowsValidationSessionDependencies {
   const timeoutMs = DEFAULT_TIMEOUT_MS;
   return {
     storage,
-    agentIdentity: { isAvailable: async () => false },
+    // The native readiness worker performs ssh-add within its one budget.
+    agentIdentity: { isAvailable: async () => true },
+    agentReadiness: new WindowsNativeAgentReadiness(),
     createPasswordTransport: (approvedReference) =>
       new WindowsInMemoryPasswordTransport(new WindowsCredentialManager(undefined, [approvedReference])),
     timeoutMs,
@@ -104,7 +109,7 @@ export class WindowsValidationSession {
     const profile = this.dependencies.storage.getProfile(selection.profileId);
     if (profile === undefined) return unavailable();
 
-    await this.dependencies.storage.withKnownHostsSnapshot(profile.approvedKnownHostsReference, async (bytes, _capability) => {
+    await this.dependencies.storage.withKnownHostsSnapshot(profile.approvedKnownHostsReference, async (bytes, capability) => {
       if (remaining() === 0) return unavailable();
       const entries = parseKnownHosts(bytes);
       const policy = new HostIdentityCredentialPolicy({
@@ -117,12 +122,16 @@ export class WindowsValidationSession {
           isApproved: (reference) => profile.authMode === 'password' && reference === profile.credentialReference,
         },
       });
-      // Native agent-key readiness is synchronous today. Do not invoke it on
-      // the MCP path: it would pin the event loop and make cancellation
-      // unsound while the opaque snapshot is live. Windows stays fail-closed
-      // until the addon offers a cancellable asynchronous operation.
-      if (profile.authMode === 'agent-key') return unavailable();
       const authorized = await policy.authorize(selection);
+      if (authorized.authentication.mode === 'agent-key') {
+        await this.dependencies.agentReadiness.validate(
+          capability,
+          Object.freeze({ host: authorized.profile.host, port: authorized.profile.port, user: authorized.profile.user }),
+          remaining(),
+          signal,
+        );
+        return;
+      }
       if (authorized.authentication.mode !== 'password' || remaining() === 0) return unavailable();
 
       await this.dependencies.createPasswordTransport(authorized.authentication.credentialReference).connect(
@@ -138,4 +147,10 @@ export class WindowsValidationSession {
       );
     });
   }
+}
+
+export function createWindowsValidationSession(
+  storage: Pick<WindowsSecureStorage, 'getProfile' | 'withKnownHostsSnapshot'>,
+): WindowsValidationSession {
+  return new WindowsValidationSession(defaultDependencies(storage));
 }

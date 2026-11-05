@@ -13,7 +13,14 @@ export interface NativeAgentKeyReadinessDescriptor {
 }
 
 export interface WindowsNativeAgentReadinessBinding {
-  validateAgentKeyReadiness(capability: object, descriptor: NativeAgentKeyReadinessDescriptor, timeoutMs: number): void;
+  startAgentKeyReadiness(
+    capability: object,
+    descriptor: NativeAgentKeyReadinessDescriptor,
+    timeoutMs: number,
+  ): {
+    readonly promise: Promise<void>;
+    readonly cancel: () => void;
+  };
 }
 
 export class WindowsNativeAgentReadinessError extends Error {
@@ -57,7 +64,7 @@ function loadNativeBinding(): WindowsNativeAgentReadinessBinding {
   if (
     typeof candidate !== 'object' ||
     candidate === null ||
-    typeof (candidate as { validateAgentKeyReadiness?: unknown }).validateAgentKeyReadiness !== 'function'
+    typeof (candidate as { startAgentKeyReadiness?: unknown }).startAgentKeyReadiness !== 'function'
   ) {
     return unavailable();
   }
@@ -72,10 +79,19 @@ function loadNativeBinding(): WindowsNativeAgentReadinessBinding {
 export class WindowsNativeAgentReadiness {
   constructor(private readonly binding: WindowsNativeAgentReadinessBinding = loadNativeBinding()) {}
 
-  validate(capability: object, descriptor: NativeAgentKeyReadinessDescriptor, timeoutMs: number): void {
+  async validate(capability: object, descriptor: NativeAgentKeyReadinessDescriptor, timeoutMs: number, signal?: AbortSignal): Promise<void> {
     if (typeof capability !== 'object' || capability === null || !validDescriptor(descriptor)) return unavailable();
     try {
-      this.binding.validateAgentKeyReadiness(capability, descriptor, boundedTimeout(timeoutMs));
+      const operation = this.binding.startAgentKeyReadiness(capability, descriptor, boundedTimeout(timeoutMs));
+      if (!operation || typeof operation.cancel !== 'function' || !(operation.promise instanceof Promise)) return unavailable();
+      const cancel = () => operation.cancel();
+      if (signal?.aborted) cancel();
+      signal?.addEventListener('abort', cancel, { once: true });
+      try {
+        await operation.promise;
+      } finally {
+        signal?.removeEventListener('abort', cancel);
+      }
     } catch {
       return unavailable();
     }

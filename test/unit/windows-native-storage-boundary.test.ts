@@ -75,6 +75,11 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
     captureKnownHostsSnapshot(profileId: string): { bytes: Buffer; capability: object };
     disposeKnownHostsSnapshot(capability: unknown): void;
     validateAgentKeyReadiness(capability: unknown, descriptor: unknown, timeoutMs: unknown): void;
+    startAgentKeyReadiness(
+      capability: object,
+      descriptor: { readonly host: string; readonly port: number; readonly user: string },
+      timeoutMs: number,
+    ): { readonly promise: Promise<void>; readonly cancel: () => void };
     readCredential(locator: unknown): string;
     resolveOpenSsh(): { ssh: string; sshAdd: string; version: string };
     probeSshAdd(timeoutMs: unknown): number;
@@ -189,6 +194,23 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
       const snapshot = testBinding.captureKnownHostsSnapshot('production-api');
       assert.equal(testBinding.testSnapshotArtifactCount(), 1);
       assert.doesNotThrow(() => testBinding.disposeKnownHostsSnapshot(snapshot.capability));
+      assert.equal(testBinding.testSnapshotArtifactCount(), 0);
+    } finally {
+      if (configured) runFixture('cleanup', root);
+    }
+  });
+
+  test('cancels native agent readiness before it can retain a snapshot or start a remote command', async () => {
+    const root = uniqueRoot('cancel-agent-readiness');
+    let configured = false;
+    try {
+      runFixture('safe', root);
+      configured = true;
+      const snapshot = binding.captureKnownHostsSnapshot('production-api');
+      const operation = binding.startAgentKeyReadiness(snapshot.capability, Object.freeze({ host: '192.0.2.1', port: 22, user: 'deploy' }), 1_000);
+      operation.cancel();
+      await assert.rejects(operation.promise, /Windows connection validation is unavailable/u);
+      assert.doesNotThrow(() => binding.disposeKnownHostsSnapshot(snapshot.capability));
       assert.equal(testBinding.testSnapshotArtifactCount(), 0);
     } finally {
       if (configured) runFixture('cleanup', root);
