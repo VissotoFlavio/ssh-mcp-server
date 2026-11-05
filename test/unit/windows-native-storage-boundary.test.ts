@@ -13,7 +13,15 @@ const nativeRequire = createRequire(import.meta.url);
 // Windows PowerShell 5.1 can fail to load ACL type data in isolated child
 // processes, so these Windows-only fixtures require PowerShell 7+.
 const fixtureShell = 'pwsh.exe';
-const testOnlyHookNames = ['testReadReplacementRace', 'testSystemOwnerMismatch', 'testUntrustedOpenSshCandidate', 'testLaunch'] as const;
+const testOnlyHookNames = [
+  'testReadReplacementRace',
+  'testReadStateFile',
+  'testSystemOwnerMismatch',
+  'testTrustedOpenSsh',
+  'testOpenSshIdentityBeforeLaunch',
+  'testOpenSshUnexpectedPreLaunchError',
+  'testLaunch',
+] as const;
 
 type RegistryMutationRight =
   'SetValue' | 'CreateSubKey' | 'CreateLink' | 'ChangePermissions' | 'TakeOwnership' | 'Delete' | 'WriteKey' | 'GenericWrite';
@@ -22,6 +30,15 @@ type FixtureMode =
   | 'unsafe-root'
   | 'unsafe-state-leaf'
   | 'unsafe-known-hosts-leaf'
+  | 'unsafe-write-dac-root'
+  | 'unsafe-write-dac-state-leaf'
+  | 'unsafe-write-dac-known-hosts-leaf'
+  | 'reparse-state-root'
+  | 'reparse-state-leaf'
+  | 'reparse-known-hosts-leaf'
+  | 'openssh-chain-reparse'
+  | 'openssh-chain-unsafe-dacl'
+  | 'openssh-chain-safe'
   | 'unsafe-registry-mutation'
   | 'unsafe-registry-unprotected'
   | 'unsafe-inherited-leaf'
@@ -55,13 +72,21 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
     probeSshAdd(timeoutMs: unknown): number;
   };
   const testBinding = nativeRequire(testAddonPath) as {
-    testReadReplacementRace(): { hookExecuted: boolean; readSucceeded: boolean; stage: string };
+    testReadReplacementRace(target: 'state-root' | 'state-leaf' | 'known-hosts-root' | 'known-hosts-leaf'): {
+      hookExecuted: boolean;
+      replacementError: number;
+      readSucceeded: boolean;
+      stage: string;
+    };
+    testReadStateFile(root: string): boolean;
     testSystemOwnerMismatch(): boolean;
-    testUntrustedOpenSshCandidate(path: string): {
-      expectedOpenSshPath: boolean;
-      trustedObject: boolean;
-      microsoftSigned: boolean;
-      supportedVersion: boolean;
+    testTrustedOpenSsh(system: string): boolean;
+    testOpenSshIdentityBeforeLaunch(): { replacementBlocked: boolean; moveAttempted: boolean; replacementError: number; launchCompleted: boolean };
+    testOpenSshUnexpectedPreLaunchError(): {
+      replacementBlocked: boolean;
+      moveAttempted: boolean;
+      replacementError: number;
+      launchCompleted: boolean;
     };
     testLaunch(mode: 'exit' | 'hang', timeoutMs: number): { completed: boolean; timedOut: boolean; exitCode: number };
   };
@@ -91,38 +116,66 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
     }
   });
 
-  test('rejects a user-controlled OpenSSH candidate through native path, DACL, signature, and version checks', () => {
-    const root = uniqueRoot('openssh-negative');
+  for (const target of ['state-root', 'state-leaf', 'known-hosts-root', 'known-hosts-leaf'] as const) {
+    test(`rejects ${target} replacement through the production protected-file routine`, () => {
+      const root = uniqueRoot(`${target}-replacement`);
+      let configured = false;
+      try {
+        runFixture('safe', root);
+        configured = true;
+        assert.deepEqual(testBinding.testReadReplacementRace(target), {
+          hookExecuted: true,
+          replacementError: 0,
+          readSucceeded: false,
+          stage: 'production-read',
+        });
+      } finally {
+        if (configured) runFixture('cleanup', root);
+      }
+    });
+  }
+
+  test('rejects a state-root reparse point through the production protected-file routine', () => {
+    const root = uniqueRoot('reparse-state-root');
     let configured = false;
     try {
-      runFixture('safe', root);
+      runFixture('reparse-state-root', root);
       configured = true;
-      const candidate = testBinding.testUntrustedOpenSshCandidate(join(root, 'state', 'connection-profiles.json'));
-      assert.deepEqual(candidate, {
-        expectedOpenSshPath: false,
-        trustedObject: false,
-        microsoftSigned: false,
-        supportedVersion: false,
-      });
+      assert.equal(testBinding.testReadStateFile(join(root, 'linked-state')), false);
     } finally {
       if (configured) runFixture('cleanup', root);
     }
   });
 
-  test('detects an identity-changing replacement between native protected-file checks', () => {
-    const root = uniqueRoot('replacement-race');
-    let configured = false;
-    try {
-      runFixture('safe', root);
-      configured = true;
-      assert.deepEqual(testBinding.testReadReplacementRace(), {
-        hookExecuted: true,
-        readSucceeded: false,
-        stage: 'file-identity-mismatch',
-      });
-    } finally {
-      if (configured) runFixture('cleanup', root);
-    }
+  for (const mode of ['openssh-chain-reparse', 'openssh-chain-unsafe-dacl'] as const) {
+    test(`rejects ${mode} through the production trusted OpenSSH routine`, () => {
+      const root = uniqueRoot(mode);
+      let configured = false;
+      try {
+        runFixture(mode, root);
+        configured = true;
+        assert.equal(testBinding.testTrustedOpenSsh(join(root, 'openssh-system')), false);
+      } finally {
+        if (configured) runFixture('cleanup', root);
+      }
+    });
+  }
+
+  test('blocks OpenSSH identity replacement immediately before the production launch chain', () => {
+    const result = testBinding.testOpenSshIdentityBeforeLaunch();
+    assert.equal(result.replacementBlocked, true);
+    assert.equal(result.moveAttempted, true);
+    assert.equal([5, 32].includes(result.replacementError), true);
+    assert.equal(result.launchCompleted, true);
+  });
+
+  test('fails closed before launch when the OpenSSH replacement attempt has an unexpected error', () => {
+    assert.deepEqual(testBinding.testOpenSshUnexpectedPreLaunchError(), {
+      replacementBlocked: false,
+      moveAttempted: false,
+      replacementError: 5,
+      launchCompleted: false,
+    });
   });
 
   test('rejects an existing system-owned location without mutating it', () => {
@@ -153,6 +206,11 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
     { doD: 'rejects writable state root', mode: 'unsafe-root', read: 'profile' },
     { doD: 'rejects writable state file', mode: 'unsafe-state-leaf', read: 'profile' },
     { doD: 'rejects writable known-hosts file', mode: 'unsafe-known-hosts-leaf', read: 'known-hosts' },
+    { doD: 'rejects WRITE_DAC on the state root', mode: 'unsafe-write-dac-root', read: 'profile' },
+    { doD: 'rejects WRITE_DAC on the state file', mode: 'unsafe-write-dac-state-leaf', read: 'profile' },
+    { doD: 'rejects WRITE_DAC on the known-hosts file', mode: 'unsafe-write-dac-known-hosts-leaf', read: 'known-hosts' },
+    { doD: 'rejects a reparse state file', mode: 'reparse-state-leaf', read: 'profile' },
+    { doD: 'rejects a reparse known-hosts file', mode: 'reparse-known-hosts-leaf', read: 'known-hosts' },
     ...registryMutationRights.map((registryMutationRight) => ({
       doD: `rejects registry mutation right ${registryMutationRight}`,
       mode: 'unsafe-registry-mutation' as const,
