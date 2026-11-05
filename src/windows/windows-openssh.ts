@@ -11,6 +11,7 @@ const WINDOWS_EXECUTABLE = /^[A-Za-z]:\\(?:[^\\/:*?"<>|]+\\)*[^\\/:*?"<>|]+\.exe
 export interface WindowsOpenSshPaths {
   readonly ssh: string;
   readonly sshAdd: string;
+  readonly version: string;
 }
 
 export interface WindowsOpenSshBinding {
@@ -83,14 +84,24 @@ function validPaths(value: unknown): value is WindowsOpenSshPaths {
     typeof value === 'object' &&
     value !== null &&
     !Array.isArray(value) &&
-    Reflect.ownKeys(value).length === 2 &&
+    Reflect.ownKeys(value).length === 3 &&
     typeof ssh === 'string' &&
     typeof sshAdd === 'string' &&
+    typeof (value as { version?: unknown }).version === 'string' &&
+    supportedVersion((value as { version: string }).version) &&
     !hasControlCharacter(ssh) &&
     !hasControlCharacter(sshAdd) &&
     WINDOWS_EXECUTABLE.test(ssh) &&
     WINDOWS_EXECUTABLE.test(sshAdd)
   );
+}
+
+function supportedVersion(value: string): boolean {
+  const match = /^(\d+)\.(\d+)\.\d+\.\d+$/u.exec(value);
+  if (match === null) return false;
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  return Number.isSafeInteger(major) && Number.isSafeInteger(minor) && (major > 9 || (major === 9 && minor >= 5));
 }
 
 function hasControlCharacter(value: string): boolean {
@@ -122,7 +133,7 @@ export class WindowsOpenSshResolver implements OpenSshExecutableResolver {
     try {
       const paths = this.binding.resolveOpenSsh();
       if (!validPaths(paths)) return unavailable();
-      return Object.freeze({ ssh: paths.ssh, sshAdd: paths.sshAdd });
+      return Object.freeze({ ssh: paths.ssh, sshAdd: paths.sshAdd, version: paths.version });
     } catch {
       return unavailable();
     }

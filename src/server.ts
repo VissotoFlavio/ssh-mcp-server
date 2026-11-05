@@ -18,6 +18,7 @@ import {
   type ConnectionValidationOutcome,
   type ConnectionValidationProvider,
 } from './validation/trusted-connection-validation.js';
+import { WindowsOpenSshResolver } from './windows/windows-openssh.js';
 import { supportsWindowsAlphaRuntime } from './windows/windows-runtime-support.js';
 import { createWindowsRuntimeProviders } from './windows/windows-runtime.js';
 
@@ -406,7 +407,15 @@ const isEntrypoint = process.argv[1] !== undefined && import.meta.url === pathTo
 
 export function createProductionRuntimeProviders(
   platform = process.platform,
-  windowsSupported = supportsWindowsAlphaRuntime(),
+  windowsSupported = supportsWindowsAlphaRuntime() &&
+    (() => {
+      try {
+        new WindowsOpenSshResolver().paths();
+        return true;
+      } catch {
+        return false;
+      }
+    })(),
   windowsRuntimeFactory: () => Pick<ServerOptions, 'approvedProfileListingProvider' | 'connectionValidationProvider'> = createWindowsRuntimeProviders,
 ): Pick<ServerOptions, 'approvedProfileListingProvider' | 'connectionValidationProvider'> {
   if (platform === 'win32') {
