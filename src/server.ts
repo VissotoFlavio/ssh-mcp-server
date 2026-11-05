@@ -18,6 +18,8 @@ import {
   type ConnectionValidationOutcome,
   type ConnectionValidationProvider,
 } from './validation/trusted-connection-validation.js';
+import { supportsWindowsAlphaRuntime } from './windows/windows-runtime-support.js';
+import { createWindowsRuntimeProviders } from './windows/windows-runtime.js';
 
 export const serverName = 'ssh-mcp-server';
 export const serverVersion = '0.1.0';
@@ -220,15 +222,19 @@ function registerTools(
 ): void {
   server.setRequestHandler(ListToolsRequestSchema, () => ({
     tools: [
-      {
-        name: listApprovedProfilesToolName,
-        description: LIST_APPROVED_PROFILES_DESCRIPTION,
-        inputSchema: {
-          type: 'object',
-          properties: {},
-          additionalProperties: false,
-        },
-      },
+      ...(approvedProfileListingProvider === undefined
+        ? []
+        : [
+            {
+              name: listApprovedProfilesToolName,
+              description: LIST_APPROVED_PROFILES_DESCRIPTION,
+              inputSchema: {
+                type: 'object',
+                properties: {},
+                additionalProperties: false,
+              },
+            },
+          ]),
       ...(connectionValidationProvider === undefined
         ? []
         : [
@@ -398,11 +404,31 @@ export async function runStdioServer({
 
 const isEntrypoint = process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
 
+export function createProductionRuntimeProviders(
+  platform = process.platform,
+  windowsSupported = supportsWindowsAlphaRuntime(),
+  windowsRuntimeFactory: () => Pick<ServerOptions, 'approvedProfileListingProvider' | 'connectionValidationProvider'> = createWindowsRuntimeProviders,
+): Pick<ServerOptions, 'approvedProfileListingProvider' | 'connectionValidationProvider'> {
+  if (platform === 'win32') {
+    if (!windowsSupported) return {};
+    try {
+      return windowsRuntimeFactory();
+    } catch {
+      return {};
+    }
+  }
+  if (platform === 'linux' || platform === 'darwin') {
+    return {
+      approvedProfileListingProvider: createRuntimeApprovedProfileListingProvider(),
+      connectionValidationProvider: createRuntimeConnectionValidationProvider(),
+    };
+  }
+  return {};
+}
+
 if (isEntrypoint) {
   const runProductionServer = async (): Promise<void> => {
-    const approvedProfileListingProvider = createRuntimeApprovedProfileListingProvider();
-    const connectionValidationProvider = createRuntimeConnectionValidationProvider();
-    await runStdioServer({ approvedProfileListingProvider, connectionValidationProvider });
+    await runStdioServer(createProductionRuntimeProviders());
   };
 
   runProductionServer().catch((error: unknown) => {
