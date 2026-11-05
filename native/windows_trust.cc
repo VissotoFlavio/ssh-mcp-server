@@ -8,8 +8,10 @@
 #include <wincrypt.h>
 #include <wincred.h>
 #include <wintrust.h>
+#include <winver.h>
 
 #include <string>
+#include <array>
 #include <algorithm>
 #include <cstring>
 #include <vector>
@@ -334,6 +336,19 @@ bool IsMicrosoftSigned(const std::wstring& path) {
   return VerifyCatalogMember(path);
 }
 
+bool IsSupportedOpenSshVersion(const std::wstring& path, std::array<DWORD, 4>* version) {
+  DWORD unused = 0;
+  const DWORD bytes = GetFileVersionInfoSizeW(path.c_str(), &unused);
+  if (bytes == 0 || bytes > 1024 * 1024) return false;
+  std::vector<BYTE> data(bytes);
+  if (!GetFileVersionInfoW(path.c_str(), 0, bytes, data.data())) return false;
+  VS_FIXEDFILEINFO* info = nullptr;
+  UINT info_bytes = 0;
+  if (!VerQueryValueW(data.data(), L"\\", reinterpret_cast<void**>(&info), &info_bytes) || info == nullptr || info_bytes < sizeof(VS_FIXEDFILEINFO) || info->dwSignature != 0xfeef04bd) return false;
+  *version = {HIWORD(info->dwFileVersionMS), LOWORD(info->dwFileVersionMS), HIWORD(info->dwFileVersionLS), LOWORD(info->dwFileVersionLS)};
+  return (*version)[0] > 9 || ((*version)[0] == 9 && (*version)[1] >= 5);
+}
+
 bool OpenTrustedSystemObject(const std::wstring& path, bool directory, Handle* result) {
   const DWORD flags = (directory ? FILE_FLAG_BACKUP_SEMANTICS : 0) | FILE_FLAG_OPEN_REPARSE_POINT;
   Handle handle(CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES | READ_CONTROL, FILE_SHARE_READ, nullptr, OPEN_EXISTING, flags, nullptr));
@@ -356,7 +371,7 @@ bool SystemDirectory(std::wstring* value) {
   return IsAbsoluteLocalPath(*value) && IsLocalNtfsPath(*value);
 }
 
-bool TrustedOpenSsh(std::wstring* ssh, std::wstring* ssh_add) {
+bool TrustedOpenSsh(std::wstring* ssh, std::wstring* ssh_add, std::array<DWORD, 4>* version) {
   std::wstring system;
   if (!SystemDirectory(&system)) return false;
   const std::wstring directory = system + L"\\OpenSSH";
@@ -366,7 +381,7 @@ bool TrustedOpenSsh(std::wstring* ssh, std::wstring* ssh_add) {
   Handle openssh_handle;
   Handle ssh_handle;
   Handle ssh_add_handle;
-  return OpenTrustedSystemObject(system, true, &system_handle) && OpenTrustedSystemObject(directory, true, &openssh_handle) && OpenTrustedSystemObject(*ssh, false, &ssh_handle) && OpenTrustedSystemObject(*ssh_add, false, &ssh_add_handle) && IsMicrosoftSigned(*ssh) && IsMicrosoftSigned(*ssh_add);
+  return OpenTrustedSystemObject(system, true, &system_handle) && OpenTrustedSystemObject(directory, true, &openssh_handle) && OpenTrustedSystemObject(*ssh, false, &ssh_handle) && OpenTrustedSystemObject(*ssh_add, false, &ssh_add_handle) && IsMicrosoftSigned(*ssh) && IsMicrosoftSigned(*ssh_add) && IsSupportedOpenSshVersion(*ssh, version) && IsSupportedOpenSshVersion(*ssh_add, version);
 }
 
 bool RootsAreDistinct(const std::wstring& state_root, const std::wstring& known_hosts_root, PSID operator_sid) {
@@ -461,11 +476,14 @@ napi_value ResolveOpenSsh(napi_env env, napi_callback_info info) {
   if (napi_get_cb_info(env, info, &count, nullptr, nullptr, nullptr) != napi_ok || count != 0) return Unavailable(env);
   std::wstring ssh;
   std::wstring ssh_add;
-  if (!TrustedOpenSsh(&ssh, &ssh_add)) return Unavailable(env);
+  std::array<DWORD, 4> version{};
+  if (!TrustedOpenSsh(&ssh, &ssh_add, &version)) return Unavailable(env);
   napi_value result{};
   napi_value ssh_value{};
   napi_value ssh_add_value{};
-  if (napi_create_object(env, &result) != napi_ok || napi_create_string_utf16(env, reinterpret_cast<const char16_t*>(ssh.c_str()), ssh.size(), &ssh_value) != napi_ok || napi_create_string_utf16(env, reinterpret_cast<const char16_t*>(ssh_add.c_str()), ssh_add.size(), &ssh_add_value) != napi_ok || napi_set_named_property(env, result, "ssh", ssh_value) != napi_ok || napi_set_named_property(env, result, "sshAdd", ssh_add_value) != napi_ok) return Unavailable(env);
+  napi_value version_value{};
+  const std::wstring version_text = std::to_wstring(version[0]) + L"." + std::to_wstring(version[1]) + L"." + std::to_wstring(version[2]) + L"." + std::to_wstring(version[3]);
+  if (napi_create_object(env, &result) != napi_ok || napi_create_string_utf16(env, reinterpret_cast<const char16_t*>(ssh.c_str()), ssh.size(), &ssh_value) != napi_ok || napi_create_string_utf16(env, reinterpret_cast<const char16_t*>(ssh_add.c_str()), ssh_add.size(), &ssh_add_value) != napi_ok || napi_create_string_utf16(env, reinterpret_cast<const char16_t*>(version_text.c_str()), version_text.size(), &version_value) != napi_ok || napi_set_named_property(env, result, "ssh", ssh_value) != napi_ok || napi_set_named_property(env, result, "sshAdd", ssh_add_value) != napi_ok || napi_set_named_property(env, result, "version", version_value) != napi_ok) return Unavailable(env);
   return result;
 }
 

@@ -35,12 +35,13 @@ if (process.platform !== 'win32' || !existsSync(addonPath)) {
       const binding = nativeRequire(addonPath) as {
         readProfileState(): Buffer;
         readCredential(locator: string): string;
-        resolveOpenSsh(): { ssh: string; sshAdd: string };
+        resolveOpenSsh(): { ssh: string; sshAdd: string; version: string };
       };
       assert.equal(binding.readProfileState().toString('utf8'), '{"profiles":[]}');
       assert.throws(() => binding.readCredential('.'), /Windows secure storage is unavailable/u);
       assert.match(binding.resolveOpenSsh().ssh, /\\System32\\OpenSSH\\ssh\.exe$/iu);
       assert.match(binding.resolveOpenSsh().sshAdd, /\\System32\\OpenSSH\\ssh-add\.exe$/iu);
+      assert.match(binding.resolveOpenSsh().version, /^9\.(?:[5-9]|[1-9][0-9]+)\.[0-9]+\.[0-9]+$/u);
     } finally {
       if (configured) runFixture('cleanup', root);
     }
