@@ -1098,7 +1098,7 @@ void FinalizeAgentReadinessCancellation(napi_env, void* data, void*) { delete st
 napi_value CancelAgentReadiness(napi_env env, napi_callback_info info) {
   void* data = nullptr;
   size_t count = 0;
-  if (napi_get_cb_info(env, info, &count, nullptr, &data, nullptr) != napi_ok || data == nullptr) return Unavailable(env);
+  if (napi_get_cb_info(env, info, &count, nullptr, nullptr, &data) != napi_ok || data == nullptr) return Unavailable(env);
   static_cast<std::shared_ptr<AgentReadinessCancellation>*>(data)->get()->requested.store(true);
   napi_value result{};
   return napi_get_undefined(env, &result) == napi_ok ? result : Unavailable(env);
