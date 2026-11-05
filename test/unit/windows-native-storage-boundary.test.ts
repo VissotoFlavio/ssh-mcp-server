@@ -98,7 +98,15 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
     testLaunch(mode: 'exit' | 'hang', timeoutMs: number): { completed: boolean; timedOut: boolean; exitCode: number };
     testSetSnapshotFailure(
       failure:
-        'directory-open' | 'directory-verify' | 'file-verify' | 'identity-adopt' | 'write' | 'flush' | 'file-disposition' | 'directory-disposition',
+        | 'directory-create'
+        | 'directory-verify'
+        | 'directory-identity'
+        | 'file-verify'
+        | 'file-identity'
+        | 'write'
+        | 'flush'
+        | 'file-disposition'
+        | 'directory-disposition',
     ): void;
     testSnapshotArtifactCount(): number;
     testFinalizeSnapshotCapability(capability: object): void;
@@ -157,8 +165,8 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
     }
   });
 
-  for (const failure of ['directory-open', 'directory-verify', 'file-verify', 'identity-adopt', 'write', 'flush'] as const) {
-    test(`rolls back snapshot artifacts when ${failure} fails before capability creation`, () => {
+  for (const failure of ['directory-create', 'directory-verify', 'directory-identity', 'file-verify', 'file-identity', 'write', 'flush'] as const) {
+    test(`leaves no snapshot artifacts when ${failure} fails before capability creation`, () => {
       const root = uniqueRoot(`snapshot-${failure}`);
       let configured = false;
       try {
