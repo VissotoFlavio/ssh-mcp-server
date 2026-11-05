@@ -2,6 +2,7 @@
 
 #include <windows.h>
 #include <winternl.h>
+#include <bcrypt.h>
 #include <aclapi.h>
 #include <sddl.h>
 #include <softpub.h>
@@ -565,7 +566,8 @@ bool CreatePrivateRelative(HANDLE root, const std::wstring& leaf, const PrivateS
 
 class SnapshotSession final {
  public:
-  explicit SnapshotSession(PSID operator_sid) : operator_sid_(operator_sid, operator_sid + GetLengthSid(operator_sid)), capability_tag_(&kSnapshotCapabilityTypeTag) {}
+  explicit SnapshotSession(PSID operator_sid)
+      : operator_sid_(static_cast<const BYTE*>(operator_sid), static_cast<const BYTE*>(operator_sid) + GetLengthSid(operator_sid)), capability_tag_(&kSnapshotCapabilityTypeTag) {}
   ~SnapshotSession() {
     if (!disposed_) {
       Rollback();
@@ -615,8 +617,8 @@ class SnapshotSession final {
   bool ReadyKnownHostsPath(std::wstring* path, std::wstring* directory) const {
     if (!IsValidCapability() || !parent_identity_known_ || !directory_identity_known_ || !file_identity_known_ ||
         !HasIdentity(parent_.get(), parent_identity_) || !HasIdentity(directory_.get(), directory_identity_) ||
-        !HasIdentity(file_.get(), file_identity_) || !VerifyFile(parent_.get(), operator_sid_.data(), true) ||
-        !VerifyFile(directory_.get(), operator_sid_.data(), true) || !VerifyFile(file_.get(), operator_sid_.data(), false))
+        !HasIdentity(file_.get(), file_identity_) || !VerifyFile(parent_.get(), operator_sid(), true) ||
+        !VerifyFile(directory_.get(), operator_sid(), true) || !VerifyFile(file_.get(), operator_sid(), false))
       return false;
     std::wstring final_directory;
     std::wstring final_file;
@@ -641,7 +643,7 @@ class SnapshotSession final {
 
   bool Rollback() {
     if (file_.get() != INVALID_HANDLE_VALUE) {
-      const bool file_verified = file_identity_known_ ? HasIdentity(file_.get(), file_identity_) && VerifyFile(file_.get(), operator_sid_.data(), false) : RevalidateFreshFile();
+      const bool file_verified = file_identity_known_ ? HasIdentity(file_.get(), file_identity_) && VerifyFile(file_.get(), operator_sid(), false) : RevalidateFreshFile();
       if (!file_verified || ConsumeSnapshotFailure(SnapshotFailure::kFileDisposition)) return false;
       FILE_DISPOSITION_INFO delete_info{};
       delete_info.DeleteFile = TRUE;
@@ -649,7 +651,7 @@ class SnapshotSession final {
       file_.reset();
     }
     if (directory_.get() != INVALID_HANDLE_VALUE) {
-      const bool directory_verified = directory_identity_known_ ? parent_identity_known_ && HasIdentity(parent_.get(), parent_identity_) && HasIdentity(directory_.get(), directory_identity_) && VerifyFile(parent_.get(), operator_sid_.data(), true) && VerifyFile(directory_.get(), operator_sid_.data(), true) : RevalidateFreshDirectory();
+      const bool directory_verified = directory_identity_known_ ? parent_identity_known_ && HasIdentity(parent_.get(), parent_identity_) && HasIdentity(directory_.get(), directory_identity_) && VerifyFile(parent_.get(), operator_sid(), true) && VerifyFile(directory_.get(), operator_sid(), true) : RevalidateFreshDirectory();
       if (!directory_verified || ConsumeSnapshotFailure(SnapshotFailure::kDirectoryDisposition)) return false;
       FILE_DISPOSITION_INFO delete_info{};
       delete_info.DeleteFile = TRUE;
@@ -664,7 +666,7 @@ class SnapshotSession final {
 #ifdef SSH_MCP_NATIVE_TEST
     ++g_test_snapshot_fresh_identity_rechecks;
 #endif
-    if (!file_fresh_ || !ReadIdentity(file_.get(), &file_identity_) || !VerifyFile(file_.get(), operator_sid_.data(), false)) return false;
+    if (!file_fresh_ || !ReadIdentity(file_.get(), &file_identity_) || !VerifyFile(file_.get(), operator_sid(), false)) return false;
     file_identity_known_ = true;
     return true;
   }
@@ -673,10 +675,12 @@ class SnapshotSession final {
 #ifdef SSH_MCP_NATIVE_TEST
     ++g_test_snapshot_fresh_identity_rechecks;
 #endif
-    if (!directory_fresh_ || !parent_identity_known_ || !HasIdentity(parent_.get(), parent_identity_) || !VerifyFile(parent_.get(), operator_sid_.data(), true) || !ReadIdentity(directory_.get(), &directory_identity_) || !VerifyFile(directory_.get(), operator_sid_.data(), true)) return false;
+    if (!directory_fresh_ || !parent_identity_known_ || !HasIdentity(parent_.get(), parent_identity_) || !VerifyFile(parent_.get(), operator_sid(), true) || !ReadIdentity(directory_.get(), &directory_identity_) || !VerifyFile(directory_.get(), operator_sid(), true)) return false;
     directory_identity_known_ = true;
     return true;
   }
+
+  PSID operator_sid() const { return static_cast<PSID>(const_cast<BYTE*>(operator_sid_.data())); }
 
   std::vector<BYTE> operator_sid_;
   const void* capability_tag_;
@@ -706,7 +710,7 @@ bool CreateKnownHostsSnapshot(const std::wstring& state_root, PSID operator_sid,
   if (!candidate->AdoptParent(std::move(parent))) return false;
   for (DWORD attempt = 0; attempt != 16; ++attempt) {
     unsigned int random_value = 0;
-    if (rand_s(&random_value) != 0) return false;
+    if (BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(&random_value), sizeof(random_value), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) return false;
     const std::wstring name = L".ssh-mcp-snapshot-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()) + L"-" + std::to_wstring(InterlockedIncrement(&g_snapshot_counter)) + L"-" + std::to_wstring(random_value);
     Handle directory;
     if (!CreatePrivateRelative(candidate->parent_handle(), name, security, true, SnapshotFailure::kDirectoryCreate, &directory)) return false;
