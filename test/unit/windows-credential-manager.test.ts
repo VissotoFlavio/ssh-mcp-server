@@ -23,6 +23,14 @@ test('rejects a valid but unapproved locator before native credential lookup', (
   assert.equal(calls, 0);
 });
 
+test('rejects malformed ssh locators before native credential lookup', () => {
+  let calls = 0;
+  const credentials = new WindowsCredentialManager({ readCredential: () => ((calls += 1), 'not-logged') }, ['os://ssh/production-api']);
+  assert.throws(() => credentials.getPassword('os://ssh/../production-api'), WindowsCredentialManagerError);
+  assert.throws(() => credentials.getPassword('os://ssh/production-api?target=other'), WindowsCredentialManagerError);
+  assert.equal(calls, 0);
+});
+
 test('rejects arbitrary providers, malformed references, native failures, and empty credential material', () => {
   const credentials = new WindowsCredentialManager(binding(), ['os://ssh/production-api']);
   assert.throws(() => credentials.getPassword('os://other/production-api'), WindowsCredentialManagerError);
