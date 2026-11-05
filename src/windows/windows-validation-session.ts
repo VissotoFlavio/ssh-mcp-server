@@ -4,8 +4,6 @@ import { HostIdentityCredentialPolicy, type ApprovedKnownHostsEntry } from '../p
 import { validateProfileSelection } from '../profiles/connection-profile.js';
 
 import { WindowsCredentialManager } from './windows-credential-manager.js';
-import { WindowsNativeAgentReadiness } from './windows-native-agent-readiness.js';
-import { WindowsOpenSshResolver, WindowsSshAddIdentity } from './windows-openssh.js';
 import { WindowsInMemoryPasswordTransport, type WindowsPasswordValidationRequest } from './windows-password-transport.js';
 import { WindowsSecureStorage } from './windows-secure-storage.js';
 
@@ -60,13 +58,12 @@ function parseKnownHosts(bytes: Buffer): readonly ApprovedKnownHostsEntry[] {
 }
 
 export interface WindowsPasswordReadinessTransport {
-  connect(request: WindowsPasswordValidationRequest): Promise<void>;
+  connect(request: WindowsPasswordValidationRequest, signal?: AbortSignal): Promise<void>;
 }
 
 export interface WindowsValidationSessionDependencies {
   readonly storage: Pick<WindowsSecureStorage, 'getProfile' | 'withKnownHostsSnapshot'>;
-  readonly agentIdentity: Pick<WindowsSshAddIdentity, 'isAvailable'>;
-  readonly agentReadiness: Pick<WindowsNativeAgentReadiness, 'validate'>;
+  readonly agentIdentity: { isAvailable(): boolean | Promise<boolean> };
   readonly createPasswordTransport: (approvedReference: string) => WindowsPasswordReadinessTransport;
   readonly timeoutMs?: number;
 }
@@ -76,8 +73,7 @@ function defaultDependencies(): WindowsValidationSessionDependencies {
   const timeoutMs = DEFAULT_TIMEOUT_MS;
   return {
     storage,
-    agentIdentity: new WindowsSshAddIdentity(new WindowsOpenSshResolver(), timeoutMs),
-    agentReadiness: new WindowsNativeAgentReadiness(),
+    agentIdentity: { isAvailable: async () => false },
     createPasswordTransport: (approvedReference) =>
       new WindowsInMemoryPasswordTransport(new WindowsCredentialManager(undefined, [approvedReference])),
     timeoutMs,
@@ -97,12 +93,19 @@ export class WindowsValidationSession {
     this.timeoutMs = boundedTimeout(dependencies.timeoutMs);
   }
 
-  async validate(input: unknown): Promise<void> {
+  async validate(input: unknown, signal?: AbortSignal): Promise<void> {
+    const started = Date.now();
+    const remaining = (): number => {
+      if (signal?.aborted) return 0;
+      return Math.max(0, this.timeoutMs - (Date.now() - started));
+    };
+    if (remaining() === 0) return unavailable();
     const selection = validateProfileSelection(input);
     const profile = this.dependencies.storage.getProfile(selection.profileId);
     if (profile === undefined) return unavailable();
 
-    await this.dependencies.storage.withKnownHostsSnapshot(profile.approvedKnownHostsReference, async (bytes, capability) => {
+    await this.dependencies.storage.withKnownHostsSnapshot(profile.approvedKnownHostsReference, async (bytes, _capability) => {
+      if (remaining() === 0) return unavailable();
       const entries = parseKnownHosts(bytes);
       const policy = new HostIdentityCredentialPolicy({
         profiles: { getProfile: (profileId) => (profileId === selection.profileId ? profile : undefined) },
@@ -114,25 +117,25 @@ export class WindowsValidationSession {
           isApproved: (reference) => profile.authMode === 'password' && reference === profile.credentialReference,
         },
       });
+      // Native agent-key readiness is synchronous today. Do not invoke it on
+      // the MCP path: it would pin the event loop and make cancellation
+      // unsound while the opaque snapshot is live. Windows stays fail-closed
+      // until the addon offers a cancellable asynchronous operation.
+      if (profile.authMode === 'agent-key') return unavailable();
       const authorized = await policy.authorize(selection);
-      if (authorized.authentication.mode === 'agent-key') {
-        const descriptor = Object.freeze({
+      if (authorized.authentication.mode !== 'password' || remaining() === 0) return unavailable();
+
+      await this.dependencies.createPasswordTransport(authorized.authentication.credentialReference).connect(
+        {
           host: authorized.profile.host,
           port: authorized.profile.port,
           user: authorized.profile.user,
-        });
-        this.dependencies.agentReadiness.validate(capability, descriptor, this.timeoutMs);
-        return;
-      }
-
-      await this.dependencies.createPasswordTransport(authorized.authentication.credentialReference).connect({
-        host: authorized.profile.host,
-        port: authorized.profile.port,
-        user: authorized.profile.user,
-        expectedHostFingerprint: authorized.hostIdentity.fingerprint,
-        credentialReference: authorized.authentication.credentialReference,
-        timeoutMs: this.timeoutMs,
-      });
+          expectedHostFingerprint: authorized.hostIdentity.fingerprint,
+          credentialReference: authorized.authentication.credentialReference,
+          timeoutMs: remaining(),
+        },
+        signal,
+      );
     });
   }
 }
