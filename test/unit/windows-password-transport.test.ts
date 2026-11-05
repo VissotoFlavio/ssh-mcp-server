@@ -103,6 +103,45 @@ test('does not start a connection or retrieve credentials after cancellation', a
   assert.equal(lookups, 0);
 });
 
+test('does not retrieve a credential when cancellation follows host-key verification', async () => {
+  const client = new FakeClient();
+  let lookups = 0;
+  const controller = new AbortController();
+  const transport = new WindowsInMemoryPasswordTransport({ getPassword: () => ({ password: (++lookups, 'private') }) }, () => client);
+  const connected = transport.connect(request, controller.signal);
+  assert.equal((client.config!.hostVerifier as (key: Buffer) => boolean)(key), true);
+  controller.abort();
+  let authentication: unknown;
+  (client.config!.authHandler as unknown as (left: unknown, partial: unknown, callback: (value: unknown) => void) => void)(null, null, (value) => {
+    authentication = value;
+  });
+  assert.equal(authentication, false);
+  assert.equal(lookups, 0);
+  await assert.rejects(connected, WindowsPasswordTransportError);
+});
+
+test('does not release a password when credential lookup triggers cancellation', async () => {
+  const client = new FakeClient();
+  const controller = new AbortController();
+  const transport = new WindowsInMemoryPasswordTransport(
+    {
+      getPassword: () => {
+        controller.abort();
+        return { password: 'private' };
+      },
+    },
+    () => client,
+  );
+  const connected = transport.connect(request, controller.signal);
+  assert.equal((client.config!.hostVerifier as (key: Buffer) => boolean)(key), true);
+  let authentication: unknown;
+  (client.config!.authHandler as unknown as (left: unknown, partial: unknown, callback: (value: unknown) => void) => void)(null, null, (value) => {
+    authentication = value;
+  });
+  assert.equal(authentication, false);
+  await assert.rejects(connected, WindowsPasswordTransportError);
+});
+
 test('times out with a redacted error and destroys the client before credential lookup', async () => {
   const client = new FakeClient();
   let lookups = 0;

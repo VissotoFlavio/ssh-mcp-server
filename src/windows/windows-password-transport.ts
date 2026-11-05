@@ -96,10 +96,11 @@ export class WindowsInMemoryPasswordTransport {
           },
           authHandler: (_methodsLeft, _partialSuccess, callback) => {
             const rejectAuthentication = callback as unknown as (value: false) => void;
-            if (!hostVerified) return rejectAuthentication(false);
+            if (finished || signal?.aborted || !hostVerified) return rejectAuthentication(false);
             let password = '';
             try {
               password = this.credentials.getPassword(request.credentialReference).password;
+              if (finished || signal?.aborted) return rejectAuthentication(false);
               if (password.length === 0 || password.includes('\u0000')) return rejectAuthentication(false);
               callback({ type: 'password', username: request.user, password });
             } catch {
