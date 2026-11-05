@@ -17,7 +17,7 @@ const paths = Object.freeze({
 });
 
 function binding(value: unknown = paths): WindowsOpenSshBinding {
-  return { resolveOpenSsh: () => value as { readonly ssh: string; readonly sshAdd: string; readonly version: string } };
+  return { resolveOpenSsh: () => value as { readonly ssh: string; readonly sshAdd: string; readonly version: string }, probeSshAdd: () => 0 };
 }
 
 test('uses only the pair returned by the native Windows trust boundary', () => {
@@ -36,23 +36,38 @@ test('fails closed when the native executable boundary is malformed or unavailab
         resolveOpenSsh: () => {
           throw new Error('untrusted path');
         },
+        probeSshAdd: () => 1,
       }).resolve(),
     WindowsOpenSshError,
   );
 });
 
 test('probes an agent only with the native-verified ssh-add path and fixed arguments', async () => {
-  const calls: Array<{ executable: string; args: readonly string[]; timeoutMs: number }> = [];
+  const calls: Array<{ executable: string; args: readonly string[]; timeoutMs: number; verified: boolean }> = [];
   const commands: WindowsOpenSshCommandRunner = {
-    run: async (executable, args, timeoutMs) => {
-      calls.push({ executable, args, timeoutMs });
+    run: async (executable, args, timeoutMs, verifyBeforeLaunch) => {
+      calls.push({ executable, args, timeoutMs, verified: verifyBeforeLaunch?.() === executable });
       return 0;
     },
   };
   const identity = new WindowsSshAddIdentity(new WindowsOpenSshResolver(binding()), 10_000, commands);
 
   assert.equal(await identity.isAvailable(), true);
-  assert.deepEqual(calls, [{ executable: paths.sshAdd, args: ['-l'], timeoutMs: 10_000 }]);
+  assert.deepEqual(calls, [{ executable: paths.sshAdd, args: ['-l'], timeoutMs: 10_000, verified: true }]);
+});
+
+test('uses the native probe after native verification instead of reopening a path in JavaScript', async () => {
+  let calls = 0;
+  const resolver = new WindowsOpenSshResolver({
+    resolveOpenSsh: () => paths,
+    probeSshAdd: (timeoutMs) => {
+      calls += 1;
+      assert.equal(timeoutMs, 1_000);
+      return 0;
+    },
+  });
+  assert.equal(await new WindowsSshAddIdentity(resolver, 1_000).isAvailable(), true);
+  assert.equal(calls, 1);
 });
 
 test('fails closed when agent probing throws or returns a non-zero status', async () => {

@@ -16,10 +16,11 @@ export interface WindowsOpenSshPaths {
 
 export interface WindowsOpenSshBinding {
   resolveOpenSsh(): WindowsOpenSshPaths;
+  probeSshAdd(timeoutMs: number): number;
 }
 
 export interface WindowsOpenSshCommandRunner {
-  run(executable: string, args: readonly string[], timeoutMs: number): Promise<number>;
+  run(executable: string, args: readonly string[], timeoutMs: number, verifyBeforeLaunch?: () => string): Promise<number>;
 }
 
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -34,8 +35,13 @@ function boundedTimeout(timeoutMs: number): number {
  * It discards all child output and never accepts shell options from callers.
  */
 export class DirectWindowsOpenSshCommandRunner implements WindowsOpenSshCommandRunner {
-  run(executable: string, args: readonly string[], timeoutMs: number): Promise<number> {
+  run(executable: string, args: readonly string[], timeoutMs: number, verifyBeforeLaunch?: () => string): Promise<number> {
     return new Promise((resolve, reject) => {
+      try {
+        if (verifyBeforeLaunch !== undefined && verifyBeforeLaunch() !== executable) return reject(new WindowsOpenSshError());
+      } catch {
+        return reject(new WindowsOpenSshError());
+      }
       let settled = false;
       const child = spawn(executable, [...args], {
         shell: false,
@@ -116,7 +122,12 @@ function loadNativeBinding(): WindowsOpenSshBinding {
   } catch {
     return unavailable();
   }
-  if (typeof candidate !== 'object' || candidate === null || typeof (candidate as { resolveOpenSsh?: unknown }).resolveOpenSsh !== 'function') {
+  if (
+    typeof candidate !== 'object' ||
+    candidate === null ||
+    typeof (candidate as { resolveOpenSsh?: unknown }).resolveOpenSsh !== 'function' ||
+    typeof (candidate as { probeSshAdd?: unknown }).probeSshAdd !== 'function'
+  ) {
     return unavailable();
   }
   return candidate as WindowsOpenSshBinding;
@@ -142,6 +153,14 @@ export class WindowsOpenSshResolver implements OpenSshExecutableResolver {
   resolve(): string {
     return this.paths().ssh;
   }
+
+  probeSshAdd(timeoutMs: number): number {
+    try {
+      return this.binding.probeSshAdd(boundedTimeout(timeoutMs));
+    } catch {
+      return unavailable();
+    }
+  }
 }
 
 /** Probes the agent through the verified ssh-add executable without exposing key material. */
@@ -154,7 +173,9 @@ export class WindowsSshAddIdentity {
 
   async isAvailable(): Promise<boolean> {
     try {
-      return (await this.commands.run(this.resolver.paths().sshAdd, ['-l'], this.timeoutMs)) === 0;
+      return this.commands instanceof DirectWindowsOpenSshCommandRunner
+        ? this.resolver.probeSshAdd(this.timeoutMs) === 0
+        : (await this.commands.run(this.resolver.paths().sshAdd, ['-l'], this.timeoutMs, () => this.resolver.paths().sshAdd)) === 0;
     } catch {
       return false;
     }
