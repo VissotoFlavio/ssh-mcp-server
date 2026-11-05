@@ -371,7 +371,7 @@ bool SystemDirectory(std::wstring* value) {
   return IsAbsoluteLocalPath(*value) && IsLocalNtfsPath(*value);
 }
 
-bool TrustedOpenSsh(std::wstring* ssh, std::wstring* ssh_add, std::array<DWORD, 4>* version) {
+bool TrustedOpenSsh(std::wstring* ssh, std::wstring* ssh_add, std::array<DWORD, 4>* version, Handle* retained_system = nullptr, Handle* retained_directory = nullptr, Handle* retained_ssh_add = nullptr) {
   std::wstring system;
   if (!SystemDirectory(&system)) return false;
   const std::wstring directory = system + L"\\OpenSSH";
@@ -381,7 +381,13 @@ bool TrustedOpenSsh(std::wstring* ssh, std::wstring* ssh_add, std::array<DWORD, 
   Handle openssh_handle;
   Handle ssh_handle;
   Handle ssh_add_handle;
-  return OpenTrustedSystemObject(system, true, &system_handle) && OpenTrustedSystemObject(directory, true, &openssh_handle) && OpenTrustedSystemObject(*ssh, false, &ssh_handle) && OpenTrustedSystemObject(*ssh_add, false, &ssh_add_handle) && IsMicrosoftSigned(*ssh) && IsMicrosoftSigned(*ssh_add) && IsSupportedOpenSshVersion(*ssh, version) && IsSupportedOpenSshVersion(*ssh_add, version);
+  const bool trusted = OpenTrustedSystemObject(system, true, &system_handle) && OpenTrustedSystemObject(directory, true, &openssh_handle) && OpenTrustedSystemObject(*ssh, false, &ssh_handle) && OpenTrustedSystemObject(*ssh_add, false, &ssh_add_handle) && IsMicrosoftSigned(*ssh) && IsMicrosoftSigned(*ssh_add) && IsSupportedOpenSshVersion(*ssh, version) && IsSupportedOpenSshVersion(*ssh_add, version);
+  if (trusted) {
+    if (retained_system != nullptr) *retained_system = std::move(system_handle);
+    if (retained_directory != nullptr) *retained_directory = std::move(openssh_handle);
+    if (retained_ssh_add != nullptr) *retained_ssh_add = std::move(ssh_add_handle);
+  }
+  return trusted;
 }
 
 bool RootsAreDistinct(const std::wstring& state_root, const std::wstring& known_hosts_root, PSID operator_sid) {
@@ -487,6 +493,26 @@ napi_value ResolveOpenSsh(napi_env env, napi_callback_info info) {
   return result;
 }
 
+napi_value ProbeSshAdd(napi_env env, napi_callback_info info) {
+  size_t count = 1; napi_value argument{}; int32_t timeout = 0;
+  if (napi_get_cb_info(env, info, &count, &argument, nullptr, nullptr) != napi_ok || count != 1 || napi_get_value_int32(env, argument, &timeout) != napi_ok || timeout <= 0 || timeout > 60000) return Unavailable(env);
+  std::wstring ssh; std::wstring ssh_add; std::array<DWORD, 4> version{};
+  Handle system_handle;
+  Handle openssh_handle;
+  Handle ssh_add_handle;
+  if (!TrustedOpenSsh(&ssh, &ssh_add, &version, &system_handle, &openssh_handle, &ssh_add_handle)) return Unavailable(env);
+  std::wstring command = L"\"" + ssh_add + L"\" -l";
+  SECURITY_ATTRIBUTES inheritable{}; inheritable.nLength = sizeof(inheritable); inheritable.bInheritHandle = TRUE;
+  Handle nul(CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &inheritable, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+  if (nul.get() == INVALID_HANDLE_VALUE) return Unavailable(env);
+  STARTUPINFOW startup{}; startup.cb = sizeof(startup); startup.dwFlags = STARTF_USESTDHANDLES; startup.hStdInput = nul.get(); startup.hStdOutput = nul.get(); startup.hStdError = nul.get(); PROCESS_INFORMATION process{};
+  if (!CreateProcessW(ssh_add.c_str(), command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) return Unavailable(env);
+  Handle process_handle(process.hProcess); Handle thread_handle(process.hThread);
+  if (WaitForSingleObject(process_handle.get(), static_cast<DWORD>(timeout)) != WAIT_OBJECT_0) { TerminateProcess(process_handle.get(), 1); return Unavailable(env); }
+  DWORD exit_code = 1; napi_value result{};
+  return GetExitCodeProcess(process_handle.get(), &exit_code) && napi_create_int32(env, static_cast<int32_t>(exit_code), &result) == napi_ok ? result : Unavailable(env);
+}
+
 napi_value ReadCredential(napi_env env, napi_callback_info info) {
   std::string locator;
   if (!ReadCredentialLocator(env, info, &locator)) return Unavailable(env);
@@ -512,6 +538,7 @@ NAPI_MODULE_INIT() {
     {"readProfileState", nullptr, ReadProfileState, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"readKnownHosts", nullptr, ReadKnownHosts, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"resolveOpenSsh", nullptr, ResolveOpenSsh, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"probeSshAdd", nullptr, ProbeSshAdd, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"readCredential", nullptr, ReadCredential, nullptr, nullptr, nullptr, napi_default, nullptr},
   };
   if (napi_define_properties(env, exports, sizeof(properties) / sizeof(properties[0]), properties) != napi_ok) return nullptr;
