@@ -503,57 +503,101 @@ constexpr napi_type_tag kSnapshotCapabilityTypeTag{0x13a5c33f91d1b7e4ULL, 0x7e4b
 constexpr napi_type_tag kSnapshotCapabilityTypeTag{0xb1c7a8d93ef01642ULL, 0x2e6f4175ca903bd8ULL};
 #endif
 
+enum class SnapshotFailure {
+  kNone,
+  kDirectoryOpen,
+  kDirectoryVerify,
+  kFileVerify,
+  kIdentityAdopt,
+  kWrite,
+  kFlush,
+  kFileDisposition,
+  kDirectoryDisposition,
+};
+
+#ifdef SSH_MCP_NATIVE_TEST
+SnapshotFailure g_test_snapshot_failure = SnapshotFailure::kNone;
+
+bool ConsumeSnapshotFailure(SnapshotFailure failure) {
+  if (g_test_snapshot_failure != failure) return false;
+  g_test_snapshot_failure = SnapshotFailure::kNone;
+  return true;
+}
+#else
+bool ConsumeSnapshotFailure(SnapshotFailure) { return false; }
+#endif
+
 class SnapshotSession final {
  public:
   explicit SnapshotSession(PSID operator_sid) : operator_sid_(operator_sid, operator_sid + GetLengthSid(operator_sid)), capability_tag_(&kSnapshotCapabilityTypeTag) {}
-  ~SnapshotSession() { if (!disposed_) Dispose(); }
+  ~SnapshotSession() {
+    if (!disposed_) {
+      Rollback();
+      // A finalizer has no remaining JavaScript capability to drive a later
+      // retry. Retry once for transient failures, then fail closed by closing
+      // only the retained handles without following a pathname.
+      if (HasArtifacts()) Rollback();
+    }
+  }
   SnapshotSession(const SnapshotSession&) = delete;
   SnapshotSession& operator=(const SnapshotSession&) = delete;
 
-  bool Adopt(Handle parent, Handle directory, Handle file) {
+  bool AdoptParent(Handle parent) {
     parent_ = std::move(parent);
-    directory_ = std::move(directory);
-    file_ = std::move(file);
-    return ReadIdentity(parent_.get(), &parent_identity_) && ReadIdentity(directory_.get(), &directory_identity_) && ReadIdentity(file_.get(), &file_identity_);
+    return ReadIdentity(parent_.get(), &parent_identity_);
   }
+
+  bool AdoptDirectory(Handle directory) {
+    directory_ = std::move(directory);
+    return ReadIdentity(directory_.get(), &directory_identity_);
+  }
+
+  bool AdoptFile(Handle file) {
+    file_ = std::move(file);
+    return ReadIdentity(file_.get(), &file_identity_) && !ConsumeSnapshotFailure(SnapshotFailure::kIdentityAdopt);
+  }
+
+  bool VerifyDirectory(PSID operator_sid) const { return VerifyFile(directory_.get(), operator_sid, true); }
+  bool VerifySnapshotFile(PSID operator_sid) const { return VerifyFile(file_.get(), operator_sid, false); }
 
   bool Write(const std::vector<BYTE>& data) {
+    if (ConsumeSnapshotFailure(SnapshotFailure::kWrite)) return false;
     DWORD bytes_written = 0;
-    return WriteFile(file_.get(), data.data(), static_cast<DWORD>(data.size()), &bytes_written, nullptr) && bytes_written == data.size() && FlushFileBuffers(file_.get());
+    return WriteFile(file_.get(), data.data(), static_cast<DWORD>(data.size()), &bytes_written, nullptr) && bytes_written == data.size() && !ConsumeSnapshotFailure(SnapshotFailure::kFlush) && FlushFileBuffers(file_.get());
   }
 
-  bool IsValidCapability() const { return !disposed_ && capability_tag_ == &kSnapshotCapabilityTypeTag; }
+  bool IsReady() const { return parent_.get() != INVALID_HANDLE_VALUE && directory_.get() != INVALID_HANDLE_VALUE && file_.get() != INVALID_HANDLE_VALUE; }
+  bool IsValidCapability() const { return !disposed_ && parent_.get() != INVALID_HANDLE_VALUE && directory_.get() != INVALID_HANDLE_VALUE && capability_tag_ == &kSnapshotCapabilityTypeTag; }
 
   bool Dispose() {
     if (disposed_) return false;
+    if (!Rollback() || HasArtifacts()) return false;
     disposed_ = true;
-    const bool trusted = parent_.get() != INVALID_HANDLE_VALUE && directory_.get() != INVALID_HANDLE_VALUE && file_.get() != INVALID_HANDLE_VALUE && HasIdentity(parent_.get(), parent_identity_) && HasIdentity(directory_.get(), directory_identity_) && HasIdentity(file_.get(), file_identity_) && VerifyFile(parent_.get(), operator_sid_.data(), true) && VerifyFile(directory_.get(), operator_sid_.data(), true) && VerifyFile(file_.get(), operator_sid_.data(), false);
-    if (!trusted) {
-      file_.reset();
-      directory_.reset();
-      parent_.reset();
-      return false;
-    }
-    FILE_DISPOSITION_INFO delete_info{};
-    delete_info.DeleteFile = TRUE;
-    if (!SetFileInformationByHandle(file_.get(), FileDispositionInfo, &delete_info, sizeof(delete_info))) {
-      file_.reset();
-      directory_.reset();
-      parent_.reset();
-      return false;
-    }
-    file_.reset();
-    if (!HasIdentity(parent_.get(), parent_identity_) || !HasIdentity(directory_.get(), directory_identity_) || !VerifyFile(parent_.get(), operator_sid_.data(), true) || !VerifyFile(directory_.get(), operator_sid_.data(), true) || !SetFileInformationByHandle(directory_.get(), FileDispositionInfo, &delete_info, sizeof(delete_info))) {
-      directory_.reset();
-      parent_.reset();
-      return false;
-    }
-    directory_.reset();
-    parent_.reset();
     return true;
   }
 
  private:
+  bool HasArtifacts() const { return directory_.get() != INVALID_HANDLE_VALUE || file_.get() != INVALID_HANDLE_VALUE; }
+
+  bool Rollback() {
+    if (file_.get() != INVALID_HANDLE_VALUE) {
+      if (!HasIdentity(file_.get(), file_identity_) || !VerifyFile(file_.get(), operator_sid_.data(), false) || ConsumeSnapshotFailure(SnapshotFailure::kFileDisposition)) return false;
+      FILE_DISPOSITION_INFO delete_info{};
+      delete_info.DeleteFile = TRUE;
+      if (!SetFileInformationByHandle(file_.get(), FileDispositionInfo, &delete_info, sizeof(delete_info))) return false;
+      file_.reset();
+    }
+    if (directory_.get() != INVALID_HANDLE_VALUE) {
+      if (!HasIdentity(parent_.get(), parent_identity_) || !HasIdentity(directory_.get(), directory_identity_) || !VerifyFile(parent_.get(), operator_sid_.data(), true) || !VerifyFile(directory_.get(), operator_sid_.data(), true) || ConsumeSnapshotFailure(SnapshotFailure::kDirectoryDisposition)) return false;
+      FILE_DISPOSITION_INFO delete_info{};
+      delete_info.DeleteFile = TRUE;
+      if (!SetFileInformationByHandle(directory_.get(), FileDispositionInfo, &delete_info, sizeof(delete_info))) return false;
+      directory_.reset();
+    }
+    parent_.reset();
+    return true;
+  }
+
   std::vector<BYTE> operator_sid_;
   const void* capability_tag_;
   Handle parent_;
@@ -573,6 +617,8 @@ bool CreateKnownHostsSnapshot(const std::wstring& state_root, PSID operator_sid,
   if (parent.get() == INVALID_HANDLE_VALUE || !VerifyFile(parent.get(), operator_sid, true)) return false;
   PrivateSecurityAttributes security(operator_sid);
   if (!security.valid()) return false;
+  std::unique_ptr<SnapshotSession> candidate(new SnapshotSession(operator_sid));
+  if (!candidate->AdoptParent(std::move(parent))) return false;
   for (DWORD attempt = 0; attempt != 16; ++attempt) {
     unsigned int random_value = 0;
     if (rand_s(&random_value) != 0) return false;
@@ -584,18 +630,12 @@ bool CreateKnownHostsSnapshot(const std::wstring& state_root, PSID operator_sid,
       return false;
     }
     Handle directory(CreateFileW(directory_path.c_str(), FILE_READ_ATTRIBUTES | READ_CONTROL | DELETE, 0, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
-    if (directory.get() == INVALID_HANDLE_VALUE || !VerifyFile(directory.get(), operator_sid, true)) return false;
+    if (directory.get() == INVALID_HANDLE_VALUE || !candidate->AdoptDirectory(std::move(directory)) || ConsumeSnapshotFailure(SnapshotFailure::kDirectoryOpen) || ConsumeSnapshotFailure(SnapshotFailure::kDirectoryVerify) || !candidate->VerifyDirectory(operator_sid)) return false;
     const std::wstring file_path = directory_path + L"\\known_hosts";
     Handle file(CreateFileW(file_path.c_str(), GENERIC_READ | GENERIC_WRITE | FILE_READ_ATTRIBUTES | READ_CONTROL | DELETE, 0, security.get(), CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr));
-    if (file.get() == INVALID_HANDLE_VALUE || !VerifyFile(file.get(), operator_sid, false)) {
-      FILE_DISPOSITION_INFO delete_info{};
-      delete_info.DeleteFile = TRUE;
-      SetFileInformationByHandle(directory.get(), FileDispositionInfo, &delete_info, sizeof(delete_info));
-      return false;
-    }
-    std::unique_ptr<SnapshotSession> candidate(new SnapshotSession(operator_sid));
-    if (!candidate->Adopt(std::move(parent), std::move(directory), std::move(file))) return false;
+    if (file.get() == INVALID_HANDLE_VALUE || !candidate->AdoptFile(std::move(file)) || ConsumeSnapshotFailure(SnapshotFailure::kFileVerify) || !candidate->VerifySnapshotFile(operator_sid)) return false;
     if (!candidate->Write(data)) return false;
+    if (!candidate->IsReady()) return false;
     *snapshot = std::move(candidate);
     return true;
   }
@@ -809,6 +849,56 @@ bool ReadWideArgument(napi_env env, napi_callback_info info, std::wstring* value
   return value->find(L'\0') == std::wstring::npos;
 }
 
+napi_value TestSetSnapshotFailure(napi_env env, napi_callback_info info) {
+  std::string failure;
+  if (!ReadArgumentString(env, info, &failure)) return Unavailable(env);
+  if (failure == "directory-open") g_test_snapshot_failure = SnapshotFailure::kDirectoryOpen;
+  else if (failure == "directory-verify") g_test_snapshot_failure = SnapshotFailure::kDirectoryVerify;
+  else if (failure == "file-verify") g_test_snapshot_failure = SnapshotFailure::kFileVerify;
+  else if (failure == "identity-adopt") g_test_snapshot_failure = SnapshotFailure::kIdentityAdopt;
+  else if (failure == "write") g_test_snapshot_failure = SnapshotFailure::kWrite;
+  else if (failure == "flush") g_test_snapshot_failure = SnapshotFailure::kFlush;
+  else if (failure == "file-disposition") g_test_snapshot_failure = SnapshotFailure::kFileDisposition;
+  else if (failure == "directory-disposition") g_test_snapshot_failure = SnapshotFailure::kDirectoryDisposition;
+  else return Unavailable(env);
+  napi_value result{};
+  return napi_get_undefined(env, &result) == napi_ok ? result : Unavailable(env);
+}
+
+napi_value TestSnapshotArtifactCount(napi_env env, napi_callback_info info) {
+  size_t count = 0;
+  std::wstring state_root;
+  std::wstring known_hosts_root;
+  std::vector<BYTE> operator_sid;
+  if (napi_get_cb_info(env, info, &count, nullptr, nullptr, nullptr) != napi_ok || count != 0 || !LoadConfiguration(&state_root, &known_hosts_root, &operator_sid)) return Unavailable(env);
+  WIN32_FIND_DATAW entry{};
+  const std::wstring pattern = state_root + L"\\.ssh-mcp-snapshot-*";
+  HANDLE find = FindFirstFileW(pattern.c_str(), &entry);
+  DWORD artifacts = 0;
+  if (find != INVALID_HANDLE_VALUE) {
+    do {
+      if ((entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 && (entry.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0) ++artifacts;
+    } while (FindNextFileW(find, &entry) != 0);
+    const DWORD find_error = GetLastError();
+    FindClose(find);
+    if (find_error != ERROR_NO_MORE_FILES) return Unavailable(env);
+  } else if (GetLastError() != ERROR_FILE_NOT_FOUND) return Unavailable(env);
+  napi_value result{};
+  return napi_create_uint32(env, artifacts, &result) == napi_ok ? result : Unavailable(env);
+}
+
+napi_value TestFinalizeSnapshotCapability(napi_env env, napi_callback_info info) {
+  SnapshotSession* snapshot = nullptr;
+  if (!ReadSnapshotCapability(env, info, &snapshot)) return Unavailable(env);
+  size_t count = 1;
+  napi_value capability{};
+  void* unwrapped = nullptr;
+  if (napi_get_cb_info(env, info, &count, &capability, nullptr, nullptr) != napi_ok || count != 1 || napi_remove_wrap(env, capability, &unwrapped) != napi_ok || unwrapped != snapshot) return Unavailable(env);
+  FinalizeSnapshotCapability(env, snapshot, nullptr);
+  napi_value result{};
+  return napi_get_undefined(env, &result) == napi_ok ? result : Unavailable(env);
+}
+
 napi_value ReplacementRaceResult(napi_env env, bool hook_executed, DWORD replacement_error, bool read_succeeded, const char* stage) {
   napi_value result{};
   napi_value hook_value{};
@@ -1012,6 +1102,9 @@ NAPI_MODULE_INIT() {
     {"testOpenSshIdentityBeforeLaunch", nullptr, TestOpenSshIdentityBeforeLaunch<false>, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"testOpenSshUnexpectedPreLaunchError", nullptr, TestOpenSshIdentityBeforeLaunch<true>, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"testLaunch", nullptr, TestLaunch, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"testSetSnapshotFailure", nullptr, TestSetSnapshotFailure, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"testSnapshotArtifactCount", nullptr, TestSnapshotArtifactCount, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"testFinalizeSnapshotCapability", nullptr, TestFinalizeSnapshotCapability, nullptr, nullptr, nullptr, napi_default, nullptr},
 #endif
   };
   if (napi_define_properties(env, exports, sizeof(properties) / sizeof(properties[0]), properties) != napi_ok) return nullptr;

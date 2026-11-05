@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert';
 import { execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -21,6 +21,9 @@ const testOnlyHookNames = [
   'testOpenSshIdentityBeforeLaunch',
   'testOpenSshUnexpectedPreLaunchError',
   'testLaunch',
+  'testSetSnapshotFailure',
+  'testSnapshotArtifactCount',
+  'testFinalizeSnapshotCapability',
 ] as const;
 
 type RegistryMutationRight =
@@ -74,6 +77,8 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
     probeSshAdd(timeoutMs: unknown): number;
   };
   const testBinding = nativeRequire(testAddonPath) as {
+    captureKnownHostsSnapshot(profileId: string): { bytes: Buffer; capability: object };
+    disposeKnownHostsSnapshot(capability: unknown): void;
     testReadReplacementRace(target: 'state-root' | 'state-leaf' | 'known-hosts-root' | 'known-hosts-leaf'): {
       hookExecuted: boolean;
       replacementError: number;
@@ -91,6 +96,12 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
       launchCompleted: boolean;
     };
     testLaunch(mode: 'exit' | 'hang', timeoutMs: number): { completed: boolean; timedOut: boolean; exitCode: number };
+    testSetSnapshotFailure(
+      failure:
+        'directory-open' | 'directory-verify' | 'file-verify' | 'identity-adopt' | 'write' | 'flush' | 'file-disposition' | 'directory-disposition',
+    ): void;
+    testSnapshotArtifactCount(): number;
+    testFinalizeSnapshotCapability(capability: object): void;
   };
 
   test('keeps test-only hooks out of the production native addon', () => {
@@ -126,15 +137,74 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
       configured = true;
       const expected = binding.readKnownHosts('production-api');
       const snapshot = binding.captureKnownHostsSnapshot('production-api');
+      const sentinel = join(root, 'state', 'snapshot-sentinel');
+      writeFileSync(sentinel, 'sentinel', 'utf8');
       assert.equal(Buffer.isBuffer(snapshot.bytes), true);
       assert.deepEqual(snapshot.bytes, expected);
+      assert.equal(testBinding.testSnapshotArtifactCount(), 1);
       assert.deepEqual(Object.keys(snapshot).sort(), ['bytes', 'capability']);
       assert.deepEqual(Object.getOwnPropertyNames(snapshot.capability), []);
       assert.equal(JSON.stringify(snapshot.capability).includes(root), false);
       assert.throws(() => binding.disposeKnownHostsSnapshot({}), /Windows secure storage is unavailable/u);
       assert.throws(() => binding.disposeKnownHostsSnapshot(Object.create(snapshot.capability)), /Windows secure storage is unavailable/u);
+      assert.equal(existsSync(sentinel), true);
       assert.doesNotThrow(() => binding.disposeKnownHostsSnapshot(snapshot.capability));
+      assert.equal(testBinding.testSnapshotArtifactCount(), 0);
       assert.throws(() => binding.disposeKnownHostsSnapshot(snapshot.capability), /Windows secure storage is unavailable/u);
+      assert.equal(existsSync(sentinel), true);
+    } finally {
+      if (configured) runFixture('cleanup', root);
+    }
+  });
+
+  for (const failure of ['directory-open', 'directory-verify', 'file-verify', 'identity-adopt', 'write', 'flush'] as const) {
+    test(`rolls back snapshot artifacts when ${failure} fails before capability creation`, () => {
+      const root = uniqueRoot(`snapshot-${failure}`);
+      let configured = false;
+      try {
+        runFixture('safe', root);
+        configured = true;
+        assert.equal(testBinding.testSnapshotArtifactCount(), 0);
+        testBinding.testSetSnapshotFailure(failure);
+        assert.throws(() => testBinding.captureKnownHostsSnapshot('production-api'), /Windows secure storage is unavailable/u);
+        assert.equal(testBinding.testSnapshotArtifactCount(), 0);
+      } finally {
+        if (configured) runFixture('cleanup', root);
+      }
+    });
+  }
+
+  for (const failure of ['file-disposition', 'directory-disposition'] as const) {
+    test(`retains a retryable capability when ${failure} cleanup fails`, () => {
+      const root = uniqueRoot(`snapshot-${failure}`);
+      let configured = false;
+      try {
+        runFixture('safe', root);
+        configured = true;
+        const snapshot = testBinding.captureKnownHostsSnapshot('production-api');
+        assert.equal(testBinding.testSnapshotArtifactCount(), 1);
+        testBinding.testSetSnapshotFailure(failure);
+        assert.throws(() => testBinding.disposeKnownHostsSnapshot(snapshot.capability), /Windows secure storage is unavailable/u);
+        assert.equal(testBinding.testSnapshotArtifactCount(), 1);
+        assert.doesNotThrow(() => testBinding.disposeKnownHostsSnapshot(snapshot.capability));
+        assert.equal(testBinding.testSnapshotArtifactCount(), 0);
+      } finally {
+        if (configured) runFixture('cleanup', root);
+      }
+    });
+  }
+
+  test('retries a transient cleanup failure during native finalization without leaving artifacts', () => {
+    const root = uniqueRoot('snapshot-finalizer');
+    let configured = false;
+    try {
+      runFixture('safe', root);
+      configured = true;
+      const snapshot = testBinding.captureKnownHostsSnapshot('production-api');
+      assert.equal(testBinding.testSnapshotArtifactCount(), 1);
+      testBinding.testSetSnapshotFailure('file-disposition');
+      assert.doesNotThrow(() => testBinding.testFinalizeSnapshotCapability(snapshot.capability));
+      assert.equal(testBinding.testSnapshotArtifactCount(), 0);
     } finally {
       if (configured) runFixture('cleanup', root);
     }
