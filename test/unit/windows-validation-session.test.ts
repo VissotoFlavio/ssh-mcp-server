@@ -20,7 +20,9 @@ const profile = {
 };
 const knownHosts = Buffer.from(`api.internal.example ssh-ed25519 ${key.toString('base64')}\n`);
 
-function session(overrides: { readonly profile?: ConnectionProfile; readonly bytes?: Buffer; readonly delayMs?: number } = {}) {
+function session(
+  overrides: { readonly profile?: ConnectionProfile; readonly bytes?: Buffer; readonly delayMs?: number; readonly agentAvailable?: boolean } = {},
+) {
   let captures = 0;
   let disposals = 0;
   const requests: unknown[] = [];
@@ -38,7 +40,7 @@ function session(overrides: { readonly profile?: ConnectionProfile; readonly byt
         }
       },
     },
-    agentIdentity: { isAvailable: async () => true },
+    agentIdentity: { isAvailable: async () => overrides.agentAvailable ?? true },
     agentReadiness: {
       validate: async (...values) => {
         agentRequests.push(values);
@@ -94,6 +96,46 @@ test('uses cancellable native readiness for an approved agent-key profile', asyn
   assert.deepEqual(descriptor, { host: profile.host, port: profile.port, user: profile.user });
   assert.ok(timeout > 0 && timeout <= 10_000);
   assert.equal(signal, undefined);
+});
+
+test('does not start native readiness when the trusted ssh-add identity probe is unavailable', async () => {
+  const candidate = session({ profile: { ...profile, authMode: 'agent-key' }, agentAvailable: false });
+  await assert.rejects(candidate.candidate.validate({ profileId: profile.profileId }));
+  assert.deepEqual(candidate.agentRequests, []);
+});
+
+test('forwards cancellation to the native ssh-add identity gate before readiness starts', async () => {
+  let received: AbortSignal | undefined;
+  let release!: () => void;
+  let entered!: () => void;
+  const enteredGate = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const controller = new AbortController();
+  const candidate = new WindowsValidationSession({
+    storage: {
+      getProfile: () => ({ ...profile, authMode: 'agent-key' }),
+      withKnownHostsSnapshot: async (_reference, work) => work(knownHosts, {}),
+    },
+    agentIdentity: {
+      isAvailable: async (_timeout, signal) => {
+        received = signal;
+        entered();
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        return false;
+      },
+    },
+    agentReadiness: { validate: async () => assert.fail('native readiness must not start') },
+    createPasswordTransport: () => ({ connect: async () => assert.fail('password must not start') }),
+  });
+  const pending = candidate.validate({ profileId: profile.profileId }, controller.signal);
+  await enteredGate;
+  controller.abort();
+  release();
+  await assert.rejects(pending);
+  assert.equal(received, controller.signal);
 });
 
 test('disposes the captured snapshot when known-hosts parsing rejects unsafe data', async () => {

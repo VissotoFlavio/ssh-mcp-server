@@ -26,6 +26,7 @@ function binding(state: unknown = { profiles: [profile] }): WindowsTrustBinding 
       return { bytes: Buffer.from('[api.internal.example]:22 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItest\n'), capability };
     },
     disposeKnownHostsSnapshot: (value) => assert.equal(value, capability),
+    isKnownHostsSnapshotBusy: () => false,
     readCredential: () => 'unused',
   };
 }
@@ -58,6 +59,7 @@ test('fails closed for malformed state or native failures', () => {
         readKnownHosts: () => Buffer.from('unused'),
         captureKnownHostsSnapshot: () => ({ bytes: Buffer.from('unused'), capability: {} }),
         disposeKnownHostsSnapshot: () => undefined,
+        isKnownHostsSnapshotBusy: () => false,
         readCredential: () => 'unused',
       }).listProfiles(),
     WindowsSecureStorageError,

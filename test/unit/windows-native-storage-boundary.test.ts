@@ -26,6 +26,10 @@ const testOnlyHookNames = [
   'testSnapshotArtifactCount',
   'testFinalizeSnapshotCapability',
   'testReadinessDescriptor',
+  'testBlockDeferredReaper',
+  'testReleaseDeferredReaper',
+  'testWaitForMasterStarted',
+  'testDeferredReaperCompletion',
 ] as const;
 
 type RegistryMutationRight =
@@ -74,7 +78,6 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
     readKnownHosts(profileId: string): Buffer;
     captureKnownHostsSnapshot(profileId: string): { bytes: Buffer; capability: object };
     disposeKnownHostsSnapshot(capability: unknown): void;
-    validateAgentKeyReadiness(capability: unknown, descriptor: unknown, timeoutMs: unknown): void;
     startAgentKeyReadiness(
       capability: object,
       descriptor: { readonly host: string; readonly port: number; readonly user: string },
@@ -83,6 +86,7 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
     readCredential(locator: unknown): string;
     resolveOpenSsh(): { ssh: string; sshAdd: string; version: string };
     probeSshAdd(timeoutMs: unknown): number;
+    startSshAddProbe(timeoutMs: unknown): { readonly promise: Promise<boolean>; readonly cancel: () => void };
   };
   const testBinding = nativeRequire(testAddonPath) as {
     captureKnownHostsSnapshot(profileId: string): { bytes: Buffer; capability: object };
@@ -125,6 +129,10 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
     testSnapshotArtifactCount(): number;
     testFinalizeSnapshotCapability(capability: object): void;
     testReadinessDescriptor(descriptor: unknown): boolean;
+    testBlockDeferredReaper(): void;
+    testReleaseDeferredReaper(): void;
+    testWaitForMasterStarted(timeoutMs: number): boolean;
+    testDeferredReaperCompletion(): Promise<void>;
   };
 
   test('keeps test-only hooks out of the production native addon', () => {
@@ -156,7 +164,8 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
       assert.match(ssh.sshAdd, /\\System32\\OpenSSH\\ssh-add\.exe$/iu);
       assert.match(ssh.version, /^9\.(?:[5-9]|[1-9][0-9]+)\.[0-9]+\.[0-9]+$/u);
       assert.equal(typeof binding.probeSshAdd, 'function');
-      assert.equal(typeof binding.validateAgentKeyReadiness, 'function');
+      assert.equal('validateAgentKeyReadiness' in binding, false);
+      assert.equal(typeof binding.startSshAddProbe, 'function');
     } finally {
       if (configured) runFixture('cleanup', root);
     }
@@ -204,6 +213,36 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
       assert.doesNotThrow(() => testBinding.disposeKnownHostsSnapshot(snapshot.capability));
     } finally {
       if (configured) runFixture('cleanup', root);
+    }
+  });
+
+  test('retains a busy snapshot while the forced deferred reaper is blocked', async () => {
+    const root = uniqueRoot('deferred-reaper');
+    let configured = false;
+    try {
+      runFixture('safe', root);
+      configured = true;
+      testBinding.testBlockDeferredReaper();
+      const snapshot = testBinding.captureKnownHostsSnapshot('production-api');
+      const operation = testBinding.startAgentKeyReadiness(snapshot.capability, { host: '192.0.2.1', port: 22, user: 'deploy' }, 1_000);
+      assert.equal(testBinding.testWaitForMasterStarted(1_000), true);
+      operation.cancel();
+      await assert.rejects(operation.promise, /Windows connection validation is unavailable/u);
+      assert.throws(() => testBinding.disposeKnownHostsSnapshot(snapshot.capability), /Windows secure storage is unavailable/u);
+      const reaped = testBinding.testDeferredReaperCompletion();
+      testBinding.testReleaseDeferredReaper();
+      await reaped;
+      assert.equal(testBinding.testSnapshotArtifactCount(), 0);
+      assert.throws(() => testBinding.disposeKnownHostsSnapshot(snapshot.capability), /Windows secure storage is unavailable/u);
+    } finally {
+      if (configured) {
+        try {
+          testBinding.testReleaseDeferredReaper();
+        } catch {
+          // The gate may already be released.
+        }
+        runFixture('cleanup', root);
+      }
     }
   });
 
