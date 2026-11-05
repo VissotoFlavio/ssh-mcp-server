@@ -485,7 +485,7 @@ class PrivateSecurityAttributes final {
 
   bool valid() const { return valid_; }
   SECURITY_ATTRIBUTES* get() { return &attributes_; }
-  PSECURITY_DESCRIPTOR descriptor() const { return valid_ ? const_cast<PSECURITY_DESCRIPTOR>(&descriptor_) : nullptr; }
+  PSECURITY_DESCRIPTOR descriptor() { return valid_ ? &descriptor_ : nullptr; }
 
  private:
   SECURITY_DESCRIPTOR descriptor_{};
@@ -542,7 +542,7 @@ NativeCreateFile GetNativeCreateFile() {
   return create;
 }
 
-bool CreatePrivateRelative(HANDLE root, const std::wstring& leaf, const PrivateSecurityAttributes& security, bool directory, SnapshotFailure failure, Handle* result) {
+bool CreatePrivateRelative(HANDLE root, const std::wstring& leaf, PrivateSecurityAttributes& security, bool directory, SnapshotFailure failure, Handle* result) {
   if (root == INVALID_HANDLE_VALUE || leaf.empty() || leaf.size() > USHRT_MAX / sizeof(wchar_t) || leaf.find_first_of(L"\\/") != std::wstring::npos) return false;
   if (ConsumeSnapshotFailure(failure)) return false;
   NativeCreateFile create = GetNativeCreateFile();
