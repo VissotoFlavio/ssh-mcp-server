@@ -173,6 +173,16 @@ no credential. Passwords remain in memory and never enter arguments,
 environment variables, files, logs, diagnostics, audit events, or MCP
 responses.
 
+Windows Credential Manager secrets are generic credentials whose target name
+is fixed to `Vissoto/ssh-mcp-server/<opaque-locator>`. The native boundary
+accepts only the locator of an approved `os://ssh/<opaque-locator>` reference;
+it does not accept target names, shell commands, paths, or profile fields as
+credential input. The `ssh2` 1.17.0 in-process client is the approved alpha
+transport: its host verifier checks the approved SHA-256 fingerprint before
+its authentication callback retrieves the password. It launches no child
+process and does not request a shell, command, environment, or forwarding
+channel.
+
 ## Required verification matrix
 
 The Windows implementation must include deterministic tests for:

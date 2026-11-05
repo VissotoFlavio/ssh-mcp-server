@@ -6,9 +6,11 @@
 #include <softpub.h>
 #include <mscat.h>
 #include <wincrypt.h>
+#include <wincred.h>
 #include <wintrust.h>
 
 #include <string>
+#include <algorithm>
 #include <cstring>
 #include <vector>
 
@@ -17,6 +19,7 @@ namespace {
 constexpr wchar_t kConfigurationKey[] = L"Software\\Vissoto\\ssh-mcp-server";
 constexpr wchar_t kStateFile[] = L"connection-profiles.json";
 constexpr DWORD kMaxFileBytes = 1024 * 1024;
+constexpr wchar_t kCredentialTargetPrefix[] = L"Vissoto/ssh-mcp-server/";
 
 class Handle final {
  public:
@@ -411,6 +414,19 @@ bool ReadArgumentString(napi_env env, napi_callback_info info, std::string* valu
   return true;
 }
 
+bool ReadCredentialLocator(napi_env env, napi_callback_info info, std::string* value) {
+  size_t count = 1;
+  napi_value argument{};
+  if (napi_get_cb_info(env, info, &count, &argument, nullptr, nullptr) != napi_ok || count != 1) return false;
+  size_t bytes = 0;
+  if (napi_get_value_string_utf8(env, argument, nullptr, 0, &bytes) != napi_ok || bytes == 0 || bytes > 128) return false;
+  std::vector<char> buffer(bytes + 1);
+  if (napi_get_value_string_utf8(env, argument, buffer.data(), buffer.size(), &bytes) != napi_ok || buffer[0] < 'a' || buffer[0] > 'z') return false;
+  value->assign(buffer.data(), bytes);
+  for (char ch : *value) if (!(ch == '-' || ch == '.' || ch == '_' || ch == ':' || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9'))) return false;
+  return true;
+}
+
 napi_value ToBuffer(napi_env env, const std::vector<BYTE>& data) {
   void* target = nullptr;
   napi_value result{};
@@ -453,6 +469,24 @@ napi_value ResolveOpenSsh(napi_env env, napi_callback_info info) {
   return result;
 }
 
+napi_value ReadCredential(napi_env env, napi_callback_info info) {
+  std::string locator;
+  if (!ReadCredentialLocator(env, info, &locator)) return Unavailable(env);
+  std::wstring target = kCredentialTargetPrefix + std::wstring(locator.begin(), locator.end());
+  PCREDENTIALW credential = nullptr;
+  if (!CredReadW(target.c_str(), CRED_TYPE_GENERIC, 0, &credential) || credential == nullptr || credential->CredentialBlobSize == 0 || credential->CredentialBlobSize > 4096 || (credential->CredentialBlobSize % sizeof(wchar_t)) != 0) {
+    if (credential != nullptr) CredFree(credential);
+    return Unavailable(env);
+  }
+  std::wstring password(reinterpret_cast<wchar_t*>(credential->CredentialBlob), credential->CredentialBlobSize / sizeof(wchar_t));
+  CredFree(credential);
+  if (password.empty() || password.find(L'\0') != std::wstring::npos) return Unavailable(env);
+  napi_value result{};
+  const napi_status status = napi_create_string_utf16(env, reinterpret_cast<const char16_t*>(password.data()), password.size(), &result);
+  std::fill(password.begin(), password.end(), L'\0');
+  return status == napi_ok ? result : Unavailable(env);
+}
+
 }  // namespace
 
 NAPI_MODULE_INIT() {
@@ -460,6 +494,7 @@ NAPI_MODULE_INIT() {
     {"readProfileState", nullptr, ReadProfileState, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"readKnownHosts", nullptr, ReadKnownHosts, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"resolveOpenSsh", nullptr, ResolveOpenSsh, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"readCredential", nullptr, ReadCredential, nullptr, nullptr, nullptr, napi_default, nullptr},
   };
   if (napi_define_properties(env, exports, sizeof(properties) / sizeof(properties[0]), properties) != napi_ok) return nullptr;
   return exports;
