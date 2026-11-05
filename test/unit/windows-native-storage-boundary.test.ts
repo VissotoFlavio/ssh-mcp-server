@@ -67,6 +67,8 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
   const binding = nativeRequire(addonPath) as {
     readProfileState(): Buffer;
     readKnownHosts(profileId: string): Buffer;
+    captureKnownHostsSnapshot(profileId: string): { bytes: Buffer; capability: object };
+    disposeKnownHostsSnapshot(capability: unknown): void;
     readCredential(locator: unknown): string;
     resolveOpenSsh(): { ssh: string; sshAdd: string; version: string };
     probeSshAdd(timeoutMs: unknown): number;
@@ -111,6 +113,28 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
       assert.match(ssh.sshAdd, /\\System32\\OpenSSH\\ssh-add\.exe$/iu);
       assert.match(ssh.version, /^9\.(?:[5-9]|[1-9][0-9]+)\.[0-9]+\.[0-9]+$/u);
       assert.equal(typeof binding.probeSshAdd, 'function');
+    } finally {
+      if (configured) runFixture('cleanup', root);
+    }
+  });
+
+  test('captures verified known-hosts bytes in an opaque one-use native snapshot capability', () => {
+    const root = uniqueRoot('snapshot');
+    let configured = false;
+    try {
+      runFixture('safe', root);
+      configured = true;
+      const expected = binding.readKnownHosts('production-api');
+      const snapshot = binding.captureKnownHostsSnapshot('production-api');
+      assert.equal(Buffer.isBuffer(snapshot.bytes), true);
+      assert.deepEqual(snapshot.bytes, expected);
+      assert.deepEqual(Object.keys(snapshot).sort(), ['bytes', 'capability']);
+      assert.deepEqual(Object.getOwnPropertyNames(snapshot.capability), []);
+      assert.equal(JSON.stringify(snapshot.capability).includes(root), false);
+      assert.throws(() => binding.disposeKnownHostsSnapshot({}), /Windows secure storage is unavailable/u);
+      assert.throws(() => binding.disposeKnownHostsSnapshot(Object.create(snapshot.capability)), /Windows secure storage is unavailable/u);
+      assert.doesNotThrow(() => binding.disposeKnownHostsSnapshot(snapshot.capability));
+      assert.throws(() => binding.disposeKnownHostsSnapshot(snapshot.capability), /Windows secure storage is unavailable/u);
     } finally {
       if (configured) runFixture('cleanup', root);
     }

@@ -13,7 +13,9 @@
 #include <string>
 #include <array>
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <vector>
 
 namespace {
@@ -56,6 +58,10 @@ class Handle final {
     return *this;
   }
   HANDLE get() const { return value_; }
+  void reset(HANDLE value = INVALID_HANDLE_VALUE) {
+    if (value_ != INVALID_HANDLE_VALUE) CloseHandle(value_);
+    value_ = value;
+  }
  private:
   HANDLE value_;
 };
@@ -462,6 +468,144 @@ bool ReadProtectedFile(const std::wstring& root, const std::wstring& leaf, PSID 
   return true;
 }
 
+class PrivateSecurityAttributes final {
+ public:
+  explicit PrivateSecurityAttributes(PSID operator_sid) {
+    if (operator_sid != nullptr) acl_.resize(sizeof(ACL) + sizeof(ACCESS_ALLOWED_ACE) - sizeof(DWORD) + GetLengthSid(operator_sid));
+    valid_ = operator_sid != nullptr && InitializeAcl(reinterpret_cast<PACL>(acl_.data()), static_cast<DWORD>(acl_.size()), ACL_REVISION) && AddAccessAllowedAceEx(reinterpret_cast<PACL>(acl_.data()), ACL_REVISION, OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE, FILE_ALL_ACCESS, operator_sid) && InitializeSecurityDescriptor(&descriptor_, SECURITY_DESCRIPTOR_REVISION) && SetSecurityDescriptorOwner(&descriptor_, operator_sid, FALSE) && SetSecurityDescriptorDacl(&descriptor_, TRUE, reinterpret_cast<PACL>(acl_.data()), FALSE) && SetSecurityDescriptorControl(&descriptor_, SE_DACL_PROTECTED, SE_DACL_PROTECTED);
+    attributes_.nLength = sizeof(attributes_);
+    attributes_.lpSecurityDescriptor = valid_ ? &descriptor_ : nullptr;
+    attributes_.bInheritHandle = FALSE;
+  }
+
+  bool valid() const { return valid_; }
+  SECURITY_ATTRIBUTES* get() { return &attributes_; }
+
+ private:
+  SECURITY_DESCRIPTOR descriptor_{};
+  std::vector<BYTE> acl_;
+  SECURITY_ATTRIBUTES attributes_{};
+  bool valid_ = false;
+};
+
+bool ReadIdentity(HANDLE handle, FILE_ID_INFO* identity) {
+  return GetFileInformationByHandleEx(handle, FileIdInfo, identity, sizeof(*identity)) != 0;
+}
+
+bool HasIdentity(HANDLE handle, const FILE_ID_INFO& expected) {
+  FILE_ID_INFO current{};
+  return ReadIdentity(handle, &current) && current.VolumeSerialNumber == expected.VolumeSerialNumber && memcmp(current.FileId.Identifier, expected.FileId.Identifier, sizeof(current.FileId.Identifier)) == 0;
+}
+
+#ifdef SSH_MCP_NATIVE_TEST
+constexpr napi_type_tag kSnapshotCapabilityTypeTag{0x13a5c33f91d1b7e4ULL, 0x7e4bd2191c098aa3ULL};
+#else
+constexpr napi_type_tag kSnapshotCapabilityTypeTag{0xb1c7a8d93ef01642ULL, 0x2e6f4175ca903bd8ULL};
+#endif
+
+class SnapshotSession final {
+ public:
+  explicit SnapshotSession(PSID operator_sid) : operator_sid_(operator_sid, operator_sid + GetLengthSid(operator_sid)), capability_tag_(&kSnapshotCapabilityTypeTag) {}
+  ~SnapshotSession() { if (!disposed_) Dispose(); }
+  SnapshotSession(const SnapshotSession&) = delete;
+  SnapshotSession& operator=(const SnapshotSession&) = delete;
+
+  bool Adopt(Handle parent, Handle directory, Handle file) {
+    parent_ = std::move(parent);
+    directory_ = std::move(directory);
+    file_ = std::move(file);
+    return ReadIdentity(parent_.get(), &parent_identity_) && ReadIdentity(directory_.get(), &directory_identity_) && ReadIdentity(file_.get(), &file_identity_);
+  }
+
+  bool Write(const std::vector<BYTE>& data) {
+    DWORD bytes_written = 0;
+    return WriteFile(file_.get(), data.data(), static_cast<DWORD>(data.size()), &bytes_written, nullptr) && bytes_written == data.size() && FlushFileBuffers(file_.get());
+  }
+
+  bool IsValidCapability() const { return !disposed_ && capability_tag_ == &kSnapshotCapabilityTypeTag; }
+
+  bool Dispose() {
+    if (disposed_) return false;
+    disposed_ = true;
+    const bool trusted = parent_.get() != INVALID_HANDLE_VALUE && directory_.get() != INVALID_HANDLE_VALUE && file_.get() != INVALID_HANDLE_VALUE && HasIdentity(parent_.get(), parent_identity_) && HasIdentity(directory_.get(), directory_identity_) && HasIdentity(file_.get(), file_identity_) && VerifyFile(parent_.get(), operator_sid_.data(), true) && VerifyFile(directory_.get(), operator_sid_.data(), true) && VerifyFile(file_.get(), operator_sid_.data(), false);
+    if (!trusted) {
+      file_.reset();
+      directory_.reset();
+      parent_.reset();
+      return false;
+    }
+    FILE_DISPOSITION_INFO delete_info{};
+    delete_info.DeleteFile = TRUE;
+    if (!SetFileInformationByHandle(file_.get(), FileDispositionInfo, &delete_info, sizeof(delete_info))) {
+      file_.reset();
+      directory_.reset();
+      parent_.reset();
+      return false;
+    }
+    file_.reset();
+    if (!HasIdentity(parent_.get(), parent_identity_) || !HasIdentity(directory_.get(), directory_identity_) || !VerifyFile(parent_.get(), operator_sid_.data(), true) || !VerifyFile(directory_.get(), operator_sid_.data(), true) || !SetFileInformationByHandle(directory_.get(), FileDispositionInfo, &delete_info, sizeof(delete_info))) {
+      directory_.reset();
+      parent_.reset();
+      return false;
+    }
+    directory_.reset();
+    parent_.reset();
+    return true;
+  }
+
+ private:
+  std::vector<BYTE> operator_sid_;
+  const void* capability_tag_;
+  Handle parent_;
+  Handle directory_;
+  Handle file_;
+  FILE_ID_INFO parent_identity_{};
+  FILE_ID_INFO directory_identity_{};
+  FILE_ID_INFO file_identity_{};
+  bool disposed_ = false;
+};
+
+LONG g_snapshot_counter = 0;
+
+bool CreateKnownHostsSnapshot(const std::wstring& state_root, PSID operator_sid, const std::vector<BYTE>& data, std::unique_ptr<SnapshotSession>* snapshot) {
+  if (data.empty() || data.size() > kMaxFileBytes || !VerifyDirectoryChain(state_root, operator_sid)) return false;
+  Handle parent(CreateFileW(state_root.c_str(), FILE_READ_ATTRIBUTES | READ_CONTROL, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+  if (parent.get() == INVALID_HANDLE_VALUE || !VerifyFile(parent.get(), operator_sid, true)) return false;
+  PrivateSecurityAttributes security(operator_sid);
+  if (!security.valid()) return false;
+  for (DWORD attempt = 0; attempt != 16; ++attempt) {
+    unsigned int random_value = 0;
+    if (rand_s(&random_value) != 0) return false;
+    const std::wstring name = L".ssh-mcp-snapshot-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()) + L"-" + std::to_wstring(InterlockedIncrement(&g_snapshot_counter)) + L"-" + std::to_wstring(random_value);
+    if (state_root.size() + 1 + name.size() >= 32767) return false;
+    const std::wstring directory_path = state_root + L"\\" + name;
+    if (CreateDirectoryW(directory_path.c_str(), security.get()) == 0) {
+      if (GetLastError() == ERROR_ALREADY_EXISTS) continue;
+      return false;
+    }
+    Handle directory(CreateFileW(directory_path.c_str(), FILE_READ_ATTRIBUTES | READ_CONTROL | DELETE, 0, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+    if (directory.get() == INVALID_HANDLE_VALUE || !VerifyFile(directory.get(), operator_sid, true)) return false;
+    const std::wstring file_path = directory_path + L"\\known_hosts";
+    Handle file(CreateFileW(file_path.c_str(), GENERIC_READ | GENERIC_WRITE | FILE_READ_ATTRIBUTES | READ_CONTROL | DELETE, 0, security.get(), CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (file.get() == INVALID_HANDLE_VALUE || !VerifyFile(file.get(), operator_sid, false)) {
+      FILE_DISPOSITION_INFO delete_info{};
+      delete_info.DeleteFile = TRUE;
+      SetFileInformationByHandle(directory.get(), FileDispositionInfo, &delete_info, sizeof(delete_info));
+      return false;
+    }
+    std::unique_ptr<SnapshotSession> candidate(new SnapshotSession(operator_sid));
+    if (!candidate->Adopt(std::move(parent), std::move(directory), std::move(file))) return false;
+    if (!candidate->Write(data)) return false;
+    *snapshot = std::move(candidate);
+    return true;
+  }
+  return false;
+}
+
+void FinalizeSnapshotCapability(napi_env, void* data, void*) {
+  delete static_cast<SnapshotSession*>(data);
+}
+
 enum class LaunchResult { kCompleted, kTimedOut, kFailed };
 
 LaunchResult LaunchHiddenProcess(const std::wstring& application, std::wstring command, DWORD timeout, DWORD* exit_code) {
@@ -557,6 +701,56 @@ napi_value ReadKnownHosts(napi_env env, napi_callback_info info) {
   leaf += L".known_hosts";
   if (!ReadProtectedFile(known_hosts_root, leaf, operator_sid.data(), &data)) return Unavailable(env);
   return ToBuffer(env, data);
+}
+
+napi_value CaptureKnownHostsSnapshot(napi_env env, napi_callback_info info) {
+  std::string profile_id;
+  std::wstring state_root;
+  std::wstring known_hosts_root;
+  std::vector<BYTE> operator_sid;
+  std::vector<BYTE> data;
+  std::unique_ptr<SnapshotSession> snapshot;
+  if (!ReadArgumentString(env, info, &profile_id) || !LoadConfiguration(&state_root, &known_hosts_root, &operator_sid)) return Unavailable(env);
+  std::wstring leaf(profile_id.begin(), profile_id.end());
+  leaf += L".known_hosts";
+  if (!ReadProtectedFile(known_hosts_root, leaf, operator_sid.data(), &data) || !CreateKnownHostsSnapshot(state_root, operator_sid.data(), data, &snapshot)) return Unavailable(env);
+
+  napi_value result{};
+  napi_value bytes{};
+  napi_value capability{};
+  void* bytes_copy = nullptr;
+  if (napi_create_object(env, &result) != napi_ok || napi_create_buffer_copy(env, data.size(), data.data(), &bytes_copy, &bytes) != napi_ok || napi_create_object(env, &capability) != napi_ok) return Unavailable(env);
+  SnapshotSession* raw_snapshot = snapshot.release();
+  if (napi_wrap(env, capability, raw_snapshot, FinalizeSnapshotCapability, nullptr, nullptr) != napi_ok) {
+    delete raw_snapshot;
+    return Unavailable(env);
+  }
+  if (napi_type_tag_object(env, capability, &kSnapshotCapabilityTypeTag) != napi_ok) {
+    void* unwrapped = nullptr;
+    if (napi_remove_wrap(env, capability, &unwrapped) == napi_ok && unwrapped == raw_snapshot) delete raw_snapshot;
+    else raw_snapshot->Dispose();
+    return Unavailable(env);
+  }
+  if (napi_set_named_property(env, result, "bytes", bytes) != napi_ok || napi_set_named_property(env, result, "capability", capability) != napi_ok) {
+    raw_snapshot->Dispose();
+    return Unavailable(env);
+  }
+  return result;
+}
+
+bool ReadSnapshotCapability(napi_env env, napi_callback_info info, SnapshotSession** snapshot) {
+  size_t count = 1;
+  napi_value capability{};
+  bool tagged = false;
+  void* raw_snapshot = nullptr;
+  return napi_get_cb_info(env, info, &count, &capability, nullptr, nullptr) == napi_ok && count == 1 && napi_check_object_type_tag(env, capability, &kSnapshotCapabilityTypeTag, &tagged) == napi_ok && tagged && napi_unwrap(env, capability, &raw_snapshot) == napi_ok && raw_snapshot != nullptr && ((*snapshot = static_cast<SnapshotSession*>(raw_snapshot))->IsValidCapability());
+}
+
+napi_value DisposeKnownHostsSnapshot(napi_env env, napi_callback_info info) {
+  SnapshotSession* snapshot = nullptr;
+  if (!ReadSnapshotCapability(env, info, &snapshot) || !snapshot->Dispose()) return Unavailable(env);
+  napi_value result{};
+  return napi_get_undefined(env, &result) == napi_ok ? result : Unavailable(env);
 }
 
 napi_value ResolveOpenSsh(napi_env env, napi_callback_info info) {
@@ -805,6 +999,8 @@ NAPI_MODULE_INIT() {
   napi_property_descriptor properties[] = {
     {"readProfileState", nullptr, ReadProfileState, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"readKnownHosts", nullptr, ReadKnownHosts, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"captureKnownHostsSnapshot", nullptr, CaptureKnownHostsSnapshot, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"disposeKnownHostsSnapshot", nullptr, DisposeKnownHostsSnapshot, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"resolveOpenSsh", nullptr, ResolveOpenSsh, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"probeSshAdd", nullptr, ProbeSshAdd, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"readCredential", nullptr, ReadCredential, nullptr, nullptr, nullptr, napi_default, nullptr},
