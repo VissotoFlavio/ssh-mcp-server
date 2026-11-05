@@ -34,6 +34,7 @@ std::wstring g_test_replacement_root;
 std::wstring g_test_replacement_leaf;
 bool g_test_replacement_is_root = false;
 bool g_test_openssh_replacement_attempted = false;
+bool g_test_openssh_replacement_move_attempted = false;
 bool g_test_openssh_replacement_succeeded = false;
 bool g_test_openssh_force_unexpected_replacement_error = false;
 DWORD g_test_openssh_replacement_error = ERROR_SUCCESS;
@@ -627,9 +628,11 @@ napi_value ReplacementRaceResult(napi_env env, bool hook_executed, DWORD replace
 bool ReplaceProtectedFileForTest() {
   if (g_test_replacement_is_root) {
     const std::wstring path = g_test_replacement_root + L"\\" + g_test_replacement_leaf;
+    const std::wstring original_replacement_file = path + L".replacement";
     const std::wstring replacement_root = g_test_replacement_root + L".replacement";
     const std::wstring replacement_file = replacement_root + L"\\" + g_test_replacement_leaf;
     if (DeleteFileW(path.c_str()) == 0) { g_test_protected_file_replacement_error = GetLastError(); return false; }
+    if (DeleteFileW(original_replacement_file.c_str()) == 0) { g_test_protected_file_replacement_error = GetLastError(); return false; }
     if (RemoveDirectoryW(g_test_replacement_root.c_str()) == 0) { g_test_protected_file_replacement_error = GetLastError(); return false; }
     if (CreateDirectoryW(g_test_replacement_root.c_str(), nullptr) == 0) { g_test_protected_file_replacement_error = GetLastError(); return false; }
     PSECURITY_DESCRIPTOR descriptor = nullptr;
@@ -712,6 +715,7 @@ napi_value TestTrustedOpenSsh(napi_env env, napi_callback_info info) {
 
 bool ReplaceOpenSshBeforeLaunch(const std::wstring& ssh_add) {
   g_test_openssh_replacement_attempted = true;
+  g_test_openssh_replacement_move_attempted = false;
   g_test_openssh_replacement_succeeded = false;
   g_test_openssh_replacement_error = ERROR_SUCCESS;
   if (g_test_openssh_force_unexpected_replacement_error) {
@@ -719,10 +723,13 @@ bool ReplaceOpenSshBeforeLaunch(const std::wstring& ssh_add) {
     SetLastError(g_test_openssh_replacement_error);
     return false;
   }
+  g_test_openssh_replacement_move_attempted = true;
   g_test_openssh_replacement_succeeded = MoveFileExW(ssh_add.c_str(), (ssh_add + L".fixture-replacement").c_str(), MOVEFILE_WRITE_THROUGH) != 0;
   if (g_test_openssh_replacement_succeeded) return false;
   g_test_openssh_replacement_error = GetLastError();
-  return g_test_openssh_replacement_error == ERROR_SHARING_VIOLATION;
+  // A trusted system object's DACL may reject mutation before its retained
+  // handle reports a sharing violation; both are fail-closed protections.
+  return g_test_openssh_replacement_error == ERROR_ACCESS_DENIED || g_test_openssh_replacement_error == ERROR_SHARING_VIOLATION;
 }
 
 template <bool ForceUnexpectedReplacementError>
@@ -730,6 +737,7 @@ napi_value TestOpenSshIdentityBeforeLaunch(napi_env env, napi_callback_info info
   size_t count = 0;
   if (napi_get_cb_info(env, info, &count, nullptr, nullptr, nullptr) != napi_ok || count != 0) return Unavailable(env);
   g_test_openssh_replacement_attempted = false;
+  g_test_openssh_replacement_move_attempted = false;
   g_test_openssh_replacement_succeeded = false;
   g_test_openssh_force_unexpected_replacement_error = ForceUnexpectedReplacementError;
   g_test_openssh_replacement_error = ERROR_SUCCESS;
@@ -740,9 +748,11 @@ napi_value TestOpenSshIdentityBeforeLaunch(napi_env env, napi_callback_info info
   g_test_openssh_force_unexpected_replacement_error = false;
   napi_value result{};
   napi_value replacement_blocked{};
+  napi_value move_attempted{};
   napi_value replacement_error{};
   napi_value launch_completed{};
-  if (napi_create_object(env, &result) != napi_ok || napi_get_boolean(env, g_test_openssh_replacement_attempted && !g_test_openssh_replacement_succeeded && g_test_openssh_replacement_error == ERROR_SHARING_VIOLATION, &replacement_blocked) != napi_ok || napi_create_uint32(env, g_test_openssh_replacement_error, &replacement_error) != napi_ok || napi_get_boolean(env, launch == LaunchResult::kCompleted, &launch_completed) != napi_ok || napi_set_named_property(env, result, "replacementBlocked", replacement_blocked) != napi_ok || napi_set_named_property(env, result, "replacementError", replacement_error) != napi_ok || napi_set_named_property(env, result, "launchCompleted", launch_completed) != napi_ok) return Unavailable(env);
+  const bool protected_replacement = g_test_openssh_replacement_attempted && g_test_openssh_replacement_move_attempted && !g_test_openssh_replacement_succeeded && (g_test_openssh_replacement_error == ERROR_ACCESS_DENIED || g_test_openssh_replacement_error == ERROR_SHARING_VIOLATION);
+  if (napi_create_object(env, &result) != napi_ok || napi_get_boolean(env, protected_replacement, &replacement_blocked) != napi_ok || napi_get_boolean(env, g_test_openssh_replacement_move_attempted, &move_attempted) != napi_ok || napi_create_uint32(env, g_test_openssh_replacement_error, &replacement_error) != napi_ok || napi_get_boolean(env, launch == LaunchResult::kCompleted, &launch_completed) != napi_ok || napi_set_named_property(env, result, "replacementBlocked", replacement_blocked) != napi_ok || napi_set_named_property(env, result, "moveAttempted", move_attempted) != napi_ok || napi_set_named_property(env, result, "replacementError", replacement_error) != napi_ok || napi_set_named_property(env, result, "launchCompleted", launch_completed) != napi_ok) return Unavailable(env);
   return result;
 }
 

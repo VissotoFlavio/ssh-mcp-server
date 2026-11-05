@@ -81,8 +81,13 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
     testReadStateFile(root: string): boolean;
     testSystemOwnerMismatch(): boolean;
     testTrustedOpenSsh(system: string): boolean;
-    testOpenSshIdentityBeforeLaunch(): { replacementBlocked: boolean; replacementError: number; launchCompleted: boolean };
-    testOpenSshUnexpectedPreLaunchError(): { replacementBlocked: boolean; replacementError: number; launchCompleted: boolean };
+    testOpenSshIdentityBeforeLaunch(): { replacementBlocked: boolean; moveAttempted: boolean; replacementError: number; launchCompleted: boolean };
+    testOpenSshUnexpectedPreLaunchError(): {
+      replacementBlocked: boolean;
+      moveAttempted: boolean;
+      replacementError: number;
+      launchCompleted: boolean;
+    };
     testLaunch(mode: 'exit' | 'hang', timeoutMs: number): { completed: boolean; timedOut: boolean; exitCode: number };
   };
 
@@ -157,16 +162,17 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
   }
 
   test('blocks OpenSSH identity replacement immediately before the production launch chain', () => {
-    assert.deepEqual(testBinding.testOpenSshIdentityBeforeLaunch(), {
-      replacementBlocked: true,
-      replacementError: 32,
-      launchCompleted: true,
-    });
+    const result = testBinding.testOpenSshIdentityBeforeLaunch();
+    assert.equal(result.replacementBlocked, true);
+    assert.equal(result.moveAttempted, true);
+    assert.equal([5, 32].includes(result.replacementError), true);
+    assert.equal(result.launchCompleted, true);
   });
 
   test('fails closed before launch when the OpenSSH replacement attempt has an unexpected error', () => {
     assert.deepEqual(testBinding.testOpenSshUnexpectedPreLaunchError(), {
       replacementBlocked: false,
+      moveAttempted: false,
       replacementError: 5,
       launchCompleted: false,
     });
