@@ -15,6 +15,7 @@
 #include <array>
 #include <algorithm>
 #include <climits>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -412,7 +413,7 @@ bool IsExpectedOpenSshExecutable(const std::wstring& path) {
   return _wcsicmp(path.c_str(), (directory + L"\\ssh.exe").c_str()) == 0 || _wcsicmp(path.c_str(), (directory + L"\\ssh-add.exe").c_str()) == 0;
 }
 
-bool TrustedOpenSsh(std::wstring* ssh, std::wstring* ssh_add, std::array<DWORD, 4>* version, Handle* retained_system = nullptr, Handle* retained_directory = nullptr, Handle* retained_ssh_add = nullptr) {
+bool TrustedOpenSsh(std::wstring* ssh, std::wstring* ssh_add, std::array<DWORD, 4>* version, Handle* retained_system = nullptr, Handle* retained_directory = nullptr, Handle* retained_ssh_add = nullptr, Handle* retained_ssh = nullptr) {
   std::wstring system;
   if (!SystemDirectory(&system)) return false;
   const std::wstring directory = system + L"\\OpenSSH";
@@ -427,6 +428,7 @@ bool TrustedOpenSsh(std::wstring* ssh, std::wstring* ssh_add, std::array<DWORD, 
     if (retained_system != nullptr) *retained_system = std::move(system_handle);
     if (retained_directory != nullptr) *retained_directory = std::move(openssh_handle);
     if (retained_ssh_add != nullptr) *retained_ssh_add = std::move(ssh_add_handle);
+    if (retained_ssh != nullptr) *retained_ssh = std::move(ssh_handle);
   }
   return trusted;
 }
@@ -554,7 +556,9 @@ bool CreatePrivateRelative(HANDLE root, const std::wstring& leaf, const PrivateS
   HANDLE raw = INVALID_HANDLE_VALUE;
   const ACCESS_MASK access = directory ? FILE_READ_ATTRIBUTES | READ_CONTROL | DELETE | SYNCHRONIZE : GENERIC_READ | GENERIC_WRITE | FILE_READ_ATTRIBUTES | READ_CONTROL | DELETE | SYNCHRONIZE;
   const ULONG options = (directory ? FILE_DIRECTORY_FILE : FILE_NON_DIRECTORY_FILE) | FILE_SYNCHRONOUS_IO_NONALERT;
-  if (create(&raw, access, &attributes, &status, nullptr, FILE_ATTRIBUTE_NORMAL, 0, FILE_CREATE, options, nullptr, 0) < 0 || raw == INVALID_HANDLE_VALUE) return false;
+  // Retain read-only sharing: OpenSSH can read the snapshot, while write,
+  // delete, and replacement opens remain blocked until disposal.
+  if (create(&raw, access, &attributes, &status, nullptr, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_CREATE, options, nullptr, 0) < 0 || raw == INVALID_HANDLE_VALUE) return false;
   *result = Handle(raw);
   return true;
 }
@@ -607,6 +611,23 @@ class SnapshotSession final {
   HANDLE directory_handle() const { return directory_.get(); }
   bool IsReady() const { return parent_identity_known_ && directory_identity_known_ && file_identity_known_ && parent_.get() != INVALID_HANDLE_VALUE && directory_.get() != INVALID_HANDLE_VALUE && file_.get() != INVALID_HANDLE_VALUE; }
   bool IsValidCapability() const { return !disposed_ && parent_.get() != INVALID_HANDLE_VALUE && directory_.get() != INVALID_HANDLE_VALUE && capability_tag_ == &kSnapshotCapabilityTypeTag; }
+
+  bool ReadyKnownHostsPath(std::wstring* path, std::wstring* directory) const {
+    if (!IsValidCapability() || !parent_identity_known_ || !directory_identity_known_ || !file_identity_known_ ||
+        !HasIdentity(parent_.get(), parent_identity_) || !HasIdentity(directory_.get(), directory_identity_) ||
+        !HasIdentity(file_.get(), file_identity_) || !VerifyFile(parent_.get(), operator_sid_.data(), true) ||
+        !VerifyFile(directory_.get(), operator_sid_.data(), true) || !VerifyFile(file_.get(), operator_sid_.data(), false))
+      return false;
+    std::wstring final_directory;
+    std::wstring final_file;
+    if (!FinalPath(directory_.get(), &final_directory) || !FinalPath(file_.get(), &final_file)) return false;
+    final_directory = StripExtendedPrefix(final_directory);
+    final_file = StripExtendedPrefix(final_file);
+    if (_wcsicmp(final_file.c_str(), (final_directory + L"\\known_hosts").c_str()) != 0) return false;
+    *directory = std::move(final_directory);
+    *path = std::move(final_file);
+    return true;
+  }
 
   bool Dispose() {
     if (disposed_) return false;
@@ -747,6 +768,151 @@ LaunchResult ProbeTrustedOpenSsh(DWORD timeout, DWORD* exit_code) {
   return LaunchHiddenProcess(ssh_add, std::move(command), timeout, exit_code);
 }
 
+bool StartHiddenProcess(const std::wstring& application, std::wstring command, Handle* process_handle) {
+  SECURITY_ATTRIBUTES inheritable{};
+  inheritable.nLength = sizeof(inheritable);
+  inheritable.bInheritHandle = TRUE;
+  Handle nul(CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &inheritable, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+  if (nul.get() == INVALID_HANDLE_VALUE) return false;
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  startup.dwFlags = STARTF_USESTDHANDLES;
+  startup.hStdInput = nul.get();
+  startup.hStdOutput = nul.get();
+  startup.hStdError = nul.get();
+  PROCESS_INFORMATION process{};
+  if (!CreateProcessW(application.c_str(), command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) return false;
+  CloseHandle(process.hThread);
+  *process_handle = Handle(process.hProcess);
+  return true;
+}
+
+void AppendQuotedArgument(std::wstring* command, const std::wstring& argument) {
+  command->push_back(L' ');
+  command->push_back(L'"');
+  size_t slashes = 0;
+  for (wchar_t character : argument) {
+    if (character == L'\\') {
+      ++slashes;
+      continue;
+    }
+    if (character == L'"') command->append(slashes * 2 + 1, L'\\');
+    else command->append(slashes, L'\\');
+    slashes = 0;
+    command->push_back(character);
+  }
+  command->append(slashes * 2, L'\\');
+  command->push_back(L'"');
+}
+
+std::wstring FixedCommandLine(const std::wstring& application, const std::vector<std::wstring>& arguments) {
+  std::wstring command;
+  AppendQuotedArgument(&command, application);
+  for (const auto& argument : arguments) AppendQuotedArgument(&command, argument);
+  return command;
+}
+
+bool IsSafeReadinessHost(const std::wstring& host) {
+  if (host.empty() || host.size() > 253 || host.front() == L'-' || host.back() == L'.') return false;
+  for (wchar_t character : host) {
+    if (!((character >= L'a' && character <= L'z') || (character >= L'A' && character <= L'Z') || (character >= L'0' && character <= L'9') || character == L'.' || character == L'-' || character == L':' || character == L'%')) return false;
+  }
+  return true;
+}
+
+bool IsSafeReadinessUser(const std::wstring& user) {
+  if (user.empty() || user.size() > 64 || user.front() == L'-') return false;
+  for (wchar_t character : user) {
+    if (!((character >= L'a' && character <= L'z') || (character >= L'A' && character <= L'Z') || (character >= L'0' && character <= L'9') || character == L'.' || character == L'_' || character == L'-')) return false;
+  }
+  return true;
+}
+
+bool ReadUtf16Property(napi_env env, napi_value object, const char* name, std::wstring* value) {
+  napi_value property{};
+  size_t length = 0;
+  if (napi_get_named_property(env, object, name, &property) != napi_ok || napi_get_value_string_utf16(env, property, nullptr, 0, &length) != napi_ok || length == 0 || length > 253) return false;
+  std::vector<char16_t> buffer(length + 1);
+  if (napi_get_value_string_utf16(env, property, buffer.data(), buffer.size(), &length) != napi_ok) return false;
+  value->assign(reinterpret_cast<const wchar_t*>(buffer.data()), length);
+  return value->find(L'\0') == std::wstring::npos;
+}
+
+bool ReadReadinessDescriptor(napi_env env, napi_value descriptor, std::wstring* host, DWORD* port, std::wstring* user) {
+  napi_valuetype type{};
+  napi_value names{};
+  uint32_t length = 0;
+  if (napi_typeof(env, descriptor, &type) != napi_ok || type != napi_object || napi_get_property_names(env, descriptor, &names) != napi_ok || napi_get_array_length(env, names, &length) != napi_ok || length != 3) return false;
+  bool has_host = false;
+  bool has_port = false;
+  bool has_user = false;
+  for (uint32_t index = 0; index < length; ++index) {
+    napi_value name{};
+    size_t name_length = 0;
+    if (napi_get_element(env, names, index, &name) != napi_ok || napi_get_value_string_utf8(env, name, nullptr, 0, &name_length) != napi_ok) return false;
+    std::vector<char> key(name_length + 1);
+    if (napi_get_value_string_utf8(env, name, key.data(), key.size(), &name_length) != napi_ok) return false;
+    if (strcmp(key.data(), "host") == 0) has_host = true;
+    else if (strcmp(key.data(), "port") == 0) has_port = true;
+    else if (strcmp(key.data(), "user") == 0) has_user = true;
+    else return false;
+  }
+  napi_value port_value{};
+  double port_number = 0;
+  if (!has_host || !has_port || !has_user || !ReadUtf16Property(env, descriptor, "host", host) || !ReadUtf16Property(env, descriptor, "user", user) || !IsSafeReadinessHost(*host) || !IsSafeReadinessUser(*user) || napi_get_named_property(env, descriptor, "port", &port_value) != napi_ok || napi_get_value_double(env, port_value, &port_number) != napi_ok || !std::isfinite(port_number) || std::floor(port_number) != port_number || port_number < 1 || port_number > 65535) return false;
+  *port = static_cast<DWORD>(port_number);
+  return true;
+}
+
+bool StopMaster(Handle* master, const std::wstring& ssh, const std::wstring& control_path, const std::wstring& destination, DWORD timeout) {
+  DWORD ignored = 1;
+  const std::vector<std::wstring> exit_arguments = {L"-F", L"none", L"-S", control_path, L"-O", L"exit", L"--", destination};
+  if (timeout > 0) LaunchHiddenProcess(ssh, FixedCommandLine(ssh, exit_arguments), timeout, &ignored);
+  DWORD wait = WaitForSingleObject(master->get(), timeout);
+  if (wait == WAIT_OBJECT_0) return true;
+  if (master->get() == INVALID_HANDLE_VALUE || !TerminateProcess(master->get(), 1)) return false;
+  return WaitForSingleObject(master->get(), 1'000) == WAIT_OBJECT_0;
+}
+
+bool ValidateAgentKeyReadiness(SnapshotSession* snapshot, const std::wstring& host, DWORD port, const std::wstring& user, DWORD timeout) {
+  std::wstring known_hosts;
+  std::wstring snapshot_directory;
+  std::wstring ssh;
+  std::wstring ssh_add;
+  std::array<DWORD, 4> version{};
+  Handle system_handle;
+  Handle openssh_handle;
+  Handle ssh_add_handle;
+  Handle ssh_handle;
+  if (!snapshot->ReadyKnownHostsPath(&known_hosts, &snapshot_directory) || !TrustedOpenSsh(&ssh, &ssh_add, &version, &system_handle, &openssh_handle, &ssh_add_handle, &ssh_handle)) return false;
+  const std::wstring control_path = snapshot_directory + L"\\control";
+  const std::wstring destination = user + L"@" + host;
+  const std::vector<std::wstring> master_arguments = {
+      L"-F", L"none", L"-N", L"-T", L"-n", L"-M", L"-S", control_path,
+      L"-o", L"ControlPersist=no", L"-o", L"CanonicalizeHostname=no", L"-o", L"ProxyCommand=none", L"-o", L"ProxyJump=none",
+      L"-o", L"HostName=" + host, L"-o", L"BatchMode=yes", L"-o", L"StrictHostKeyChecking=yes", L"-o", L"UserKnownHostsFile=" + known_hosts,
+      L"-o", L"GlobalKnownHostsFile=NUL", L"-o", L"PasswordAuthentication=no", L"-o", L"KbdInteractiveAuthentication=no",
+      L"-o", L"NumberOfPasswordPrompts=0", L"-o", L"IdentitiesOnly=yes", L"-p", std::to_wstring(port), L"--", destination};
+  Handle master;
+  if (!StartHiddenProcess(ssh, FixedCommandLine(ssh, master_arguments), &master)) return false;
+  const ULONGLONG started = GetTickCount64();
+  bool ready = false;
+  while (GetTickCount64() - started < timeout) {
+    DWORD master_exit = STILL_ACTIVE;
+    if (!GetExitCodeProcess(master.get(), &master_exit) || master_exit != STILL_ACTIVE) break;
+    const DWORD remaining = static_cast<DWORD>(timeout - (GetTickCount64() - started));
+    DWORD check_exit = 1;
+    const std::vector<std::wstring> check_arguments = {L"-F", L"none", L"-S", control_path, L"-O", L"check", L"--", destination};
+    if (LaunchHiddenProcess(ssh, FixedCommandLine(ssh, check_arguments), std::max<DWORD>(1, std::min<DWORD>(remaining, 250)), &check_exit) == LaunchResult::kCompleted && check_exit == 0) {
+      ready = true;
+      break;
+    }
+  }
+  const ULONGLONG elapsed = GetTickCount64() - started;
+  const DWORD cleanup = elapsed < timeout ? static_cast<DWORD>(timeout - elapsed) : 0;
+  return StopMaster(&master, ssh, control_path, destination, cleanup) && ready;
+}
+
 bool ReadArgumentString(napi_env env, napi_callback_info info, std::string* value) {
   size_t count = 1;
   napi_value argument{};
@@ -837,17 +1003,38 @@ napi_value CaptureKnownHostsSnapshot(napi_env env, napi_callback_info info) {
   return result;
 }
 
+bool ReadSnapshotCapabilityValue(napi_env env, napi_value capability, SnapshotSession** snapshot) {
+  bool tagged = false;
+  void* raw_snapshot = nullptr;
+  return napi_check_object_type_tag(env, capability, &kSnapshotCapabilityTypeTag, &tagged) == napi_ok && tagged && napi_unwrap(env, capability, &raw_snapshot) == napi_ok && raw_snapshot != nullptr && ((*snapshot = static_cast<SnapshotSession*>(raw_snapshot))->IsValidCapability());
+}
+
 bool ReadSnapshotCapability(napi_env env, napi_callback_info info, SnapshotSession** snapshot) {
   size_t count = 1;
   napi_value capability{};
-  bool tagged = false;
-  void* raw_snapshot = nullptr;
-  return napi_get_cb_info(env, info, &count, &capability, nullptr, nullptr) == napi_ok && count == 1 && napi_check_object_type_tag(env, capability, &kSnapshotCapabilityTypeTag, &tagged) == napi_ok && tagged && napi_unwrap(env, capability, &raw_snapshot) == napi_ok && raw_snapshot != nullptr && ((*snapshot = static_cast<SnapshotSession*>(raw_snapshot))->IsValidCapability());
+  return napi_get_cb_info(env, info, &count, &capability, nullptr, nullptr) == napi_ok && count == 1 && ReadSnapshotCapabilityValue(env, capability, snapshot);
 }
 
 napi_value DisposeKnownHostsSnapshot(napi_env env, napi_callback_info info) {
   SnapshotSession* snapshot = nullptr;
   if (!ReadSnapshotCapability(env, info, &snapshot) || !snapshot->Dispose()) return Unavailable(env);
+  napi_value result{};
+  return napi_get_undefined(env, &result) == napi_ok ? result : Unavailable(env);
+}
+
+napi_value ValidateNativeAgentKeyReadiness(napi_env env, napi_callback_info info) {
+  size_t count = 3;
+  napi_value arguments[3]{};
+  SnapshotSession* snapshot = nullptr;
+  int32_t timeout = 0;
+  std::wstring host;
+  std::wstring user;
+  DWORD port = 0;
+  if (napi_get_cb_info(env, info, &count, arguments, nullptr, nullptr) != napi_ok || count != 3 ||
+      !ReadSnapshotCapabilityValue(env, arguments[0], &snapshot) || !ReadReadinessDescriptor(env, arguments[1], &host, &port, &user) ||
+      napi_get_value_int32(env, arguments[2], &timeout) != napi_ok || timeout <= 0 || timeout > 60000 ||
+      !ValidateAgentKeyReadiness(snapshot, host, port, user, static_cast<DWORD>(timeout)))
+    return Unavailable(env);
   napi_value result{};
   return napi_get_undefined(env, &result) == napi_ok ? result : Unavailable(env);
 }
@@ -965,6 +1152,17 @@ napi_value TestFinalizeSnapshotCapability(napi_env env, napi_callback_info info)
   FinalizeSnapshotCapability(env, snapshot, nullptr);
   napi_value result{};
   return napi_get_undefined(env, &result) == napi_ok ? result : Unavailable(env);
+}
+
+napi_value TestReadinessDescriptor(napi_env env, napi_callback_info info) {
+  size_t count = 1;
+  napi_value descriptor{};
+  std::wstring host;
+  std::wstring user;
+  DWORD port = 0;
+  if (napi_get_cb_info(env, info, &count, &descriptor, nullptr, nullptr) != napi_ok || count != 1) return Unavailable(env);
+  napi_value result{};
+  return napi_get_boolean(env, ReadReadinessDescriptor(env, descriptor, &host, &port, &user), &result) == napi_ok ? result : Unavailable(env);
 }
 
 napi_value ReplacementRaceResult(napi_env env, bool hook_executed, DWORD replacement_error, bool read_succeeded, const char* stage) {
@@ -1159,6 +1357,7 @@ NAPI_MODULE_INIT() {
     {"readKnownHosts", nullptr, ReadKnownHosts, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"captureKnownHostsSnapshot", nullptr, CaptureKnownHostsSnapshot, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"disposeKnownHostsSnapshot", nullptr, DisposeKnownHostsSnapshot, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"validateAgentKeyReadiness", nullptr, ValidateNativeAgentKeyReadiness, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"resolveOpenSsh", nullptr, ResolveOpenSsh, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"probeSshAdd", nullptr, ProbeSshAdd, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"readCredential", nullptr, ReadCredential, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -1174,6 +1373,7 @@ NAPI_MODULE_INIT() {
     {"testSnapshotFreshIdentityRechecks", nullptr, TestSnapshotFreshIdentityRechecks, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"testSnapshotArtifactCount", nullptr, TestSnapshotArtifactCount, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"testFinalizeSnapshotCapability", nullptr, TestFinalizeSnapshotCapability, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"testReadinessDescriptor", nullptr, TestReadinessDescriptor, nullptr, nullptr, nullptr, napi_default, nullptr},
 #endif
   };
   if (napi_define_properties(env, exports, sizeof(properties) / sizeof(properties[0]), properties) != napi_ok) return nullptr;

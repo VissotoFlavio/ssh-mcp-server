@@ -145,7 +145,7 @@ export class WindowsSecureStorage {
    * the opaque native snapshot afterwards. The snapshot pathname never enters
    * TypeScript or an SSH child command.
    */
-  async withKnownHostsSnapshot<T>(reference: string, work: (bytes: Buffer) => Promise<T>): Promise<T> {
+  async withKnownHostsSnapshot<T>(reference: string, work: (bytes: Buffer, capability: object) => Promise<T>): Promise<T> {
     const profileId = snapshotProfileId(reference);
     let snapshot: { readonly bytes: Buffer; readonly capability: object };
     try {
@@ -156,7 +156,7 @@ export class WindowsSecureStorage {
       return unavailable();
     }
     try {
-      return await work(Buffer.from(snapshot.bytes));
+      return await work(Buffer.from(snapshot.bytes), snapshot.capability);
     } finally {
       try {
         this.binding.disposeKnownHostsSnapshot(snapshot.capability);

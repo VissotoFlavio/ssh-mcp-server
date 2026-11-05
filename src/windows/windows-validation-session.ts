@@ -4,6 +4,7 @@ import { HostIdentityCredentialPolicy, type ApprovedKnownHostsEntry } from '../p
 import { validateProfileSelection } from '../profiles/connection-profile.js';
 
 import { WindowsCredentialManager } from './windows-credential-manager.js';
+import { WindowsNativeAgentReadiness } from './windows-native-agent-readiness.js';
 import { WindowsOpenSshResolver, WindowsSshAddIdentity } from './windows-openssh.js';
 import { WindowsInMemoryPasswordTransport, type WindowsPasswordValidationRequest } from './windows-password-transport.js';
 import { WindowsSecureStorage } from './windows-secure-storage.js';
@@ -65,6 +66,7 @@ export interface WindowsPasswordReadinessTransport {
 export interface WindowsValidationSessionDependencies {
   readonly storage: Pick<WindowsSecureStorage, 'getProfile' | 'withKnownHostsSnapshot'>;
   readonly agentIdentity: Pick<WindowsSshAddIdentity, 'isAvailable'>;
+  readonly agentReadiness: Pick<WindowsNativeAgentReadiness, 'validate'>;
   readonly createPasswordTransport: (approvedReference: string) => WindowsPasswordReadinessTransport;
   readonly timeoutMs?: number;
 }
@@ -75,6 +77,7 @@ function defaultDependencies(): WindowsValidationSessionDependencies {
   return {
     storage,
     agentIdentity: new WindowsSshAddIdentity(new WindowsOpenSshResolver(), timeoutMs),
+    agentReadiness: new WindowsNativeAgentReadiness(),
     createPasswordTransport: (approvedReference) =>
       new WindowsInMemoryPasswordTransport(new WindowsCredentialManager(undefined, [approvedReference])),
     timeoutMs,
@@ -99,7 +102,7 @@ export class WindowsValidationSession {
     const profile = this.dependencies.storage.getProfile(selection.profileId);
     if (profile === undefined) return unavailable();
 
-    await this.dependencies.storage.withKnownHostsSnapshot(profile.approvedKnownHostsReference, async (bytes) => {
+    await this.dependencies.storage.withKnownHostsSnapshot(profile.approvedKnownHostsReference, async (bytes, capability) => {
       const entries = parseKnownHosts(bytes);
       const policy = new HostIdentityCredentialPolicy({
         profiles: { getProfile: (profileId) => (profileId === selection.profileId ? profile : undefined) },
@@ -112,7 +115,15 @@ export class WindowsValidationSession {
         },
       });
       const authorized = await policy.authorize(selection);
-      if (authorized.authentication.mode !== 'password') return unavailable();
+      if (authorized.authentication.mode === 'agent-key') {
+        const descriptor = Object.freeze({
+          host: authorized.profile.host,
+          port: authorized.profile.port,
+          user: authorized.profile.user,
+        });
+        this.dependencies.agentReadiness.validate(capability, descriptor, this.timeoutMs);
+        return;
+      }
 
       await this.dependencies.createPasswordTransport(authorized.authentication.credentialReference).connect({
         host: authorized.profile.host,

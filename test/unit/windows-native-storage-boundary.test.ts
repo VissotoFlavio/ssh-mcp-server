@@ -25,6 +25,7 @@ const testOnlyHookNames = [
   'testSnapshotFreshIdentityRechecks',
   'testSnapshotArtifactCount',
   'testFinalizeSnapshotCapability',
+  'testReadinessDescriptor',
 ] as const;
 
 type RegistryMutationRight =
@@ -73,6 +74,7 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
     readKnownHosts(profileId: string): Buffer;
     captureKnownHostsSnapshot(profileId: string): { bytes: Buffer; capability: object };
     disposeKnownHostsSnapshot(capability: unknown): void;
+    validateAgentKeyReadiness(capability: unknown, descriptor: unknown, timeoutMs: unknown): void;
     readCredential(locator: unknown): string;
     resolveOpenSsh(): { ssh: string; sshAdd: string; version: string };
     probeSshAdd(timeoutMs: unknown): number;
@@ -112,12 +114,22 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
     testSnapshotFreshIdentityRechecks(): number;
     testSnapshotArtifactCount(): number;
     testFinalizeSnapshotCapability(capability: object): void;
+    testReadinessDescriptor(descriptor: unknown): boolean;
   };
 
   test('keeps test-only hooks out of the production native addon', () => {
     for (const hook of testOnlyHookNames) {
       assert.equal(hook in binding, false, `Production addon exposes ${hook}`);
     }
+  });
+
+  test('accepts only the fixed native agent-readiness descriptor grammar', () => {
+    assert.equal(testBinding.testReadinessDescriptor(Object.freeze({ host: 'api.internal.example', port: 22, user: 'deploy' })), true);
+    assert.equal(testBinding.testReadinessDescriptor(Object.freeze({ host: '2001:db8::1', port: 22, user: 'deploy' })), true);
+    assert.equal(testBinding.testReadinessDescriptor({ host: 'api.internal.example', port: 22, user: 'deploy', command: 'id' }), false);
+    assert.equal(testBinding.testReadinessDescriptor({ host: 'api.internal.example -oProxyCommand=evil', port: 22, user: 'deploy' }), false);
+    assert.equal(testBinding.testReadinessDescriptor({ host: 'api.internal.example', port: 22, user: '-oProxyCommand=evil' }), false);
+    assert.equal(testBinding.testReadinessDescriptor({ host: 'api.internal.example', port: 0, user: 'deploy' }), false);
   });
 
   test('accepts only an isolated private per-user configuration and verified Windows OpenSSH', () => {
@@ -134,6 +146,7 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
       assert.match(ssh.sshAdd, /\\System32\\OpenSSH\\ssh-add\.exe$/iu);
       assert.match(ssh.version, /^9\.(?:[5-9]|[1-9][0-9]+)\.[0-9]+\.[0-9]+$/u);
       assert.equal(typeof binding.probeSshAdd, 'function');
+      assert.equal(typeof binding.validateAgentKeyReadiness, 'function');
     } finally {
       if (configured) runFixture('cleanup', root);
     }

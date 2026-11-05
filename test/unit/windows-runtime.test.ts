@@ -48,6 +48,26 @@ test('does not advertise validate_connection while agent-key cannot consume the 
   await server;
 });
 
+test('advertises validation only when the native-capable internal session is composed', async () => {
+  const inputs: unknown[] = [];
+  const runtime = createWindowsRuntimeProviders(
+    { listProfiles: () => [] },
+    {
+      validate: async (input) => {
+        inputs.push(input);
+      },
+    },
+  );
+  const provider = runtime.connectionValidationProvider;
+  if (provider === undefined) throw new Error('validation provider was not composed');
+  assert.deepEqual(await provider.validateConnection({ profileId: 'production-api' }), {
+    profileId: 'production-api',
+    ready: true,
+  });
+  assert.deepEqual(inputs, [{ profileId: 'production-api' }]);
+  await assert.rejects(provider.validateConnection({ profileId: 'production-api', host: 'attacker.example' }));
+});
+
 test('keeps unsupported and unknown platforms fail closed', () => {
   let composed = 0;
   const factory = () => {
