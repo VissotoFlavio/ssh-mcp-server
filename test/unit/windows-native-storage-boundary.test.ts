@@ -22,6 +22,7 @@ const testOnlyHookNames = [
   'testOpenSshUnexpectedPreLaunchError',
   'testLaunch',
   'testSetSnapshotFailure',
+  'testSnapshotFreshIdentityRechecks',
   'testSnapshotArtifactCount',
   'testFinalizeSnapshotCapability',
 ] as const;
@@ -108,6 +109,7 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
         | 'file-disposition'
         | 'directory-disposition',
     ): void;
+    testSnapshotFreshIdentityRechecks(): number;
     testSnapshotArtifactCount(): number;
     testFinalizeSnapshotCapability(capability: object): void;
   };
@@ -175,6 +177,7 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
         assert.equal(testBinding.testSnapshotArtifactCount(), 0);
         testBinding.testSetSnapshotFailure(failure);
         assert.throws(() => testBinding.captureKnownHostsSnapshot('production-api'), /Windows secure storage is unavailable/u);
+        assert.equal(testBinding.testSnapshotFreshIdentityRechecks(), failure.endsWith('identity') ? 1 : 0);
         assert.equal(testBinding.testSnapshotArtifactCount(), 0);
       } finally {
         if (configured) runFixture('cleanup', root);

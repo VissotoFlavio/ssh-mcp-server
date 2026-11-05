@@ -521,6 +521,7 @@ enum class SnapshotFailure {
 
 #ifdef SSH_MCP_NATIVE_TEST
 SnapshotFailure g_test_snapshot_failure = SnapshotFailure::kNone;
+DWORD g_test_snapshot_fresh_identity_rechecks = 0;
 
 bool ConsumeSnapshotFailure(SnapshotFailure failure) {
   if (g_test_snapshot_failure != failure) return false;
@@ -619,7 +620,7 @@ class SnapshotSession final {
 
   bool Rollback() {
     if (file_.get() != INVALID_HANDLE_VALUE) {
-      const bool file_verified = file_identity_known_ ? HasIdentity(file_.get(), file_identity_) && VerifyFile(file_.get(), operator_sid_.data(), false) : file_fresh_;
+      const bool file_verified = file_identity_known_ ? HasIdentity(file_.get(), file_identity_) && VerifyFile(file_.get(), operator_sid_.data(), false) : RevalidateFreshFile();
       if (!file_verified || ConsumeSnapshotFailure(SnapshotFailure::kFileDisposition)) return false;
       FILE_DISPOSITION_INFO delete_info{};
       delete_info.DeleteFile = TRUE;
@@ -627,7 +628,7 @@ class SnapshotSession final {
       file_.reset();
     }
     if (directory_.get() != INVALID_HANDLE_VALUE) {
-      const bool directory_verified = directory_identity_known_ ? parent_identity_known_ && HasIdentity(parent_.get(), parent_identity_) && HasIdentity(directory_.get(), directory_identity_) && VerifyFile(parent_.get(), operator_sid_.data(), true) && VerifyFile(directory_.get(), operator_sid_.data(), true) : directory_fresh_ && parent_identity_known_ && HasIdentity(parent_.get(), parent_identity_) && VerifyFile(parent_.get(), operator_sid_.data(), true);
+      const bool directory_verified = directory_identity_known_ ? parent_identity_known_ && HasIdentity(parent_.get(), parent_identity_) && HasIdentity(directory_.get(), directory_identity_) && VerifyFile(parent_.get(), operator_sid_.data(), true) && VerifyFile(directory_.get(), operator_sid_.data(), true) : RevalidateFreshDirectory();
       if (!directory_verified || ConsumeSnapshotFailure(SnapshotFailure::kDirectoryDisposition)) return false;
       FILE_DISPOSITION_INFO delete_info{};
       delete_info.DeleteFile = TRUE;
@@ -635,6 +636,24 @@ class SnapshotSession final {
       directory_.reset();
     }
     parent_.reset();
+    return true;
+  }
+
+  bool RevalidateFreshFile() {
+#ifdef SSH_MCP_NATIVE_TEST
+    ++g_test_snapshot_fresh_identity_rechecks;
+#endif
+    if (!file_fresh_ || !ReadIdentity(file_.get(), &file_identity_) || !VerifyFile(file_.get(), operator_sid_.data(), false)) return false;
+    file_identity_known_ = true;
+    return true;
+  }
+
+  bool RevalidateFreshDirectory() {
+#ifdef SSH_MCP_NATIVE_TEST
+    ++g_test_snapshot_fresh_identity_rechecks;
+#endif
+    if (!directory_fresh_ || !parent_identity_known_ || !HasIdentity(parent_.get(), parent_identity_) || !VerifyFile(parent_.get(), operator_sid_.data(), true) || !ReadIdentity(directory_.get(), &directory_identity_) || !VerifyFile(directory_.get(), operator_sid_.data(), true)) return false;
+    directory_identity_known_ = true;
     return true;
   }
 
@@ -892,6 +911,7 @@ bool ReadWideArgument(napi_env env, napi_callback_info info, std::wstring* value
 napi_value TestSetSnapshotFailure(napi_env env, napi_callback_info info) {
   std::string failure;
   if (!ReadArgumentString(env, info, &failure)) return Unavailable(env);
+  g_test_snapshot_fresh_identity_rechecks = 0;
   if (failure == "directory-create") g_test_snapshot_failure = SnapshotFailure::kDirectoryCreate;
   else if (failure == "directory-verify") g_test_snapshot_failure = SnapshotFailure::kDirectoryVerify;
   else if (failure == "directory-identity") g_test_snapshot_failure = SnapshotFailure::kDirectoryIdentity;
@@ -904,6 +924,13 @@ napi_value TestSetSnapshotFailure(napi_env env, napi_callback_info info) {
   else return Unavailable(env);
   napi_value result{};
   return napi_get_undefined(env, &result) == napi_ok ? result : Unavailable(env);
+}
+
+napi_value TestSnapshotFreshIdentityRechecks(napi_env env, napi_callback_info info) {
+  size_t count = 0;
+  if (napi_get_cb_info(env, info, &count, nullptr, nullptr, nullptr) != napi_ok || count != 0) return Unavailable(env);
+  napi_value result{};
+  return napi_create_uint32(env, g_test_snapshot_fresh_identity_rechecks, &result) == napi_ok ? result : Unavailable(env);
 }
 
 napi_value TestSnapshotArtifactCount(napi_env env, napi_callback_info info) {
@@ -1144,6 +1171,7 @@ NAPI_MODULE_INIT() {
     {"testOpenSshUnexpectedPreLaunchError", nullptr, TestOpenSshIdentityBeforeLaunch<true>, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"testLaunch", nullptr, TestLaunch, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"testSetSnapshotFailure", nullptr, TestSetSnapshotFailure, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"testSnapshotFreshIdentityRechecks", nullptr, TestSnapshotFreshIdentityRechecks, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"testSnapshotArtifactCount", nullptr, TestSnapshotArtifactCount, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"testFinalizeSnapshotCapability", nullptr, TestFinalizeSnapshotCapability, nullptr, nullptr, nullptr, napi_default, nullptr},
 #endif
