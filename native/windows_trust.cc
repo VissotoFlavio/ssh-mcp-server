@@ -26,9 +26,9 @@ constexpr wchar_t kCredentialTargetPrefix[] = L"Vissoto/ssh-mcp-server/";
 #ifdef SSH_MCP_NATIVE_TEST
 PSID g_test_system_owner = nullptr;
 const std::wstring* g_test_system_directory = nullptr;
-bool g_test_allow_openssh_test_executables = false;
 bool (*g_test_protected_file_pre_recheck)() = nullptr;
 bool g_test_protected_file_replacement_succeeded = false;
+DWORD g_test_protected_file_replacement_error = ERROR_SUCCESS;
 bool (*g_test_openssh_pre_launch)(const std::wstring& ssh_add) = nullptr;
 std::wstring g_test_replacement_root;
 std::wstring g_test_replacement_leaf;
@@ -352,19 +352,10 @@ bool VerifyCatalogMember(const std::wstring& path) {
 }
 
 bool IsMicrosoftSigned(const std::wstring& path) {
-#ifdef SSH_MCP_NATIVE_TEST
-  if (g_test_allow_openssh_test_executables) return true;
-#endif
   return VerifyCatalogMember(path);
 }
 
 bool IsSupportedOpenSshVersion(const std::wstring& path, std::array<DWORD, 4>* version) {
-#ifdef SSH_MCP_NATIVE_TEST
-  if (g_test_allow_openssh_test_executables) {
-    *version = {9, 5, 0, 0};
-    return true;
-  }
-#endif
   DWORD unused = 0;
   const DWORD bytes = GetFileVersionInfoSizeW(path.c_str(), &unused);
   if (bytes == 0 || bytes > 1024 * 1024) return false;
@@ -623,22 +614,38 @@ bool ReadWideArgument(napi_env env, napi_callback_info info, std::wstring* value
   return value->find(L'\0') == std::wstring::npos;
 }
 
-napi_value ReplacementRaceResult(napi_env env, bool hook_executed, bool read_succeeded, const char* stage) {
+napi_value ReplacementRaceResult(napi_env env, bool hook_executed, DWORD replacement_error, bool read_succeeded, const char* stage) {
   napi_value result{};
   napi_value hook_value{};
+  napi_value replacement_error_value{};
   napi_value read_value{};
   napi_value stage_value{};
-  if (napi_create_object(env, &result) != napi_ok || napi_get_boolean(env, hook_executed, &hook_value) != napi_ok || napi_get_boolean(env, read_succeeded, &read_value) != napi_ok || napi_create_string_utf8(env, stage, NAPI_AUTO_LENGTH, &stage_value) != napi_ok || napi_set_named_property(env, result, "hookExecuted", hook_value) != napi_ok || napi_set_named_property(env, result, "readSucceeded", read_value) != napi_ok || napi_set_named_property(env, result, "stage", stage_value) != napi_ok) return Unavailable(env);
+  if (napi_create_object(env, &result) != napi_ok || napi_get_boolean(env, hook_executed, &hook_value) != napi_ok || napi_create_uint32(env, replacement_error, &replacement_error_value) != napi_ok || napi_get_boolean(env, read_succeeded, &read_value) != napi_ok || napi_create_string_utf8(env, stage, NAPI_AUTO_LENGTH, &stage_value) != napi_ok || napi_set_named_property(env, result, "hookExecuted", hook_value) != napi_ok || napi_set_named_property(env, result, "replacementError", replacement_error_value) != napi_ok || napi_set_named_property(env, result, "readSucceeded", read_value) != napi_ok || napi_set_named_property(env, result, "stage", stage_value) != napi_ok) return Unavailable(env);
   return result;
 }
 
 bool ReplaceProtectedFileForTest() {
   if (g_test_replacement_is_root) {
-    g_test_protected_file_replacement_succeeded = MoveFileExW(g_test_replacement_root.c_str(), (g_test_replacement_root + L".original").c_str(), MOVEFILE_WRITE_THROUGH) != 0 && MoveFileExW((g_test_replacement_root + L".replacement").c_str(), g_test_replacement_root.c_str(), MOVEFILE_WRITE_THROUGH) != 0;
+    const std::wstring path = g_test_replacement_root + L"\\" + g_test_replacement_leaf;
+    const std::wstring replacement_root = g_test_replacement_root + L".replacement";
+    const std::wstring replacement_file = replacement_root + L"\\" + g_test_replacement_leaf;
+    if (DeleteFileW(path.c_str()) == 0) { g_test_protected_file_replacement_error = GetLastError(); return false; }
+    if (RemoveDirectoryW(g_test_replacement_root.c_str()) == 0) { g_test_protected_file_replacement_error = GetLastError(); return false; }
+    if (CreateDirectoryW(g_test_replacement_root.c_str(), nullptr) == 0) { g_test_protected_file_replacement_error = GetLastError(); return false; }
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    PSID owner = nullptr;
+    PACL dacl = nullptr;
+    const DWORD get_security = GetNamedSecurityInfoW(const_cast<wchar_t*>(replacement_root.c_str()), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, &owner, nullptr, &dacl, nullptr, &descriptor);
+    const DWORD set_security = get_security == ERROR_SUCCESS ? SetNamedSecurityInfoW(const_cast<wchar_t*>(g_test_replacement_root.c_str()), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, owner, nullptr, dacl, nullptr) : get_security;
+    if (descriptor != nullptr) LocalFree(descriptor);
+    if (set_security != ERROR_SUCCESS) { g_test_protected_file_replacement_error = set_security; return false; }
+    g_test_protected_file_replacement_succeeded = MoveFileExW(replacement_file.c_str(), path.c_str(), MOVEFILE_WRITE_THROUGH) != 0;
+    if (!g_test_protected_file_replacement_succeeded) g_test_protected_file_replacement_error = GetLastError();
     return g_test_protected_file_replacement_succeeded;
   }
   const std::wstring path = g_test_replacement_root + L"\\" + g_test_replacement_leaf;
   g_test_protected_file_replacement_succeeded = DeleteFileW(path.c_str()) != 0 && MoveFileExW((path + L".replacement").c_str(), path.c_str(), MOVEFILE_WRITE_THROUGH) != 0;
+  if (!g_test_protected_file_replacement_succeeded) g_test_protected_file_replacement_error = GetLastError();
   return g_test_protected_file_replacement_succeeded;
 }
 
@@ -648,18 +655,19 @@ napi_value TestReadReplacementRace(napi_env env, napi_callback_info info) {
   std::wstring known_hosts_root;
   std::vector<BYTE> operator_sid;
   if (!ReadWideArgument(env, info, &target)) return Unavailable(env);
-  if (!LoadConfiguration(&state_root, &known_hosts_root, &operator_sid)) return ReplacementRaceResult(env, false, false, "configuration");
+  if (!LoadConfiguration(&state_root, &known_hosts_root, &operator_sid)) return ReplacementRaceResult(env, false, ERROR_SUCCESS, false, "configuration");
   if (target == L"state-root") { g_test_replacement_root = state_root; g_test_replacement_leaf = kStateFile; g_test_replacement_is_root = true; }
   else if (target == L"state-leaf") { g_test_replacement_root = state_root; g_test_replacement_leaf = kStateFile; g_test_replacement_is_root = false; }
   else if (target == L"known-hosts-root") { g_test_replacement_root = known_hosts_root; g_test_replacement_leaf = L"production-api.known_hosts"; g_test_replacement_is_root = true; }
   else if (target == L"known-hosts-leaf") { g_test_replacement_root = known_hosts_root; g_test_replacement_leaf = L"production-api.known_hosts"; g_test_replacement_is_root = false; }
   else return Unavailable(env);
   g_test_protected_file_replacement_succeeded = false;
+  g_test_protected_file_replacement_error = ERROR_SUCCESS;
   g_test_protected_file_pre_recheck = ReplaceProtectedFileForTest;
   std::vector<BYTE> data;
   const bool read = ReadProtectedFile(g_test_replacement_root, g_test_replacement_leaf, operator_sid.data(), &data);
   g_test_protected_file_pre_recheck = nullptr;
-  return ReplacementRaceResult(env, g_test_protected_file_replacement_succeeded, read, "production-read");
+  return ReplacementRaceResult(env, g_test_protected_file_replacement_succeeded, g_test_protected_file_replacement_error, read, "production-read");
 }
 
 napi_value TestReadStateFile(napi_env env, napi_callback_info info) {
@@ -673,23 +681,20 @@ napi_value TestReadStateFile(napi_env env, napi_callback_info info) {
 
 class TestOpenSshContext final {
  public:
-  TestOpenSshContext(const std::wstring& system, PSID operator_sid, bool allow_test_executables)
-      : previous_directory_(g_test_system_directory), previous_owner_(g_test_system_owner), previous_allow_(g_test_allow_openssh_test_executables), system_(system) {
+  TestOpenSshContext(const std::wstring& system, PSID operator_sid)
+      : previous_directory_(g_test_system_directory), previous_owner_(g_test_system_owner), system_(system) {
     g_test_system_directory = &system_;
     g_test_system_owner = operator_sid;
-    g_test_allow_openssh_test_executables = allow_test_executables;
   }
   ~TestOpenSshContext() {
     g_test_system_directory = previous_directory_;
     g_test_system_owner = previous_owner_;
-    g_test_allow_openssh_test_executables = previous_allow_;
   }
   TestOpenSshContext(const TestOpenSshContext&) = delete;
   TestOpenSshContext& operator=(const TestOpenSshContext&) = delete;
  private:
   const std::wstring* previous_directory_;
   PSID previous_owner_;
-  bool previous_allow_;
   std::wstring system_;
 };
 
@@ -697,7 +702,7 @@ napi_value TestTrustedOpenSsh(napi_env env, napi_callback_info info) {
   std::wstring system;
   std::vector<BYTE> operator_sid;
   if (!ReadWideArgument(env, info, &system) || !CurrentUserSid(&operator_sid)) return Unavailable(env);
-  TestOpenSshContext context(system, operator_sid.data(), false);
+  TestOpenSshContext context(system, operator_sid.data());
   std::wstring ssh;
   std::wstring ssh_add;
   std::array<DWORD, 4> version{};
@@ -722,10 +727,8 @@ bool ReplaceOpenSshBeforeLaunch(const std::wstring& ssh_add) {
 
 template <bool ForceUnexpectedReplacementError>
 napi_value TestOpenSshIdentityBeforeLaunch(napi_env env, napi_callback_info info) {
-  std::wstring system;
-  std::vector<BYTE> operator_sid;
-  if (!ReadWideArgument(env, info, &system) || !CurrentUserSid(&operator_sid)) return Unavailable(env);
-  TestOpenSshContext context(system, operator_sid.data(), true);
+  size_t count = 0;
+  if (napi_get_cb_info(env, info, &count, nullptr, nullptr, nullptr) != napi_ok || count != 0) return Unavailable(env);
   g_test_openssh_replacement_attempted = false;
   g_test_openssh_replacement_succeeded = false;
   g_test_openssh_force_unexpected_replacement_error = ForceUnexpectedReplacementError;
