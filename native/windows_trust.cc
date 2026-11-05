@@ -527,6 +527,7 @@ SnapshotFailure g_test_snapshot_failure = SnapshotFailure::kNone;
 DWORD g_test_snapshot_fresh_identity_rechecks = 0;
 
 bool ConsumeSnapshotFailure(SnapshotFailure failure) {
+  if (failure == SnapshotFailure::kNone) return false;
   if (g_test_snapshot_failure != failure) return false;
   g_test_snapshot_failure = SnapshotFailure::kNone;
   return true;

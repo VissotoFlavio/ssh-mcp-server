@@ -180,6 +180,21 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
     }
   });
 
+  test('lets the test native addon capture and dispose a baseline snapshot', () => {
+    const root = uniqueRoot('test-snapshot-baseline');
+    let configured = false;
+    try {
+      runFixture('safe', root);
+      configured = true;
+      const snapshot = testBinding.captureKnownHostsSnapshot('production-api');
+      assert.equal(testBinding.testSnapshotArtifactCount(), 1);
+      assert.doesNotThrow(() => testBinding.disposeKnownHostsSnapshot(snapshot.capability));
+      assert.equal(testBinding.testSnapshotArtifactCount(), 0);
+    } finally {
+      if (configured) runFixture('cleanup', root);
+    }
+  });
+
   for (const failure of ['directory-create', 'directory-verify', 'directory-identity', 'file-verify', 'file-identity', 'write', 'flush'] as const) {
     test(`leaves no snapshot artifacts when ${failure} fails before capability creation`, () => {
       const root = uniqueRoot(`snapshot-${failure}`);
