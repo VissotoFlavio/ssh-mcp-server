@@ -1,7 +1,9 @@
 import { APPROVED_PROFILE_CLASSIFICATION, type ApprovedProfileListingProvider } from '../profiles/approved-profile-listing.js';
+import { validateProfileSelection } from '../profiles/connection-profile.js';
 import type { ConnectionValidationProvider } from '../validation/trusted-connection-validation.js';
 
 import { WindowsSecureStorage } from './windows-secure-storage.js';
+import { createWindowsValidationSession, WindowsValidationSession } from './windows-validation-session.js';
 
 export interface WindowsRuntimeProviders {
   readonly approvedProfileListingProvider: ApprovedProfileListingProvider;
@@ -9,12 +11,20 @@ export interface WindowsRuntimeProviders {
 }
 
 /**
- * The native storage boundary is sufficient for discovery. Validation remains
- * unavailable until a native known-hosts snapshot can be composed with every
- * authentication boundary without exposing a mutable filesystem path.
+ * Native construction is fail-closed when any required Windows boundary is unavailable.
  */
 export function createWindowsRuntimeProviders(
-  storage: Pick<WindowsSecureStorage, 'listProfiles'> = new WindowsSecureStorage(),
+  storage: Pick<WindowsSecureStorage, 'listProfiles'> &
+    Partial<Pick<WindowsSecureStorage, 'getProfile' | 'withKnownHostsSnapshot'>> = new WindowsSecureStorage(),
+  validationSession: Pick<WindowsValidationSession, 'validate'> | undefined = (() => {
+    try {
+      storage.listProfiles();
+      if (typeof storage.getProfile !== 'function' || typeof storage.withKnownHostsSnapshot !== 'function') return undefined;
+      return createWindowsValidationSession(storage as Pick<WindowsSecureStorage, 'getProfile' | 'withKnownHostsSnapshot'>);
+    } catch {
+      return undefined;
+    }
+  })(),
 ): WindowsRuntimeProviders {
   return {
     approvedProfileListingProvider: {
@@ -22,5 +32,16 @@ export function createWindowsRuntimeProviders(
         return storage.listProfiles().map(({ profileId }) => ({ profileId, classification: APPROVED_PROFILE_CLASSIFICATION }));
       },
     },
+    ...(validationSession === undefined
+      ? {}
+      : {
+          connectionValidationProvider: {
+            async validateConnection(input: unknown, signal?: AbortSignal) {
+              const selection = validateProfileSelection(input);
+              await validationSession.validate(selection, signal);
+              return { profileId: selection.profileId, ready: true as const };
+            },
+          },
+        }),
   };
 }

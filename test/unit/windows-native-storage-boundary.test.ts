@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert';
 import { execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -21,6 +21,11 @@ const testOnlyHookNames = [
   'testOpenSshIdentityBeforeLaunch',
   'testOpenSshUnexpectedPreLaunchError',
   'testLaunch',
+  'testSetSnapshotFailure',
+  'testSnapshotFreshIdentityRechecks',
+  'testSnapshotArtifactCount',
+  'testFinalizeSnapshotCapability',
+  'testReadinessDescriptor',
 ] as const;
 
 type RegistryMutationRight =
@@ -67,11 +72,26 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
   const binding = nativeRequire(addonPath) as {
     readProfileState(): Buffer;
     readKnownHosts(profileId: string): Buffer;
+    captureKnownHostsSnapshot(profileId: string): { bytes: Buffer; capability: object };
+    disposeKnownHostsSnapshot(capability: unknown): void;
+    validateAgentKeyReadiness(capability: unknown, descriptor: unknown, timeoutMs: unknown): void;
+    startAgentKeyReadiness(
+      capability: object,
+      descriptor: { readonly host: string; readonly port: number; readonly user: string },
+      timeoutMs: number,
+    ): { readonly promise: Promise<void>; readonly cancel: () => void };
     readCredential(locator: unknown): string;
     resolveOpenSsh(): { ssh: string; sshAdd: string; version: string };
     probeSshAdd(timeoutMs: unknown): number;
   };
   const testBinding = nativeRequire(testAddonPath) as {
+    captureKnownHostsSnapshot(profileId: string): { bytes: Buffer; capability: object };
+    disposeKnownHostsSnapshot(capability: unknown): void;
+    startAgentKeyReadiness(
+      capability: object,
+      descriptor: { readonly host: string; readonly port: number; readonly user: string },
+      timeoutMs: number,
+    ): { readonly promise: Promise<void>; readonly cancel: () => void };
     testReadReplacementRace(target: 'state-root' | 'state-leaf' | 'known-hosts-root' | 'known-hosts-leaf'): {
       hookExecuted: boolean;
       replacementError: number;
@@ -89,12 +109,37 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
       launchCompleted: boolean;
     };
     testLaunch(mode: 'exit' | 'hang', timeoutMs: number): { completed: boolean; timedOut: boolean; exitCode: number };
+    testSetSnapshotFailure(
+      failure:
+        | 'directory-create'
+        | 'directory-verify'
+        | 'directory-identity'
+        | 'file-verify'
+        | 'file-identity'
+        | 'write'
+        | 'flush'
+        | 'file-disposition'
+        | 'directory-disposition',
+    ): void;
+    testSnapshotFreshIdentityRechecks(): number;
+    testSnapshotArtifactCount(): number;
+    testFinalizeSnapshotCapability(capability: object): void;
+    testReadinessDescriptor(descriptor: unknown): boolean;
   };
 
   test('keeps test-only hooks out of the production native addon', () => {
     for (const hook of testOnlyHookNames) {
       assert.equal(hook in binding, false, `Production addon exposes ${hook}`);
     }
+  });
+
+  test('accepts only the fixed native agent-readiness descriptor grammar', () => {
+    assert.equal(testBinding.testReadinessDescriptor(Object.freeze({ host: 'api.internal.example', port: 22, user: 'deploy' })), true);
+    assert.equal(testBinding.testReadinessDescriptor(Object.freeze({ host: '2001:db8::1', port: 22, user: 'deploy' })), true);
+    assert.equal(testBinding.testReadinessDescriptor({ host: 'api.internal.example', port: 22, user: 'deploy', command: 'id' }), false);
+    assert.equal(testBinding.testReadinessDescriptor({ host: 'api.internal.example -oProxyCommand=evil', port: 22, user: 'deploy' }), false);
+    assert.equal(testBinding.testReadinessDescriptor({ host: 'api.internal.example', port: 22, user: '-oProxyCommand=evil' }), false);
+    assert.equal(testBinding.testReadinessDescriptor({ host: 'api.internal.example', port: 0, user: 'deploy' }), false);
   });
 
   test('accepts only an isolated private per-user configuration and verified Windows OpenSSH', () => {
@@ -111,6 +156,138 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
       assert.match(ssh.sshAdd, /\\System32\\OpenSSH\\ssh-add\.exe$/iu);
       assert.match(ssh.version, /^9\.(?:[5-9]|[1-9][0-9]+)\.[0-9]+\.[0-9]+$/u);
       assert.equal(typeof binding.probeSshAdd, 'function');
+      assert.equal(typeof binding.validateAgentKeyReadiness, 'function');
+    } finally {
+      if (configured) runFixture('cleanup', root);
+    }
+  });
+
+  test('captures verified known-hosts bytes in an opaque one-use native snapshot capability', () => {
+    const root = uniqueRoot('snapshot');
+    let configured = false;
+    try {
+      runFixture('safe', root);
+      configured = true;
+      const expected = binding.readKnownHosts('production-api');
+      const snapshot = binding.captureKnownHostsSnapshot('production-api');
+      const sentinel = join(root, 'state', 'snapshot-sentinel');
+      writeFileSync(sentinel, 'sentinel', 'utf8');
+      assert.equal(Buffer.isBuffer(snapshot.bytes), true);
+      assert.deepEqual(snapshot.bytes, expected);
+      assert.equal(testBinding.testSnapshotArtifactCount(), 1);
+      assert.deepEqual(Object.keys(snapshot).sort(), ['bytes', 'capability']);
+      assert.deepEqual(Object.getOwnPropertyNames(snapshot.capability), []);
+      assert.equal(JSON.stringify(snapshot.capability).includes(root), false);
+      assert.throws(() => binding.disposeKnownHostsSnapshot({}), /Windows secure storage is unavailable/u);
+      assert.throws(() => binding.disposeKnownHostsSnapshot(Object.create(snapshot.capability)), /Windows secure storage is unavailable/u);
+      assert.equal(existsSync(sentinel), true);
+      assert.doesNotThrow(() => binding.disposeKnownHostsSnapshot(snapshot.capability));
+      assert.equal(testBinding.testSnapshotArtifactCount(), 0);
+      assert.throws(() => binding.disposeKnownHostsSnapshot(snapshot.capability), /Windows secure storage is unavailable/u);
+      assert.equal(existsSync(sentinel), true);
+    } finally {
+      if (configured) runFixture('cleanup', root);
+    }
+  });
+
+  test('cancellation retains the opaque snapshot until native readiness has reaped its children', async () => {
+    const root = uniqueRoot('snapshot-cancel');
+    let configured = false;
+    try {
+      runFixture('safe', root);
+      configured = true;
+      const snapshot = testBinding.captureKnownHostsSnapshot('production-api');
+      const operation = testBinding.startAgentKeyReadiness(snapshot.capability, { host: 'api.internal.example', port: 22, user: 'deploy' }, 5_000);
+      operation.cancel();
+      assert.throws(() => testBinding.disposeKnownHostsSnapshot(snapshot.capability), /Windows secure storage is unavailable/u);
+      await assert.rejects(operation.promise, /Windows connection validation is unavailable/u);
+      assert.doesNotThrow(() => testBinding.disposeKnownHostsSnapshot(snapshot.capability));
+    } finally {
+      if (configured) runFixture('cleanup', root);
+    }
+  });
+
+  test('lets the test native addon capture and dispose a baseline snapshot', () => {
+    const root = uniqueRoot('test-snapshot-baseline');
+    let configured = false;
+    try {
+      runFixture('safe', root);
+      configured = true;
+      const snapshot = testBinding.captureKnownHostsSnapshot('production-api');
+      assert.equal(testBinding.testSnapshotArtifactCount(), 1);
+      assert.doesNotThrow(() => testBinding.disposeKnownHostsSnapshot(snapshot.capability));
+      assert.equal(testBinding.testSnapshotArtifactCount(), 0);
+    } finally {
+      if (configured) runFixture('cleanup', root);
+    }
+  });
+
+  test('cancels native agent readiness before it can retain a snapshot or start a remote command', async () => {
+    const root = uniqueRoot('cancel-agent-readiness');
+    let configured = false;
+    try {
+      runFixture('safe', root);
+      configured = true;
+      const snapshot = binding.captureKnownHostsSnapshot('production-api');
+      const operation = binding.startAgentKeyReadiness(snapshot.capability, Object.freeze({ host: '192.0.2.1', port: 22, user: 'deploy' }), 1_000);
+      operation.cancel();
+      await assert.rejects(operation.promise, /Windows connection validation is unavailable/u);
+      assert.doesNotThrow(() => binding.disposeKnownHostsSnapshot(snapshot.capability));
+      assert.equal(testBinding.testSnapshotArtifactCount(), 0);
+    } finally {
+      if (configured) runFixture('cleanup', root);
+    }
+  });
+
+  for (const failure of ['directory-create', 'directory-verify', 'directory-identity', 'file-verify', 'file-identity', 'write', 'flush'] as const) {
+    test(`leaves no snapshot artifacts when ${failure} fails before capability creation`, () => {
+      const root = uniqueRoot(`snapshot-${failure}`);
+      let configured = false;
+      try {
+        runFixture('safe', root);
+        configured = true;
+        assert.equal(testBinding.testSnapshotArtifactCount(), 0);
+        testBinding.testSetSnapshotFailure(failure);
+        assert.throws(() => testBinding.captureKnownHostsSnapshot('production-api'), /Windows secure storage is unavailable/u);
+        assert.equal(testBinding.testSnapshotFreshIdentityRechecks(), failure.endsWith('identity') ? 1 : 0);
+        assert.equal(testBinding.testSnapshotArtifactCount(), 0);
+      } finally {
+        if (configured) runFixture('cleanup', root);
+      }
+    });
+  }
+
+  for (const failure of ['file-disposition', 'directory-disposition'] as const) {
+    test(`retains a retryable capability when ${failure} cleanup fails`, () => {
+      const root = uniqueRoot(`snapshot-${failure}`);
+      let configured = false;
+      try {
+        runFixture('safe', root);
+        configured = true;
+        const snapshot = testBinding.captureKnownHostsSnapshot('production-api');
+        assert.equal(testBinding.testSnapshotArtifactCount(), 1);
+        testBinding.testSetSnapshotFailure(failure);
+        assert.throws(() => testBinding.disposeKnownHostsSnapshot(snapshot.capability), /Windows secure storage is unavailable/u);
+        assert.equal(testBinding.testSnapshotArtifactCount(), 1);
+        assert.doesNotThrow(() => testBinding.disposeKnownHostsSnapshot(snapshot.capability));
+        assert.equal(testBinding.testSnapshotArtifactCount(), 0);
+      } finally {
+        if (configured) runFixture('cleanup', root);
+      }
+    });
+  }
+
+  test('retries a transient cleanup failure during native finalization without leaving artifacts', () => {
+    const root = uniqueRoot('snapshot-finalizer');
+    let configured = false;
+    try {
+      runFixture('safe', root);
+      configured = true;
+      const snapshot = testBinding.captureKnownHostsSnapshot('production-api');
+      assert.equal(testBinding.testSnapshotArtifactCount(), 1);
+      testBinding.testSetSnapshotFailure('file-disposition');
+      assert.doesNotThrow(() => testBinding.testFinalizeSnapshotCapability(snapshot.capability));
+      assert.equal(testBinding.testSnapshotArtifactCount(), 0);
     } finally {
       if (configured) runFixture('cleanup', root);
     }

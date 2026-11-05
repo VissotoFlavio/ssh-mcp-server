@@ -26,7 +26,38 @@ test('composes Windows discovery only from the native storage boundary', async (
   assert.equal(runtime.connectionValidationProvider, undefined);
 });
 
-test('registers only discovery through the Windows runtime protocol composition', async () => {
+test('advertises validation only after the complete storage and native-session boundary is available', async () => {
+  const profiles = [
+    {
+      profileId: 'production-api',
+      host: 'private.example',
+      port: 22,
+      user: 'deploy',
+      authMode: 'agent-key' as const,
+      approvedKnownHostsReference: 'known-hosts://production-api',
+      expectedHostFingerprint: 'SHA256:1111111111111111111111111111111111111111111',
+    },
+  ];
+  const validated: unknown[] = [];
+  const runtime = createWindowsRuntimeProviders(
+    {
+      listProfiles: () => profiles,
+      getProfile: (profileId) => profiles.find((profile) => profile.profileId === profileId),
+      withKnownHostsSnapshot: async (_reference, work) => work(Buffer.from('approved'), {}),
+    },
+    {
+      validate: async (input) => {
+        validated.push(input);
+      },
+    },
+  );
+
+  assert.notEqual(runtime.connectionValidationProvider, undefined);
+  await runtime.connectionValidationProvider!.validateConnection({ profileId: 'production-api' });
+  assert.deepEqual(validated, [{ profileId: 'production-api' }]);
+});
+
+test('does not advertise validate_connection with an incomplete native storage boundary', async () => {
   const runtime = createWindowsRuntimeProviders({ listProfiles: () => [] });
   const input = new PassThrough();
   const output = new PassThrough();
@@ -46,6 +77,11 @@ test('registers only discovery through the Windows runtime protocol composition'
   );
   input.end();
   await server;
+});
+
+test('does not advertise validation without all native storage prerequisites', () => {
+  const runtime = createWindowsRuntimeProviders({ listProfiles: () => [] });
+  assert.equal(runtime.connectionValidationProvider, undefined);
 });
 
 test('keeps unsupported and unknown platforms fail closed', () => {

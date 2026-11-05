@@ -17,7 +17,7 @@ export interface ConnectionReadinessAdapter {
  * connection configuration is resolved by the policy and readiness adapter.
  */
 export interface ConnectionValidationProvider {
-  validateConnection(input: unknown): Promise<ConnectionValidationOutcome>;
+  validateConnection(input: unknown, signal?: AbortSignal): Promise<ConnectionValidationOutcome>;
 }
 
 /** Deliberately small, non-secret result that can cross the MCP boundary. */
@@ -105,7 +105,7 @@ export function createTrustedConnectionValidationProvider(dependencies: TrustedC
   }
 
   return {
-    async validateConnection(input: unknown): Promise<ConnectionValidationOutcome> {
+    async validateConnection(input: unknown, _signal?: AbortSignal): Promise<ConnectionValidationOutcome> {
       const selection = validateProfileSelection(input);
       const authorized = bindAuthorizedConnection(await dependencies.policy.authorize(selection), selection.profileId);
       await dependencies.readinessAdapter.connect(authorized);

@@ -14,12 +14,19 @@ const profile = {
 };
 
 function binding(state: unknown = { profiles: [profile] }): WindowsTrustBinding {
+  const capability = {};
   return {
     readProfileState: () => Buffer.from(JSON.stringify(state)),
     readKnownHosts: (profileId) => {
       assert.equal(profileId, 'production-api');
       return Buffer.from('[api.internal.example]:22 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItest\n');
     },
+    captureKnownHostsSnapshot: (profileId) => {
+      assert.equal(profileId, 'production-api');
+      return { bytes: Buffer.from('[api.internal.example]:22 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItest\n'), capability };
+    },
+    disposeKnownHostsSnapshot: (value) => assert.equal(value, capability),
+    readCredential: () => 'unused',
   };
 }
 
@@ -49,7 +56,27 @@ test('fails closed for malformed state or native failures', () => {
           throw new Error('native path failure');
         },
         readKnownHosts: () => Buffer.from('unused'),
+        captureKnownHostsSnapshot: () => ({ bytes: Buffer.from('unused'), capability: {} }),
+        disposeKnownHostsSnapshot: () => undefined,
+        readCredential: () => 'unused',
       }).listProfiles(),
     WindowsSecureStorageError,
   );
+});
+
+test('always disposes the opaque native snapshot after work succeeds or fails', async () => {
+  const capability = {};
+  let disposals = 0;
+  const storage = new WindowsSecureStorage({
+    ...binding(),
+    captureKnownHostsSnapshot: () => ({ bytes: Buffer.from('approved'), capability }),
+    disposeKnownHostsSnapshot: (value) => {
+      assert.equal(value, capability);
+      disposals += 1;
+    },
+  });
+  await assert.rejects(storage.withKnownHostsSnapshot('known-hosts://production-api', async () => Promise.reject(new Error('transport failed'))));
+  assert.equal(disposals, 1);
+  await storage.withKnownHostsSnapshot('known-hosts://production-api', async (bytes) => assert.equal(bytes.toString('utf8'), 'approved'));
+  assert.equal(disposals, 2);
 });
