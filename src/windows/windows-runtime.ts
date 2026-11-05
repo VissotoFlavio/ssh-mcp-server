@@ -9,9 +9,10 @@ export interface WindowsRuntimeProviders {
 }
 
 /**
- * The native storage boundary is sufficient for discovery. Validation remains
- * unavailable until a native known-hosts snapshot can be composed with every
- * authentication boundary without exposing a mutable filesystem path.
+ * The native storage boundary is sufficient for discovery. Password readiness
+ * has an internal in-memory session, but validation remains unavailable at
+ * the MCP boundary until agent-key readiness can consume an opaque native
+ * known-hosts snapshot without exposing a mutable filesystem path.
  */
 export function createWindowsRuntimeProviders(
   storage: Pick<WindowsSecureStorage, 'listProfiles'> = new WindowsSecureStorage(),

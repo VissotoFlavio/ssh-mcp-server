@@ -12,6 +12,8 @@ const KNOWN_HOSTS_REFERENCE = /^known-hosts:\/\/([a-z0-9]+(?:-[a-z0-9]+)*)$/u;
 export interface WindowsTrustBinding {
   readProfileState(): Buffer;
   readKnownHosts(profileId: string): Buffer;
+  captureKnownHostsSnapshot(profileId: string): { readonly bytes: Buffer; readonly capability: object };
+  disposeKnownHostsSnapshot(capability: object): void;
 }
 
 export class WindowsSecureStorageError extends Error {
@@ -40,7 +42,9 @@ function loadNativeBinding(): WindowsTrustBinding {
     typeof candidate !== 'object' ||
     candidate === null ||
     typeof (candidate as { readProfileState?: unknown }).readProfileState !== 'function' ||
-    typeof (candidate as { readKnownHosts?: unknown }).readKnownHosts !== 'function'
+    typeof (candidate as { readKnownHosts?: unknown }).readKnownHosts !== 'function' ||
+    typeof (candidate as { captureKnownHostsSnapshot?: unknown }).captureKnownHostsSnapshot !== 'function' ||
+    typeof (candidate as { disposeKnownHostsSnapshot?: unknown }).disposeKnownHostsSnapshot !== 'function'
   ) {
     return unavailable();
   }
@@ -81,6 +85,30 @@ function parseState(value: Buffer): readonly ConnectionProfile[] {
   }
 }
 
+function snapshotProfileId(reference: string): string {
+  const match = KNOWN_HOSTS_REFERENCE.exec(reference);
+  if (match === null) return unavailable();
+  return match[1];
+}
+
+function validSnapshot(value: unknown): value is { readonly bytes: Buffer; readonly capability: object } {
+  if (typeof value !== 'object' || value === null || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype) return false;
+  const keys = Reflect.ownKeys(value);
+  const bytes = (value as { bytes?: unknown }).bytes;
+  const capability = (value as { capability?: unknown }).capability;
+  return (
+    keys.length === 2 &&
+    keys.includes('bytes') &&
+    keys.includes('capability') &&
+    Buffer.isBuffer(bytes) &&
+    bytes.byteLength > 0 &&
+    bytes.byteLength <= MAX_STATE_BYTES &&
+    typeof capability === 'object' &&
+    capability !== null &&
+    !Array.isArray(capability)
+  );
+}
+
 /**
  * Reads only fixed Windows trust anchors through the native boundary. Neither
  * roots nor filenames are accepted from MCP callers or environment variables.
@@ -102,14 +130,39 @@ export class WindowsSecureStorage {
   }
 
   readKnownHosts(reference: string): Buffer {
-    const match = KNOWN_HOSTS_REFERENCE.exec(reference);
-    if (match === null) return unavailable();
+    const profileId = snapshotProfileId(reference);
     try {
-      const value = this.binding.readKnownHosts(match[1]);
+      const value = this.binding.readKnownHosts(profileId);
       if (!Buffer.isBuffer(value) || value.byteLength === 0 || value.byteLength > MAX_STATE_BYTES) return unavailable();
       return Buffer.from(value);
     } catch {
       return unavailable();
+    }
+  }
+
+  /**
+   * Gives work a copy of native-captured known-hosts bytes and always disposes
+   * the opaque native snapshot afterwards. The snapshot pathname never enters
+   * TypeScript or an SSH child command.
+   */
+  async withKnownHostsSnapshot<T>(reference: string, work: (bytes: Buffer) => Promise<T>): Promise<T> {
+    const profileId = snapshotProfileId(reference);
+    let snapshot: { readonly bytes: Buffer; readonly capability: object };
+    try {
+      const captured = this.binding.captureKnownHostsSnapshot(profileId);
+      if (!validSnapshot(captured)) return unavailable();
+      snapshot = captured;
+    } catch {
+      return unavailable();
+    }
+    try {
+      return await work(Buffer.from(snapshot.bytes));
+    } finally {
+      try {
+        this.binding.disposeKnownHostsSnapshot(snapshot.capability);
+      } catch {
+        unavailable();
+      }
     }
   }
 }

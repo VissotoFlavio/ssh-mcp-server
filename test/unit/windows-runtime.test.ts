@@ -26,7 +26,7 @@ test('composes Windows discovery only from the native storage boundary', async (
   assert.equal(runtime.connectionValidationProvider, undefined);
 });
 
-test('registers only discovery through the Windows runtime protocol composition', async () => {
+test('does not advertise validate_connection while agent-key cannot consume the opaque native snapshot', async () => {
   const runtime = createWindowsRuntimeProviders({ listProfiles: () => [] });
   const input = new PassThrough();
   const output = new PassThrough();
