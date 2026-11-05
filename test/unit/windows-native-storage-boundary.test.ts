@@ -19,6 +19,7 @@ const testOnlyHookNames = [
   'testSystemOwnerMismatch',
   'testTrustedOpenSsh',
   'testOpenSshIdentityBeforeLaunch',
+  'testOpenSshUnexpectedPreLaunchError',
   'testLaunch',
 ] as const;
 
@@ -79,7 +80,8 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
     testReadStateFile(root: string): boolean;
     testSystemOwnerMismatch(): boolean;
     testTrustedOpenSsh(system: string): boolean;
-    testOpenSshIdentityBeforeLaunch(system: string): { replacementBlocked: boolean; launchCompleted: boolean };
+    testOpenSshIdentityBeforeLaunch(system: string): { replacementBlocked: boolean; replacementError: number; launchCompleted: boolean };
+    testOpenSshUnexpectedPreLaunchError(system: string): { replacementBlocked: boolean; replacementError: number; launchCompleted: boolean };
     testLaunch(mode: 'exit' | 'hang', timeoutMs: number): { completed: boolean; timedOut: boolean; exitCode: number };
   };
 
@@ -160,7 +162,24 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
       configured = true;
       assert.deepEqual(testBinding.testOpenSshIdentityBeforeLaunch(join(root, 'openssh-system')), {
         replacementBlocked: true,
+        replacementError: 32,
         launchCompleted: true,
+      });
+    } finally {
+      if (configured) runFixture('cleanup', root);
+    }
+  });
+
+  test('fails closed before launch when the OpenSSH replacement attempt has an unexpected error', () => {
+    const root = uniqueRoot('openssh-unexpected-pre-launch-error');
+    let configured = false;
+    try {
+      runFixture('openssh-chain-safe', root);
+      configured = true;
+      assert.deepEqual(testBinding.testOpenSshUnexpectedPreLaunchError(join(root, 'openssh-system')), {
+        replacementBlocked: false,
+        replacementError: 5,
+        launchCompleted: false,
       });
     } finally {
       if (configured) runFixture('cleanup', root);
