@@ -616,6 +616,13 @@ class SnapshotSession final {
   bool IsReady() const { return parent_identity_known_ && directory_identity_known_ && file_identity_known_ && parent_.get() != INVALID_HANDLE_VALUE && directory_.get() != INVALID_HANDLE_VALUE && file_.get() != INVALID_HANDLE_VALUE; }
   bool IsValidCapability() const { return !disposed_ && parent_.get() != INVALID_HANDLE_VALUE && directory_.get() != INVALID_HANDLE_VALUE && capability_tag_ == &kSnapshotCapabilityTypeTag; }
 
+  bool Acquire() {
+    bool expected = false;
+    return !disposed_ && busy_.compare_exchange_strong(expected, true);
+  }
+
+  void Release() { busy_.store(false); }
+
   bool ReadyKnownHostsPath(std::wstring* path, std::wstring* directory) const {
     if (!IsValidCapability() || !parent_identity_known_ || !directory_identity_known_ || !file_identity_known_ ||
         !HasIdentity(parent_.get(), parent_identity_) || !HasIdentity(directory_.get(), directory_identity_) ||
@@ -634,7 +641,7 @@ class SnapshotSession final {
   }
 
   bool Dispose() {
-    if (disposed_) return false;
+    if (disposed_ || busy_.load()) return false;
     if (!Rollback() || HasArtifacts()) return false;
     disposed_ = true;
     return true;
@@ -698,6 +705,7 @@ class SnapshotSession final {
   bool directory_fresh_ = false;
   bool file_fresh_ = false;
   bool disposed_ = false;
+  std::atomic<bool> busy_{false};
 };
 
 LONG g_snapshot_counter = 0;
@@ -877,13 +885,13 @@ bool ReadReadinessDescriptor(napi_env env, napi_value descriptor, std::wstring* 
 }
 
 bool StopMaster(Handle* master, const std::wstring& ssh, const std::wstring& control_path, const std::wstring& destination, DWORD timeout, const std::atomic<bool>* cancelled = nullptr) {
+  const ULONGLONG deadline = GetTickCount64() + timeout;
   DWORD ignored = 1;
   const std::vector<std::wstring> exit_arguments = {L"-F", L"none", L"-S", control_path, L"-O", L"exit", L"--", destination};
   if (timeout > 0) LaunchHiddenProcess(ssh, FixedCommandLine(ssh, exit_arguments), timeout, &ignored, cancelled);
   DWORD wait = WAIT_TIMEOUT;
-  const ULONGLONG started = GetTickCount64();
-  while (GetTickCount64() - started < timeout) {
-    wait = WaitForSingleObject(master->get(), std::min<DWORD>(static_cast<DWORD>(timeout - (GetTickCount64() - started)), 25));
+  while (GetTickCount64() < deadline && (cancelled == nullptr || !cancelled->load())) {
+    wait = WaitForSingleObject(master->get(), std::min<DWORD>(static_cast<DWORD>(deadline - GetTickCount64()), 25));
     if (wait == WAIT_OBJECT_0 || wait == WAIT_FAILED) break;
   }
   if (wait == WAIT_OBJECT_0) return true;
@@ -1078,9 +1086,10 @@ void ExecuteAgentReadiness(napi_env, void* data) {
 
 void CompleteAgentReadiness(napi_env env, napi_status, void* data) {
   std::unique_ptr<AgentReadinessWork> job(static_cast<AgentReadinessWork*>(data));
+  job->snapshot->Release();
   if (job->snapshot_reference != nullptr) napi_delete_reference(env, job->snapshot_reference);
   if (job->work != nullptr) napi_delete_async_work(env, job->work);
-  if (job->succeeded) {
+  if (job->succeeded && !job->cancellation->requested.load()) {
     napi_value result{};
     napi_get_undefined(env, &result);
     napi_resolve_deferred(env, job->deferred, result);
@@ -1110,7 +1119,8 @@ napi_value StartNativeAgentKeyReadiness(napi_env env, napi_callback_info info) {
   int32_t timeout = 0;
   auto job = std::make_unique<AgentReadinessWork>();
   job->env = env;
-  if (napi_get_cb_info(env, info, &count, arguments, nullptr, nullptr) != napi_ok || count != 3 || !ReadSnapshotCapabilityValue(env, arguments[0], &job->snapshot) || !ReadReadinessDescriptor(env, arguments[1], &job->host, &job->port, &job->user) || napi_get_value_int32(env, arguments[2], &timeout) != napi_ok || timeout <= 0 || timeout > 60000) return Unavailable(env);
+  if (napi_get_cb_info(env, info, &count, arguments, nullptr, nullptr) != napi_ok || count != 3 || !ReadSnapshotCapabilityValue(env, arguments[0], &job->snapshot) || !job->snapshot->Acquire()) return Unavailable(env);
+  if (!ReadReadinessDescriptor(env, arguments[1], &job->host, &job->port, &job->user) || napi_get_value_int32(env, arguments[2], &timeout) != napi_ok || timeout <= 0 || timeout > 60000) { job->snapshot->Release(); return Unavailable(env); }
   job->timeout = static_cast<DWORD>(timeout);
   job->cancellation = std::make_shared<AgentReadinessCancellation>();
   napi_value promise{};
@@ -1118,14 +1128,15 @@ napi_value StartNativeAgentKeyReadiness(napi_env env, napi_callback_info info) {
   napi_value cancel{};
   napi_value result{};
   auto cancellation_handle = std::make_unique<std::shared_ptr<AgentReadinessCancellation>>(job->cancellation);
-  if (napi_create_promise(env, &job->deferred, &promise) != napi_ok || napi_create_string_utf8(env, "sshMcpAgentReadiness", NAPI_AUTO_LENGTH, &resource_name) != napi_ok || napi_create_function(env, "cancel", NAPI_AUTO_LENGTH, CancelAgentReadiness, cancellation_handle.get(), &cancel) != napi_ok) return Unavailable(env);
-  if (napi_add_finalizer(env, cancel, cancellation_handle.get(), FinalizeAgentReadinessCancellation, nullptr, nullptr) != napi_ok) return Unavailable(env);
+  if (napi_create_promise(env, &job->deferred, &promise) != napi_ok || napi_create_string_utf8(env, "sshMcpAgentReadiness", NAPI_AUTO_LENGTH, &resource_name) != napi_ok || napi_create_function(env, "cancel", NAPI_AUTO_LENGTH, CancelAgentReadiness, cancellation_handle.get(), &cancel) != napi_ok) { job->snapshot->Release(); return Unavailable(env); }
+  if (napi_add_finalizer(env, cancel, cancellation_handle.get(), FinalizeAgentReadinessCancellation, nullptr, nullptr) != napi_ok) { job->snapshot->Release(); return Unavailable(env); }
   cancellation_handle.release();
-  if (napi_create_object(env, &result) != napi_ok || napi_set_named_property(env, result, "promise", promise) != napi_ok || napi_set_named_property(env, result, "cancel", cancel) != napi_ok) return Unavailable(env);
-  if (napi_create_reference(env, arguments[0], 1, &job->snapshot_reference) != napi_ok) return Unavailable(env);
+  if (napi_create_object(env, &result) != napi_ok || napi_set_named_property(env, result, "promise", promise) != napi_ok || napi_set_named_property(env, result, "cancel", cancel) != napi_ok) { job->snapshot->Release(); return Unavailable(env); }
+  if (napi_create_reference(env, arguments[0], 1, &job->snapshot_reference) != napi_ok) { job->snapshot->Release(); return Unavailable(env); }
   if (napi_create_async_work(env, nullptr, resource_name, ExecuteAgentReadiness, CompleteAgentReadiness, job.get(), &job->work) != napi_ok) {
     napi_delete_reference(env, job->snapshot_reference);
     job->snapshot_reference = nullptr;
+    job->snapshot->Release();
     return Unavailable(env);
   }
   if (napi_queue_async_work(env, job->work) != napi_ok) {
@@ -1133,6 +1144,7 @@ napi_value StartNativeAgentKeyReadiness(napi_env env, napi_callback_info info) {
     job->work = nullptr;
     napi_delete_reference(env, job->snapshot_reference);
     job->snapshot_reference = nullptr;
+    job->snapshot->Release();
     return Unavailable(env);
   }
   job.release();

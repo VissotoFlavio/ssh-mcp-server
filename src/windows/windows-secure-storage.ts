@@ -14,6 +14,7 @@ export interface WindowsTrustBinding {
   readKnownHosts(profileId: string): Buffer;
   captureKnownHostsSnapshot(profileId: string): { readonly bytes: Buffer; readonly capability: object };
   disposeKnownHostsSnapshot(capability: object): void;
+  readCredential(locator: string): string;
 }
 
 export class WindowsSecureStorageError extends Error {
@@ -44,7 +45,8 @@ function loadNativeBinding(): WindowsTrustBinding {
     typeof (candidate as { readProfileState?: unknown }).readProfileState !== 'function' ||
     typeof (candidate as { readKnownHosts?: unknown }).readKnownHosts !== 'function' ||
     typeof (candidate as { captureKnownHostsSnapshot?: unknown }).captureKnownHostsSnapshot !== 'function' ||
-    typeof (candidate as { disposeKnownHostsSnapshot?: unknown }).disposeKnownHostsSnapshot !== 'function'
+    typeof (candidate as { disposeKnownHostsSnapshot?: unknown }).disposeKnownHostsSnapshot !== 'function' ||
+    typeof (candidate as { readCredential?: unknown }).readCredential !== 'function'
   ) {
     return unavailable();
   }

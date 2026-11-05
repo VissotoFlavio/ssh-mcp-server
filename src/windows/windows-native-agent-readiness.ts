@@ -3,7 +3,6 @@ import { createRequire } from 'node:module';
 import { supportsWindowsAlphaRuntime } from './windows-runtime-support.js';
 
 const require = createRequire(import.meta.url);
-const DEFAULT_TIMEOUT_MS = 10_000;
 const MAX_TIMEOUT_MS = 60_000;
 
 export interface NativeAgentKeyReadinessDescriptor {
@@ -35,7 +34,8 @@ function unavailable(): never {
 }
 
 function boundedTimeout(value: number): number {
-  return Number.isInteger(value) && value > 0 && value <= MAX_TIMEOUT_MS ? value : DEFAULT_TIMEOUT_MS;
+  if (!Number.isInteger(value) || value <= 0 || value > MAX_TIMEOUT_MS) return unavailable();
+  return value;
 }
 
 function validDescriptor(value: unknown): value is NativeAgentKeyReadinessDescriptor {
@@ -80,7 +80,7 @@ export class WindowsNativeAgentReadiness {
   constructor(private readonly binding: WindowsNativeAgentReadinessBinding = loadNativeBinding()) {}
 
   async validate(capability: object, descriptor: NativeAgentKeyReadinessDescriptor, timeoutMs: number, signal?: AbortSignal): Promise<void> {
-    if (typeof capability !== 'object' || capability === null || !validDescriptor(descriptor)) return unavailable();
+    if (typeof capability !== 'object' || capability === null || !validDescriptor(descriptor) || signal?.aborted) return unavailable();
     try {
       const operation = this.binding.startAgentKeyReadiness(capability, descriptor, boundedTimeout(timeoutMs));
       if (!operation || typeof operation.cancel !== 'function' || !(operation.promise instanceof Promise)) return unavailable();
@@ -89,6 +89,7 @@ export class WindowsNativeAgentReadiness {
       signal?.addEventListener('abort', cancel, { once: true });
       try {
         await operation.promise;
+        if (signal?.aborted) return unavailable();
       } finally {
         signal?.removeEventListener('abort', cancel);
       }

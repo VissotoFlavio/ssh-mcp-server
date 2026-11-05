@@ -36,9 +36,9 @@ export function createWindowsRuntimeProviders(
       ? {}
       : {
           connectionValidationProvider: {
-            async validateConnection(input: unknown) {
+            async validateConnection(input: unknown, signal?: AbortSignal) {
               const selection = validateProfileSelection(input);
-              await validationSession.validate(selection);
+              await validationSession.validate(selection, signal);
               return { profileId: selection.profileId, ready: true as const };
             },
           },

@@ -124,6 +124,7 @@ export class WindowsValidationSession {
       });
       const authorized = await policy.authorize(selection);
       if (authorized.authentication.mode === 'agent-key') {
+        if (remaining() === 0) return unavailable();
         await this.dependencies.agentReadiness.validate(
           capability,
           Object.freeze({ host: authorized.profile.host, port: authorized.profile.port, user: authorized.profile.user }),

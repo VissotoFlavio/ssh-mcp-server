@@ -87,6 +87,11 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
   const testBinding = nativeRequire(testAddonPath) as {
     captureKnownHostsSnapshot(profileId: string): { bytes: Buffer; capability: object };
     disposeKnownHostsSnapshot(capability: unknown): void;
+    startAgentKeyReadiness(
+      capability: object,
+      descriptor: { readonly host: string; readonly port: number; readonly user: string },
+      timeoutMs: number,
+    ): { readonly promise: Promise<void>; readonly cancel: () => void };
     testReadReplacementRace(target: 'state-root' | 'state-leaf' | 'known-hosts-root' | 'known-hosts-leaf'): {
       hookExecuted: boolean;
       replacementError: number;
@@ -180,6 +185,23 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
       assert.equal(testBinding.testSnapshotArtifactCount(), 0);
       assert.throws(() => binding.disposeKnownHostsSnapshot(snapshot.capability), /Windows secure storage is unavailable/u);
       assert.equal(existsSync(sentinel), true);
+    } finally {
+      if (configured) runFixture('cleanup', root);
+    }
+  });
+
+  test('cancellation retains the opaque snapshot until native readiness has reaped its children', async () => {
+    const root = uniqueRoot('snapshot-cancel');
+    let configured = false;
+    try {
+      runFixture('safe', root);
+      configured = true;
+      const snapshot = testBinding.captureKnownHostsSnapshot('production-api');
+      const operation = testBinding.startAgentKeyReadiness(snapshot.capability, { host: 'api.internal.example', port: 22, user: 'deploy' }, 5_000);
+      operation.cancel();
+      assert.throws(() => testBinding.disposeKnownHostsSnapshot(snapshot.capability), /Windows secure storage is unavailable/u);
+      await assert.rejects(operation.promise, /Windows connection validation is unavailable/u);
+      assert.doesNotThrow(() => testBinding.disposeKnownHostsSnapshot(snapshot.capability));
     } finally {
       if (configured) runFixture('cleanup', root);
     }

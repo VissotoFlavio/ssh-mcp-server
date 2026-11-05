@@ -253,7 +253,7 @@ function registerTools(
     ],
   }));
 
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     if (request.params.name === listApprovedProfilesToolName) {
       if (!isEmptyDiscoveryInput(request.params.arguments) || approvedProfileListingProvider === undefined) {
         return unavailableDiscoveryResult();
@@ -280,7 +280,7 @@ function registerTools(
     }
     const startedAt = Date.now();
     try {
-      const outcome = await connectionValidationProvider.validateConnection({ profileId: request.params.arguments.profileId });
+      const outcome = await connectionValidationProvider.validateConnection({ profileId: request.params.arguments.profileId }, extra.signal);
       const safeOutcome = safeValidationOutcome(outcome, request.params.arguments.profileId);
       writeAudit(auditSink, {
         profileId: safeOutcome.profileId,

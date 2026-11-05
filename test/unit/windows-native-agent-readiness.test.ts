@@ -61,3 +61,18 @@ test('forwards cancellation to the native operation and redacts its rejection', 
   await assert.rejects(validation, WindowsNativeAgentReadinessError);
   assert.equal(cancelled, 1);
 });
+
+test('does not start native readiness for an already-aborted signal or expired budget', async () => {
+  let starts = 0;
+  const readiness = new WindowsNativeAgentReadiness({
+    startAgentKeyReadiness: () => {
+      starts += 1;
+      return { promise: Promise.resolve(), cancel: () => undefined };
+    },
+  });
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(() => readiness.validate({}, descriptor, 10_000, controller.signal), WindowsNativeAgentReadinessError);
+  await assert.rejects(() => readiness.validate({}, descriptor, 0), WindowsNativeAgentReadinessError);
+  assert.equal(starts, 0);
+});
