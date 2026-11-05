@@ -51,6 +51,9 @@ jobs:
 
   validate-windows-native:
     runs-on: windows-latest
+    strategy:
+      matrix:
+        node-version: [22.x, 24.x]
 
     steps:
       - name: Check out repository
@@ -59,7 +62,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 24.x
+          node-version: ${{ matrix.node-version }}
           cache: npm
 
       - name: Install dependencies
@@ -70,6 +73,13 @@ jobs:
 
       - name: Build native boundary
         run: npm run build:native
+
+      - name: Require native boundary artifact
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'build/Release/windows_trust.node') -or -not (Test-Path 'build/Release/windows_trust_test.node')) {
+            throw 'The production and test-only Windows native trust boundaries were not built.'
+          }
 
       - name: Validate native Windows boundary
         run: npm test

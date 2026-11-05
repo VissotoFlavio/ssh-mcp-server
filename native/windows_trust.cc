@@ -371,6 +371,13 @@ bool SystemDirectory(std::wstring* value) {
   return IsAbsoluteLocalPath(*value) && IsLocalNtfsPath(*value);
 }
 
+bool IsExpectedOpenSshExecutable(const std::wstring& path) {
+  std::wstring system;
+  if (!SystemDirectory(&system)) return false;
+  const std::wstring directory = system + L"\\OpenSSH";
+  return _wcsicmp(path.c_str(), (directory + L"\\ssh.exe").c_str()) == 0 || _wcsicmp(path.c_str(), (directory + L"\\ssh-add.exe").c_str()) == 0;
+}
+
 bool TrustedOpenSsh(std::wstring* ssh, std::wstring* ssh_add, std::array<DWORD, 4>* version, Handle* retained_system = nullptr, Handle* retained_directory = nullptr, Handle* retained_ssh_add = nullptr) {
   std::wstring system;
   if (!SystemDirectory(&system)) return false;
@@ -381,7 +388,7 @@ bool TrustedOpenSsh(std::wstring* ssh, std::wstring* ssh_add, std::array<DWORD, 
   Handle openssh_handle;
   Handle ssh_handle;
   Handle ssh_add_handle;
-  const bool trusted = OpenTrustedSystemObject(system, true, &system_handle) && OpenTrustedSystemObject(directory, true, &openssh_handle) && OpenTrustedSystemObject(*ssh, false, &ssh_handle) && OpenTrustedSystemObject(*ssh_add, false, &ssh_add_handle) && IsMicrosoftSigned(*ssh) && IsMicrosoftSigned(*ssh_add) && IsSupportedOpenSshVersion(*ssh, version) && IsSupportedOpenSshVersion(*ssh_add, version);
+  const bool trusted = IsExpectedOpenSshExecutable(*ssh) && IsExpectedOpenSshExecutable(*ssh_add) && OpenTrustedSystemObject(system, true, &system_handle) && OpenTrustedSystemObject(directory, true, &openssh_handle) && OpenTrustedSystemObject(*ssh, false, &ssh_handle) && OpenTrustedSystemObject(*ssh_add, false, &ssh_add_handle) && IsMicrosoftSigned(*ssh) && IsMicrosoftSigned(*ssh_add) && IsSupportedOpenSshVersion(*ssh, version) && IsSupportedOpenSshVersion(*ssh_add, version);
   if (trusted) {
     if (retained_system != nullptr) *retained_system = std::move(system_handle);
     if (retained_directory != nullptr) *retained_directory = std::move(openssh_handle);
@@ -420,6 +427,33 @@ bool ReadProtectedFile(const std::wstring& root, const std::wstring& leaf, PSID 
   DWORD bytes_read = 0;
   if (!ReadFile(file_handle.get(), output->data(), static_cast<DWORD>(output->size()), &bytes_read, nullptr) || bytes_read != output->size()) return false;
   return true;
+}
+
+enum class LaunchResult { kCompleted, kTimedOut, kFailed };
+
+LaunchResult LaunchHiddenProcess(const std::wstring& application, std::wstring command, DWORD timeout, DWORD* exit_code) {
+  SECURITY_ATTRIBUTES inheritable{};
+  inheritable.nLength = sizeof(inheritable);
+  inheritable.bInheritHandle = TRUE;
+  Handle nul(CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &inheritable, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+  if (nul.get() == INVALID_HANDLE_VALUE) return LaunchResult::kFailed;
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  startup.dwFlags = STARTF_USESTDHANDLES;
+  startup.hStdInput = nul.get();
+  startup.hStdOutput = nul.get();
+  startup.hStdError = nul.get();
+  PROCESS_INFORMATION process{};
+  if (!CreateProcessW(application.c_str(), command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) return LaunchResult::kFailed;
+  Handle process_handle(process.hProcess);
+  Handle thread_handle(process.hThread);
+  const DWORD wait = WaitForSingleObject(process_handle.get(), timeout);
+  if (wait == WAIT_TIMEOUT) {
+    if (!TerminateProcess(process_handle.get(), 1) || WaitForSingleObject(process_handle.get(), INFINITE) != WAIT_OBJECT_0) return LaunchResult::kFailed;
+    return LaunchResult::kTimedOut;
+  }
+  if (wait != WAIT_OBJECT_0 || !GetExitCodeProcess(process_handle.get(), exit_code)) return LaunchResult::kFailed;
+  return LaunchResult::kCompleted;
 }
 
 bool ReadArgumentString(napi_env env, napi_callback_info info, std::string* value) {
@@ -502,15 +536,10 @@ napi_value ProbeSshAdd(napi_env env, napi_callback_info info) {
   Handle ssh_add_handle;
   if (!TrustedOpenSsh(&ssh, &ssh_add, &version, &system_handle, &openssh_handle, &ssh_add_handle)) return Unavailable(env);
   std::wstring command = L"\"" + ssh_add + L"\" -l";
-  SECURITY_ATTRIBUTES inheritable{}; inheritable.nLength = sizeof(inheritable); inheritable.bInheritHandle = TRUE;
-  Handle nul(CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &inheritable, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
-  if (nul.get() == INVALID_HANDLE_VALUE) return Unavailable(env);
-  STARTUPINFOW startup{}; startup.cb = sizeof(startup); startup.dwFlags = STARTF_USESTDHANDLES; startup.hStdInput = nul.get(); startup.hStdOutput = nul.get(); startup.hStdError = nul.get(); PROCESS_INFORMATION process{};
-  if (!CreateProcessW(ssh_add.c_str(), command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) return Unavailable(env);
-  Handle process_handle(process.hProcess); Handle thread_handle(process.hThread);
-  if (WaitForSingleObject(process_handle.get(), static_cast<DWORD>(timeout)) != WAIT_OBJECT_0) { TerminateProcess(process_handle.get(), 1); return Unavailable(env); }
-  DWORD exit_code = 1; napi_value result{};
-  return GetExitCodeProcess(process_handle.get(), &exit_code) && napi_create_int32(env, static_cast<int32_t>(exit_code), &result) == napi_ok ? result : Unavailable(env);
+  DWORD exit_code = 1;
+  if (LaunchHiddenProcess(ssh_add, std::move(command), static_cast<DWORD>(timeout), &exit_code) != LaunchResult::kCompleted) return Unavailable(env);
+  napi_value result{};
+  return napi_create_int32(env, static_cast<int32_t>(exit_code), &result) == napi_ok ? result : Unavailable(env);
 }
 
 napi_value ReadCredential(napi_env env, napi_callback_info info) {
@@ -531,6 +560,115 @@ napi_value ReadCredential(napi_env env, napi_callback_info info) {
   return status == napi_ok ? result : Unavailable(env);
 }
 
+#ifdef SSH_MCP_NATIVE_TEST
+bool ReadWideArgument(napi_env env, napi_callback_info info, std::wstring* value) {
+  size_t count = 1;
+  napi_value argument{};
+  if (napi_get_cb_info(env, info, &count, &argument, nullptr, nullptr) != napi_ok || count != 1) return false;
+  size_t length = 0;
+  if (napi_get_value_string_utf16(env, argument, nullptr, 0, &length) != napi_ok || length == 0 || length >= 32768) return false;
+  std::vector<char16_t> buffer(length + 1);
+  if (napi_get_value_string_utf16(env, argument, buffer.data(), buffer.size(), &length) != napi_ok) return false;
+  value->assign(reinterpret_cast<const wchar_t*>(buffer.data()), length);
+  return value->find(L'\0') == std::wstring::npos;
+}
+
+napi_value ReplacementRaceResult(napi_env env, bool hook_executed, bool read_succeeded, const char* stage) {
+  napi_value result{};
+  napi_value hook_value{};
+  napi_value read_value{};
+  napi_value stage_value{};
+  if (napi_create_object(env, &result) != napi_ok || napi_get_boolean(env, hook_executed, &hook_value) != napi_ok || napi_get_boolean(env, read_succeeded, &read_value) != napi_ok || napi_create_string_utf8(env, stage, NAPI_AUTO_LENGTH, &stage_value) != napi_ok || napi_set_named_property(env, result, "hookExecuted", hook_value) != napi_ok || napi_set_named_property(env, result, "readSucceeded", read_value) != napi_ok || napi_set_named_property(env, result, "stage", stage_value) != napi_ok) return Unavailable(env);
+  return result;
+}
+
+napi_value TestReadReplacementRace(napi_env env, napi_callback_info info) {
+  size_t count = 0;
+  std::wstring state_root;
+  std::wstring known_hosts_root;
+  std::vector<BYTE> operator_sid;
+  if (napi_get_cb_info(env, info, &count, nullptr, nullptr, nullptr) != napi_ok || count != 0) return Unavailable(env);
+  if (!LoadConfiguration(&state_root, &known_hosts_root, &operator_sid)) return ReplacementRaceResult(env, false, false, "configuration");
+  Handle root_handle(CreateFileW(state_root.c_str(), FILE_READ_ATTRIBUTES | READ_CONTROL, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+  if (root_handle.get() == INVALID_HANDLE_VALUE || !VerifyFile(root_handle.get(), operator_sid.data(), true)) return ReplacementRaceResult(env, false, false, "root-initial");
+  const std::wstring path = state_root + L"\\" + kStateFile;
+  Handle file_handle(CreateFileW(path.c_str(), GENERIC_READ | FILE_READ_ATTRIBUTES | READ_CONTROL, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+  if (file_handle.get() == INVALID_HANDLE_VALUE || !VerifyFile(file_handle.get(), operator_sid.data(), false)) return ReplacementRaceResult(env, false, false, "file-initial");
+  const bool hook_executed = DeleteFileW(path.c_str()) != 0 && MoveFileExW((path + L".replacement").c_str(), path.c_str(), MOVEFILE_WRITE_THROUGH) != 0;
+  if (!hook_executed) return ReplacementRaceResult(env, false, false, "replacement");
+  Handle root_recheck(CreateFileW(state_root.c_str(), FILE_READ_ATTRIBUTES | READ_CONTROL, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+  Handle file_recheck(CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES | READ_CONTROL, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+  if (root_recheck.get() == INVALID_HANDLE_VALUE) return ReplacementRaceResult(env, true, false, "root-reopen");
+  if (file_recheck.get() == INVALID_HANDLE_VALUE) return ReplacementRaceResult(env, true, false, "file-reopen");
+  if (!VerifyDirectoryChain(state_root, operator_sid.data())) return ReplacementRaceResult(env, true, false, "directory-recheck");
+  if (!VerifyFile(root_recheck.get(), operator_sid.data(), true)) return ReplacementRaceResult(env, true, false, "root-recheck");
+  if (!VerifyFile(file_recheck.get(), operator_sid.data(), false)) return ReplacementRaceResult(env, true, false, "file-recheck");
+  if (!SameIdentity(root_handle.get(), root_recheck.get())) return ReplacementRaceResult(env, true, false, "root-identity-mismatch");
+  if (!SameIdentity(file_handle.get(), file_recheck.get())) return ReplacementRaceResult(env, true, false, "file-identity-mismatch");
+  return ReplacementRaceResult(env, true, true, "unexpected-success");
+}
+
+napi_value TestSystemOwnerMismatch(napi_env env, napi_callback_info info) {
+  size_t count = 0;
+  std::wstring system;
+  std::vector<BYTE> operator_sid;
+  std::vector<BYTE> data;
+  if (napi_get_cb_info(env, info, &count, nullptr, nullptr, nullptr) != napi_ok || count != 0 || !SystemDirectory(&system) || !CurrentUserSid(&operator_sid)) return Unavailable(env);
+  const bool read = ReadProtectedFile(system, L"cmd.exe", operator_sid.data(), &data);
+  napi_value result{};
+  return napi_get_boolean(env, read, &result) == napi_ok ? result : Unavailable(env);
+}
+
+napi_value TestUntrustedOpenSshCandidate(napi_env env, napi_callback_info info) {
+  std::wstring candidate;
+  if (!ReadWideArgument(env, info, &candidate)) return Unavailable(env);
+  Handle handle;
+  std::array<DWORD, 4> version{};
+  const bool expected_path = IsExpectedOpenSshExecutable(candidate);
+  const bool trusted_object = OpenTrustedSystemObject(candidate, false, &handle);
+  const bool microsoft_signed = IsMicrosoftSigned(candidate);
+  const bool supported_version = IsSupportedOpenSshVersion(candidate, &version);
+  napi_value result{};
+  napi_value expected_path_value{};
+  napi_value trusted_value{};
+  napi_value signed_value{};
+  napi_value version_value{};
+  if (napi_create_object(env, &result) != napi_ok || napi_get_boolean(env, expected_path, &expected_path_value) != napi_ok || napi_get_boolean(env, trusted_object, &trusted_value) != napi_ok || napi_get_boolean(env, microsoft_signed, &signed_value) != napi_ok || napi_get_boolean(env, supported_version, &version_value) != napi_ok || napi_set_named_property(env, result, "expectedOpenSshPath", expected_path_value) != napi_ok || napi_set_named_property(env, result, "trustedObject", trusted_value) != napi_ok || napi_set_named_property(env, result, "microsoftSigned", signed_value) != napi_ok || napi_set_named_property(env, result, "supportedVersion", version_value) != napi_ok) return Unavailable(env);
+  return result;
+}
+
+napi_value TestLaunch(napi_env env, napi_callback_info info) {
+  size_t count = 2;
+  napi_value arguments[2]{};
+  int32_t timeout = 0;
+  if (napi_get_cb_info(env, info, &count, arguments, nullptr, nullptr) != napi_ok || count != 2 || napi_get_value_int32(env, arguments[1], &timeout) != napi_ok || timeout <= 0 || timeout > 60000) return Unavailable(env);
+  size_t mode_length = 0;
+  if (napi_get_value_string_utf8(env, arguments[0], nullptr, 0, &mode_length) != napi_ok || mode_length > 16) return Unavailable(env);
+  std::vector<char> mode(mode_length + 1);
+  if (napi_get_value_string_utf8(env, arguments[0], mode.data(), mode.size(), &mode_length) != napi_ok) return Unavailable(env);
+  std::wstring system;
+  if (!SystemDirectory(&system)) return Unavailable(env);
+  const std::wstring command_interpreter = system + L"\\cmd.exe";
+  const std::wstring powershell = system + L"\\WindowsPowerShell\\v1.0\\powershell.exe";
+  std::wstring application = command_interpreter;
+  std::wstring command;
+  if (strcmp(mode.data(), "exit") == 0) command = L"\"" + command_interpreter + L"\" /d /c exit 23";
+  else if (strcmp(mode.data(), "hang") == 0) {
+    application = powershell;
+    command = L"\"" + powershell + L"\" -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 30\"";
+  }
+  else return Unavailable(env);
+  DWORD exit_code = 0;
+  const LaunchResult launch = LaunchHiddenProcess(application, std::move(command), static_cast<DWORD>(timeout), &exit_code);
+  napi_value result{};
+  napi_value completed{};
+  napi_value timed_out{};
+  napi_value exit_code_value{};
+  if (launch == LaunchResult::kFailed || napi_create_object(env, &result) != napi_ok || napi_get_boolean(env, launch == LaunchResult::kCompleted, &completed) != napi_ok || napi_get_boolean(env, launch == LaunchResult::kTimedOut, &timed_out) != napi_ok || napi_create_int32(env, static_cast<int32_t>(exit_code), &exit_code_value) != napi_ok || napi_set_named_property(env, result, "completed", completed) != napi_ok || napi_set_named_property(env, result, "timedOut", timed_out) != napi_ok || napi_set_named_property(env, result, "exitCode", exit_code_value) != napi_ok) return Unavailable(env);
+  return result;
+}
+#endif
+
 }  // namespace
 
 NAPI_MODULE_INIT() {
@@ -540,6 +678,12 @@ NAPI_MODULE_INIT() {
     {"resolveOpenSsh", nullptr, ResolveOpenSsh, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"probeSshAdd", nullptr, ProbeSshAdd, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"readCredential", nullptr, ReadCredential, nullptr, nullptr, nullptr, napi_default, nullptr},
+#ifdef SSH_MCP_NATIVE_TEST
+    {"testReadReplacementRace", nullptr, TestReadReplacementRace, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"testSystemOwnerMismatch", nullptr, TestSystemOwnerMismatch, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"testUntrustedOpenSshCandidate", nullptr, TestUntrustedOpenSshCandidate, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"testLaunch", nullptr, TestLaunch, nullptr, nullptr, nullptr, napi_default, nullptr},
+#endif
   };
   if (napi_define_properties(env, exports, sizeof(properties) / sizeof(properties[0]), properties) != napi_ok) return nullptr;
   return exports;
