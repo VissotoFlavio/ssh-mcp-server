@@ -896,7 +896,7 @@ bool StopMaster(Handle* master, const std::wstring& ssh, const std::wstring& con
   }
   if (wait == WAIT_OBJECT_0) return true;
   if (master->get() == INVALID_HANDLE_VALUE || !TerminateProcess(master->get(), 1)) return false;
-  return WaitForSingleObject(master->get(), 1'000) == WAIT_OBJECT_0;
+  return WaitForSingleObject(master->get(), INFINITE) == WAIT_OBJECT_0;
 }
 
 bool ValidateAgentKeyReadiness(SnapshotSession* snapshot, const std::wstring& host, DWORD port, const std::wstring& user, DWORD timeout, const std::atomic<bool>* cancelled = nullptr) {
