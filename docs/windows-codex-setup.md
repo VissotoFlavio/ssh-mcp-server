@@ -15,9 +15,12 @@ Server 2022 or newer, with 64-bit Node.js 22 or newer and Microsoft OpenSSH
 platform, architecture, version, filesystem, or safety failure is unavailable
 rather than partially supported.
 
-The current Windows runtime exposes `list_approved_profiles` only. It does not
-advertise `validate_connection` until native capture of approved known-hosts
-data can be composed with every authentication boundary. A missing tool is a
+The Windows runtime advertises `validate_connection` only when the supported
+native addon, protected profile state, known-hosts snapshot boundary, trusted
+OpenSSH/agent boundary, and Credential Manager boundary are all available.
+It validates only an approved profile identifier; agent-key validation first
+uses the native `ssh-add -l` probe and then a cancellable native no-command
+readiness check. If any prerequisite is unavailable, the tool is omitted as a
 safe fail-closed result, not an invitation to pass hosts, credentials, paths,
 or commands to the MCP server.
 
@@ -175,8 +178,7 @@ opaque `"credentialReference": "os://ssh/<opaque-locator>"`. Create the
 matching Generic Credential in the current user's Windows Credential Manager
 with target name `Vissoto/ssh-mcp-server/<opaque-locator>`. Enter the secret in
 the Credential Manager UI; never use a command line, environment variable,
-profile JSON, or Codex configuration for it. The current runtime does not yet
-offer Windows connection validation for either authentication mode.
+profile JSON, or Codex configuration for it.
 
 ## Register the stdio server with Codex
 
@@ -203,12 +205,12 @@ args = ['D:\path\to\ssh-mcp-server\dist\server.js']
 ```
 
 Restart Codex after changing its MCP configuration, then inspect the server's
-listed tools. On a supported Windows alpha host, the expected tool is
-`list_approved_profiles`; on an unsupported host, no Windows tool is listed.
-If the host is supported but state is missing or unsafe, discovery fails closed
-when called and returns no profile data. Do not run `node dist/server.js`
-interactively to test it: its standard input and output are reserved exclusively
-for MCP JSON-RPC.
+listed tools. On a supported, fully configured Windows alpha host, the expected
+tools are `list_approved_profiles` and `validate_connection`; on an unsupported
+or incompletely configured host, `validate_connection` is omitted. If state is
+missing or unsafe, discovery fails closed when called and returns no profile
+data. Do not run `node dist/server.js` interactively to test it: its standard
+input and output are reserved exclusively for MCP JSON-RPC.
 
 ## Diagnostics and safe operation
 

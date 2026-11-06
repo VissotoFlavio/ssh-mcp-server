@@ -17,7 +17,11 @@ const paths = Object.freeze({
 });
 
 function binding(value: unknown = paths): WindowsOpenSshBinding {
-  return { resolveOpenSsh: () => value as { readonly ssh: string; readonly sshAdd: string; readonly version: string }, probeSshAdd: () => 0 };
+  return {
+    resolveOpenSsh: () => value as { readonly ssh: string; readonly sshAdd: string; readonly version: string },
+    probeSshAdd: () => 0,
+    startSshAddProbe: () => ({ promise: Promise.resolve(true), cancel: () => undefined }),
+  };
 }
 
 test('uses only the pair returned by the native Windows trust boundary', () => {
@@ -37,6 +41,7 @@ test('fails closed when the native executable boundary is malformed or unavailab
           throw new Error('untrusted path');
         },
         probeSshAdd: () => 1,
+        startSshAddProbe: () => ({ promise: Promise.resolve(false), cancel: () => undefined }),
       }).resolve(),
     WindowsOpenSshError,
   );
@@ -56,7 +61,7 @@ test('probes an agent only with the native-verified ssh-add path and fixed argum
   assert.deepEqual(calls, [{ executable: paths.sshAdd, args: ['-l'], timeoutMs: 10_000, verified: true }]);
 });
 
-test('uses the native probe after native verification instead of reopening a path in JavaScript', async () => {
+test('uses the cancellable native probe after native verification instead of reopening a path in JavaScript', async () => {
   let calls = 0;
   const resolver = new WindowsOpenSshResolver({
     resolveOpenSsh: () => paths,
@@ -65,9 +70,51 @@ test('uses the native probe after native verification instead of reopening a pat
       assert.equal(timeoutMs, 1_000);
       return 0;
     },
+    startSshAddProbe: (timeoutMs) => {
+      calls += 1;
+      assert.equal(timeoutMs, 1_000);
+      return { promise: Promise.resolve(true), cancel: () => undefined };
+    },
   });
   assert.equal(await new WindowsSshAddIdentity(resolver, 1_000).isAvailable(), true);
   assert.equal(calls, 1);
+});
+
+test('delegates an abort signal to the native ssh-add probe', async () => {
+  let cancelled = false;
+  let release!: () => void;
+  const controller = new AbortController();
+  const resolver = new WindowsOpenSshResolver({
+    resolveOpenSsh: () => paths,
+    probeSshAdd: () => 0,
+    startSshAddProbe: () => ({
+      promise: new Promise<boolean>((resolve) => {
+        release = () => resolve(false);
+      }),
+      cancel: () => {
+        cancelled = true;
+        release();
+      },
+    }),
+  });
+  const pending = new WindowsSshAddIdentity(resolver, 1_000).isAvailable(controller.signal);
+  controller.abort();
+  assert.equal(await pending, false);
+  assert.equal(cancelled, true);
+});
+
+test('fails closed instead of extending an exhausted ssh-add budget', async () => {
+  let started = false;
+  const resolver = new WindowsOpenSshResolver({
+    resolveOpenSsh: () => paths,
+    probeSshAdd: () => 0,
+    startSshAddProbe: () => {
+      started = true;
+      return { promise: Promise.resolve(true), cancel: () => undefined };
+    },
+  });
+  assert.equal(await new WindowsSshAddIdentity(resolver, 0).isAvailable(), false);
+  assert.equal(started, false);
 });
 
 test('fails closed when agent probing throws or returns a non-zero status', async () => {

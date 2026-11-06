@@ -45,6 +45,11 @@ bool g_test_openssh_replacement_move_attempted = false;
 bool g_test_openssh_replacement_succeeded = false;
 bool g_test_openssh_force_unexpected_replacement_error = false;
 DWORD g_test_openssh_replacement_error = ERROR_SUCCESS;
+std::atomic<bool> g_test_force_master_reap_timeout{false};
+HANDLE g_test_deferred_reaper_gate = nullptr;
+HANDLE g_test_master_started_gate = nullptr;
+bool g_test_deferred_reaper_completed = false;
+napi_deferred g_test_deferred_reaper_completion = nullptr;
 #endif
 
 class Handle final {
@@ -622,6 +627,7 @@ class SnapshotSession final {
   }
 
   void Release() { busy_.store(false); }
+  bool busy() const { return busy_.load(); }
 
   bool ReadyKnownHostsPath(std::wstring* path, std::wstring* directory) const {
     if (!IsValidCapability() || !parent_identity_known_ || !directory_identity_known_ || !file_identity_known_ ||
@@ -766,14 +772,14 @@ LaunchResult LaunchHiddenProcess(const std::wstring& application, std::wstring c
     if (wait == WAIT_OBJECT_0 || wait == WAIT_FAILED) break;
   }
   if (wait == WAIT_TIMEOUT || (cancelled != nullptr && cancelled->load())) {
-    if (!TerminateProcess(process_handle.get(), 1) || WaitForSingleObject(process_handle.get(), INFINITE) != WAIT_OBJECT_0) return LaunchResult::kFailed;
+    if (!TerminateProcess(process_handle.get(), 1) || WaitForSingleObject(process_handle.get(), 1'000) != WAIT_OBJECT_0) return LaunchResult::kFailed;
     return LaunchResult::kTimedOut;
   }
   if (wait != WAIT_OBJECT_0 || !GetExitCodeProcess(process_handle.get(), exit_code)) return LaunchResult::kFailed;
   return LaunchResult::kCompleted;
 }
 
-LaunchResult ProbeTrustedOpenSsh(DWORD timeout, DWORD* exit_code) {
+LaunchResult ProbeTrustedOpenSsh(DWORD timeout, DWORD* exit_code, const std::atomic<bool>* cancelled = nullptr) {
   std::wstring ssh;
   std::wstring ssh_add;
   std::array<DWORD, 4> version{};
@@ -785,7 +791,7 @@ LaunchResult ProbeTrustedOpenSsh(DWORD timeout, DWORD* exit_code) {
   if (g_test_openssh_pre_launch != nullptr && !g_test_openssh_pre_launch(ssh_add)) return LaunchResult::kFailed;
 #endif
   std::wstring command = L"\"" + ssh_add + L"\" -l";
-  return LaunchHiddenProcess(ssh_add, std::move(command), timeout, exit_code);
+  return LaunchHiddenProcess(ssh_add, std::move(command), timeout, exit_code, cancelled);
 }
 
 bool StartHiddenProcess(const std::wstring& application, std::wstring command, Handle* process_handle) {
@@ -804,6 +810,9 @@ bool StartHiddenProcess(const std::wstring& application, std::wstring command, H
   if (!CreateProcessW(application.c_str(), command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) return false;
   CloseHandle(process.hThread);
   *process_handle = Handle(process.hProcess);
+#ifdef SSH_MCP_NATIVE_TEST
+  if (g_test_master_started_gate != nullptr) SetEvent(g_test_master_started_gate);
+#endif
   return true;
 }
 
@@ -884,7 +893,7 @@ bool ReadReadinessDescriptor(napi_env env, napi_value descriptor, std::wstring* 
   return true;
 }
 
-bool StopMaster(Handle* master, const std::wstring& ssh, const std::wstring& control_path, const std::wstring& destination, DWORD timeout, const std::atomic<bool>* cancelled = nullptr) {
+bool StopMaster(Handle* master, const std::wstring& ssh, const std::wstring& control_path, const std::wstring& destination, DWORD timeout, const std::atomic<bool>* cancelled = nullptr, Handle* unreaped = nullptr) {
   const ULONGLONG deadline = GetTickCount64() + timeout;
   DWORD ignored = 1;
   const std::vector<std::wstring> exit_arguments = {L"-F", L"none", L"-S", control_path, L"-O", L"exit", L"--", destination};
@@ -896,10 +905,21 @@ bool StopMaster(Handle* master, const std::wstring& ssh, const std::wstring& con
   }
   if (wait == WAIT_OBJECT_0) return true;
   if (master->get() == INVALID_HANDLE_VALUE || !TerminateProcess(master->get(), 1)) return false;
-  return WaitForSingleObject(master->get(), INFINITE) == WAIT_OBJECT_0;
+#ifdef SSH_MCP_NATIVE_TEST
+  if (g_test_force_master_reap_timeout.load()) {
+    if (unreaped != nullptr) *unreaped = std::move(*master);
+    return false;
+  }
+#endif
+  if (WaitForSingleObject(master->get(), 1'000) == WAIT_OBJECT_0) return true;
+  if (unreaped != nullptr) *unreaped = std::move(*master);
+  return false;
 }
 
-bool ValidateAgentKeyReadiness(SnapshotSession* snapshot, const std::wstring& host, DWORD port, const std::wstring& user, DWORD timeout, const std::atomic<bool>* cancelled = nullptr) {
+struct NativeReadinessResult final { bool ready = false; Handle unreaped_master; };
+
+NativeReadinessResult ValidateAgentKeyReadiness(SnapshotSession* snapshot, const std::wstring& host, DWORD port, const std::wstring& user, DWORD timeout, const std::atomic<bool>* cancelled = nullptr) {
+  NativeReadinessResult result;
   std::wstring known_hosts;
   std::wstring snapshot_directory;
   std::wstring ssh;
@@ -909,7 +929,7 @@ bool ValidateAgentKeyReadiness(SnapshotSession* snapshot, const std::wstring& ho
   Handle openssh_handle;
   Handle ssh_add_handle;
   Handle ssh_handle;
-  if ((cancelled != nullptr && cancelled->load()) || !snapshot->ReadyKnownHostsPath(&known_hosts, &snapshot_directory) || !TrustedOpenSsh(&ssh, &ssh_add, &version, &system_handle, &openssh_handle, &ssh_add_handle, &ssh_handle)) return false;
+  if ((cancelled != nullptr && cancelled->load()) || !snapshot->ReadyKnownHostsPath(&known_hosts, &snapshot_directory) || !TrustedOpenSsh(&ssh, &ssh_add, &version, &system_handle, &openssh_handle, &ssh_add_handle, &ssh_handle)) return result;
   const std::wstring control_path = snapshot_directory + L"\\control";
   const std::wstring destination = user + L"@" + host;
   const std::vector<std::wstring> master_arguments = {
@@ -919,7 +939,7 @@ bool ValidateAgentKeyReadiness(SnapshotSession* snapshot, const std::wstring& ho
       L"-o", L"GlobalKnownHostsFile=NUL", L"-o", L"PasswordAuthentication=no", L"-o", L"KbdInteractiveAuthentication=no",
       L"-o", L"NumberOfPasswordPrompts=0", L"-o", L"IdentitiesOnly=yes", L"-p", std::to_wstring(port), L"--", destination};
   Handle master;
-  if (!StartHiddenProcess(ssh, FixedCommandLine(ssh, master_arguments), &master)) return false;
+  if (!StartHiddenProcess(ssh, FixedCommandLine(ssh, master_arguments), &master)) return result;
   const ULONGLONG started = GetTickCount64();
   bool ready = false;
   while ((cancelled == nullptr || !cancelled->load()) && GetTickCount64() - started < timeout) {
@@ -935,7 +955,8 @@ bool ValidateAgentKeyReadiness(SnapshotSession* snapshot, const std::wstring& ho
   }
   const ULONGLONG elapsed = GetTickCount64() - started;
   const DWORD cleanup = elapsed < timeout ? static_cast<DWORD>(timeout - elapsed) : 0;
-  return StopMaster(&master, ssh, control_path, destination, cleanup, cancelled) && ready && (cancelled == nullptr || !cancelled->load());
+  result.ready = StopMaster(&master, ssh, control_path, destination, cleanup, cancelled, &result.unreaped_master) && ready && (cancelled == nullptr || !cancelled->load());
+  return result;
 }
 
 bool ReadArgumentString(napi_env env, napi_callback_info info, std::string* value) {
@@ -1047,24 +1068,14 @@ napi_value DisposeKnownHostsSnapshot(napi_env env, napi_callback_info info) {
   return napi_get_undefined(env, &result) == napi_ok ? result : Unavailable(env);
 }
 
-napi_value ValidateNativeAgentKeyReadiness(napi_env env, napi_callback_info info) {
-  size_t count = 3;
-  napi_value arguments[3]{};
+napi_value IsKnownHostsSnapshotBusy(napi_env env, napi_callback_info info) {
   SnapshotSession* snapshot = nullptr;
-  int32_t timeout = 0;
-  std::wstring host;
-  std::wstring user;
-  DWORD port = 0;
-  if (napi_get_cb_info(env, info, &count, arguments, nullptr, nullptr) != napi_ok || count != 3 ||
-      !ReadSnapshotCapabilityValue(env, arguments[0], &snapshot) || !ReadReadinessDescriptor(env, arguments[1], &host, &port, &user) ||
-      napi_get_value_int32(env, arguments[2], &timeout) != napi_ok || timeout <= 0 || timeout > 60000 ||
-      !ValidateAgentKeyReadiness(snapshot, host, port, user, static_cast<DWORD>(timeout)))
-    return Unavailable(env);
+  if (!ReadSnapshotCapability(env, info, &snapshot)) return Unavailable(env);
   napi_value result{};
-  return napi_get_undefined(env, &result) == napi_ok ? result : Unavailable(env);
+  return napi_get_boolean(env, snapshot->busy(), &result) == napi_ok ? result : Unavailable(env);
 }
 
-struct AgentReadinessCancellation final { std::atomic<bool> requested{false}; };
+struct NativeCancellation final { std::atomic<bool> requested{false}; };
 struct AgentReadinessWork final {
   napi_env env;
   napi_async_work work = nullptr;
@@ -1075,19 +1086,115 @@ struct AgentReadinessWork final {
   std::wstring user;
   DWORD port = 0;
   DWORD timeout = 0;
-  std::shared_ptr<AgentReadinessCancellation> cancellation;
+  std::shared_ptr<NativeCancellation> cancellation;
   bool succeeded = false;
+  Handle unreaped_master;
 };
 
 void ExecuteAgentReadiness(napi_env, void* data) {
   auto* job = static_cast<AgentReadinessWork*>(data);
-  job->succeeded = !job->cancellation->requested.load() && ValidateAgentKeyReadiness(job->snapshot, job->host, job->port, job->user, job->timeout, &job->cancellation->requested);
+  if (job->cancellation->requested.load()) return;
+  NativeReadinessResult result = ValidateAgentKeyReadiness(job->snapshot, job->host, job->port, job->user, job->timeout, &job->cancellation->requested);
+  job->succeeded = result.ready;
+  job->unreaped_master = std::move(result.unreaped_master);
+}
+
+struct DeferredReaperWork final {
+  napi_threadsafe_function completion = nullptr;
+  HANDLE wait_registration = nullptr;
+  napi_ref snapshot_reference = nullptr;
+  SnapshotSession* snapshot = nullptr;
+  Handle child;
+};
+
+// This callback runs on the Windows thread-pool, rather than a libuv worker.
+// It never touches N-API directly; the threadsafe function below transfers
+// final ownership back to the JS thread after the child is confirmed exited.
+VOID CALLBACK DeferredReaperWaitCallback(PVOID data, BOOLEAN) {
+  auto* reaper = static_cast<DeferredReaperWork*>(data);
+#ifdef SSH_MCP_NATIVE_TEST
+  if (g_test_deferred_reaper_gate != nullptr) WaitForSingleObject(g_test_deferred_reaper_gate, INFINITE);
+#endif
+  // A failed queue must retain the busy lease and reference for process
+  // lifetime: releasing a snapshot before this child is known dead is unsafe.
+  napi_call_threadsafe_function(reaper->completion, nullptr, napi_tsfn_nonblocking);
+}
+
+void CompleteDeferredReaper(napi_env env, napi_value, void* data, void*) {
+  std::unique_ptr<DeferredReaperWork> reaper(static_cast<DeferredReaperWork*>(data));
+  reaper->snapshot->Release();
+  // The surrounding TypeScript finally deliberately left this capability busy.
+  // Its native owner must now complete its deterministic cleanup itself.
+  if (!reaper->snapshot->Dispose()) {
+    // Cleanup uncertainty is fail-closed: retain the capability reference and
+    // reacquire its lease for process lifetime rather than allow finalization
+    // to race an unverified retry.
+    reaper->snapshot->Acquire();
+    if (reaper->completion != nullptr) napi_release_threadsafe_function(reaper->completion, napi_tsfn_release);
+    reaper.release();
+    return;
+  }
+  if (reaper->snapshot_reference != nullptr) napi_delete_reference(env, reaper->snapshot_reference);
+#ifdef SSH_MCP_NATIVE_TEST
+  g_test_deferred_reaper_completed = true;
+  if (g_test_deferred_reaper_completion != nullptr) {
+    napi_value result{};
+    napi_get_undefined(env, &result);
+    napi_resolve_deferred(env, g_test_deferred_reaper_completion, result);
+    g_test_deferred_reaper_completion = nullptr;
+  }
+#endif
+  if (reaper->completion != nullptr) napi_release_threadsafe_function(reaper->completion, napi_tsfn_release);
+}
+
+napi_value DeferredReaperNoop(napi_env env, napi_callback_info) {
+  napi_value value{};
+  return napi_get_undefined(env, &value) == napi_ok ? value : nullptr;
+}
+
+bool ScheduleDeferredReaper(napi_env env, std::unique_ptr<DeferredReaperWork>& reaper) {
+  napi_value name{};
+  napi_value callback{};
+  if (napi_create_string_utf8(env, "sshMcpDeferredReaper", NAPI_AUTO_LENGTH, &name) != napi_ok ||
+      napi_create_function(env, "reap", NAPI_AUTO_LENGTH, DeferredReaperNoop, nullptr, &callback) != napi_ok ||
+      napi_create_threadsafe_function(env, callback, nullptr, name, 0, 1, nullptr, nullptr, reaper.get(), CompleteDeferredReaper, &reaper->completion) != napi_ok) {
+    return false;
+  }
+  if (!RegisterWaitForSingleObject(&reaper->wait_registration, reaper->child.get(), DeferredReaperWaitCallback, reaper.get(), INFINITE, WT_EXECUTEONLYONCE)) {
+    napi_release_threadsafe_function(reaper->completion, napi_tsfn_abort);
+    reaper->completion = nullptr;
+    return false;
+  }
+  reaper.release();
+  return true;
 }
 
 void CompleteAgentReadiness(napi_env env, napi_status, void* data) {
   std::unique_ptr<AgentReadinessWork> job(static_cast<AgentReadinessWork*>(data));
-  job->snapshot->Release();
-  if (job->snapshot_reference != nullptr) napi_delete_reference(env, job->snapshot_reference);
+  bool deferred = false;
+  if (job->unreaped_master.get() != INVALID_HANDLE_VALUE) {
+    auto reaper = std::make_unique<DeferredReaperWork>();
+    reaper->snapshot = job->snapshot;
+    reaper->snapshot_reference = job->snapshot_reference;
+    reaper->child = std::move(job->unreaped_master);
+    if (ScheduleDeferredReaper(env, reaper)) {
+      job->snapshot_reference = nullptr;
+      deferred = true;
+    } else {
+      // Preserve the busy lease and reference for process lifetime rather than
+      // releasing a snapshot which an unreaped child can still read.
+      // ScheduleDeferredReaper leaves its input intact on failure. Retain the
+      // child, reference and busy lease for process lifetime rather than
+      // risking early snapshot release.
+      reaper.release();
+      job->snapshot_reference = nullptr;
+      deferred = true;
+    }
+  }
+  if (!deferred) {
+    job->snapshot->Release();
+    if (job->snapshot_reference != nullptr) napi_delete_reference(env, job->snapshot_reference);
+  }
   if (job->work != nullptr) napi_delete_async_work(env, job->work);
   if (job->succeeded && !job->cancellation->requested.load()) {
     napi_value result{};
@@ -1102,13 +1209,13 @@ void CompleteAgentReadiness(napi_env env, napi_status, void* data) {
   }
 }
 
-void FinalizeAgentReadinessCancellation(napi_env, void* data, void*) { delete static_cast<std::shared_ptr<AgentReadinessCancellation>*>(data); }
+void FinalizeAgentReadinessCancellation(napi_env, void* data, void*) { delete static_cast<std::shared_ptr<NativeCancellation>*>(data); }
 
 napi_value CancelAgentReadiness(napi_env env, napi_callback_info info) {
   void* data = nullptr;
   size_t count = 0;
   if (napi_get_cb_info(env, info, &count, nullptr, nullptr, &data) != napi_ok || data == nullptr) return Unavailable(env);
-  static_cast<std::shared_ptr<AgentReadinessCancellation>*>(data)->get()->requested.store(true);
+  static_cast<std::shared_ptr<NativeCancellation>*>(data)->get()->requested.store(true);
   napi_value result{};
   return napi_get_undefined(env, &result) == napi_ok ? result : Unavailable(env);
 }
@@ -1122,12 +1229,12 @@ napi_value StartNativeAgentKeyReadiness(napi_env env, napi_callback_info info) {
   if (napi_get_cb_info(env, info, &count, arguments, nullptr, nullptr) != napi_ok || count != 3 || !ReadSnapshotCapabilityValue(env, arguments[0], &job->snapshot) || !job->snapshot->Acquire()) return Unavailable(env);
   if (!ReadReadinessDescriptor(env, arguments[1], &job->host, &job->port, &job->user) || napi_get_value_int32(env, arguments[2], &timeout) != napi_ok || timeout <= 0 || timeout > 60000) { job->snapshot->Release(); return Unavailable(env); }
   job->timeout = static_cast<DWORD>(timeout);
-  job->cancellation = std::make_shared<AgentReadinessCancellation>();
+  job->cancellation = std::make_shared<NativeCancellation>();
   napi_value promise{};
   napi_value resource_name{};
   napi_value cancel{};
   napi_value result{};
-  auto cancellation_handle = std::make_unique<std::shared_ptr<AgentReadinessCancellation>>(job->cancellation);
+  auto cancellation_handle = std::make_unique<std::shared_ptr<NativeCancellation>>(job->cancellation);
   if (napi_create_promise(env, &job->deferred, &promise) != napi_ok || napi_create_string_utf8(env, "sshMcpAgentReadiness", NAPI_AUTO_LENGTH, &resource_name) != napi_ok || napi_create_function(env, "cancel", NAPI_AUTO_LENGTH, CancelAgentReadiness, cancellation_handle.get(), &cancel) != napi_ok) { job->snapshot->Release(); return Unavailable(env); }
   if (napi_add_finalizer(env, cancel, cancellation_handle.get(), FinalizeAgentReadinessCancellation, nullptr, nullptr) != napi_ok) { job->snapshot->Release(); return Unavailable(env); }
   cancellation_handle.release();
@@ -1145,6 +1252,81 @@ napi_value StartNativeAgentKeyReadiness(napi_env env, napi_callback_info info) {
     napi_delete_reference(env, job->snapshot_reference);
     job->snapshot_reference = nullptr;
     job->snapshot->Release();
+    return Unavailable(env);
+  }
+  job.release();
+  return result;
+}
+
+// The ssh-add identity gate is deliberately native and asynchronous. It keeps
+// the same verified OpenSSH chain through launch, and cancellation reaches the
+// actual hidden child instead of merely racing a JS-side synchronous call.
+struct SshAddProbeWork final {
+  napi_env env;
+  napi_async_work work = nullptr;
+  napi_deferred deferred = nullptr;
+  DWORD timeout = 0;
+  std::shared_ptr<NativeCancellation> cancellation;
+  bool available = false;
+};
+
+void ExecuteSshAddProbe(napi_env, void* data) {
+  auto* job = static_cast<SshAddProbeWork*>(data);
+  if (job->cancellation->requested.load()) return;
+  DWORD exit_code = 1;
+  const LaunchResult probe = ProbeTrustedOpenSsh(job->timeout, &exit_code, &job->cancellation->requested);
+  job->available = probe == LaunchResult::kCompleted && exit_code == 0 && !job->cancellation->requested.load();
+}
+
+void CompleteSshAddProbe(napi_env env, napi_status, void* data) {
+  std::unique_ptr<SshAddProbeWork> job(static_cast<SshAddProbeWork*>(data));
+  if (job->work != nullptr) napi_delete_async_work(env, job->work);
+  if (job->cancellation->requested.load()) {
+    napi_value message{};
+    napi_value error{};
+    napi_create_string_utf8(env, "Windows OpenSSH is unavailable", NAPI_AUTO_LENGTH, &message);
+    napi_create_error(env, nullptr, message, &error);
+    napi_reject_deferred(env, job->deferred, error);
+    return;
+  }
+  napi_value available{};
+  if (napi_get_boolean(env, job->available, &available) != napi_ok) {
+    napi_value message{};
+    napi_value error{};
+    napi_create_string_utf8(env, "Windows OpenSSH is unavailable", NAPI_AUTO_LENGTH, &message);
+    napi_create_error(env, nullptr, message, &error);
+    napi_reject_deferred(env, job->deferred, error);
+    return;
+  }
+  napi_resolve_deferred(env, job->deferred, available);
+}
+
+napi_value StartSshAddProbe(napi_env env, napi_callback_info info) {
+  size_t count = 1;
+  napi_value argument{};
+  int32_t timeout = 0;
+  if (napi_get_cb_info(env, info, &count, &argument, nullptr, nullptr) != napi_ok || count != 1 ||
+      napi_get_value_int32(env, argument, &timeout) != napi_ok || timeout <= 0 || timeout > 60000) return Unavailable(env);
+  auto job = std::make_unique<SshAddProbeWork>();
+  job->env = env;
+  job->timeout = static_cast<DWORD>(timeout);
+  job->cancellation = std::make_shared<NativeCancellation>();
+  napi_value promise{};
+  napi_value resource_name{};
+  napi_value cancel{};
+  napi_value result{};
+  auto cancellation_handle = std::make_unique<std::shared_ptr<NativeCancellation>>(job->cancellation);
+  if (napi_create_promise(env, &job->deferred, &promise) != napi_ok ||
+      napi_create_string_utf8(env, "sshMcpSshAddProbe", NAPI_AUTO_LENGTH, &resource_name) != napi_ok ||
+      napi_create_function(env, "cancel", NAPI_AUTO_LENGTH, CancelAgentReadiness, cancellation_handle.get(), &cancel) != napi_ok) return Unavailable(env);
+  if (napi_add_finalizer(env, cancel, cancellation_handle.get(), FinalizeAgentReadinessCancellation, nullptr, nullptr) != napi_ok) return Unavailable(env);
+  cancellation_handle.release();
+  if (napi_create_object(env, &result) != napi_ok || napi_set_named_property(env, result, "promise", promise) != napi_ok ||
+      napi_set_named_property(env, result, "cancel", cancel) != napi_ok) return Unavailable(env);
+  if (napi_create_async_work(env, nullptr, resource_name, ExecuteSshAddProbe, CompleteSshAddProbe, job.get(), &job->work) != napi_ok) return Unavailable(env);
+  if (napi_queue_async_work(env, job->work) != napi_ok) {
+    napi_delete_async_work(env, job->work);
+    job->work = nullptr;
     return Unavailable(env);
   }
   job.release();
@@ -1275,6 +1457,53 @@ napi_value TestReadinessDescriptor(napi_env env, napi_callback_info info) {
   if (napi_get_cb_info(env, info, &count, &descriptor, nullptr, nullptr) != napi_ok || count != 1) return Unavailable(env);
   napi_value result{};
   return napi_get_boolean(env, ReadReadinessDescriptor(env, descriptor, &host, &port, &user), &result) == napi_ok ? result : Unavailable(env);
+}
+
+napi_value TestBlockDeferredReaper(napi_env env, napi_callback_info info) {
+  size_t count = 0;
+  if (napi_get_cb_info(env, info, &count, nullptr, nullptr, nullptr) != napi_ok || count != 0) return Unavailable(env);
+  if (g_test_deferred_reaper_gate != nullptr) CloseHandle(g_test_deferred_reaper_gate);
+  if (g_test_master_started_gate != nullptr) CloseHandle(g_test_master_started_gate);
+  g_test_deferred_reaper_gate = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  g_test_master_started_gate = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  g_test_deferred_reaper_completed = false;
+  g_test_deferred_reaper_completion = nullptr;
+  g_test_force_master_reap_timeout.store(g_test_deferred_reaper_gate != nullptr && g_test_master_started_gate != nullptr);
+  napi_value result{};
+  return g_test_force_master_reap_timeout.load() && napi_get_undefined(env, &result) == napi_ok ? result : Unavailable(env);
+}
+
+napi_value TestReleaseDeferredReaper(napi_env env, napi_callback_info info) {
+  size_t count = 0;
+  if (napi_get_cb_info(env, info, &count, nullptr, nullptr, nullptr) != napi_ok || count != 0 || g_test_deferred_reaper_gate == nullptr || !SetEvent(g_test_deferred_reaper_gate)) return Unavailable(env);
+  g_test_force_master_reap_timeout.store(false);
+  napi_value result{};
+  return napi_get_undefined(env, &result) == napi_ok ? result : Unavailable(env);
+}
+
+napi_value TestWaitForMasterStarted(napi_env env, napi_callback_info info) {
+  size_t count = 1;
+  napi_value argument{};
+  int32_t timeout = 0;
+  if (napi_get_cb_info(env, info, &count, &argument, nullptr, nullptr) != napi_ok || count != 1 ||
+      napi_get_value_int32(env, argument, &timeout) != napi_ok || timeout <= 0 || timeout > 5000 || g_test_master_started_gate == nullptr) return Unavailable(env);
+  napi_value result{};
+  return napi_get_boolean(env, WaitForSingleObject(g_test_master_started_gate, static_cast<DWORD>(timeout)) == WAIT_OBJECT_0, &result) == napi_ok ? result : Unavailable(env);
+}
+
+napi_value TestDeferredReaperCompletion(napi_env env, napi_callback_info info) {
+  size_t count = 0;
+  if (napi_get_cb_info(env, info, &count, nullptr, nullptr, nullptr) != napi_ok || count != 0 || g_test_deferred_reaper_completion != nullptr) return Unavailable(env);
+  napi_value promise{};
+  napi_deferred deferred{};
+  if (napi_create_promise(env, &deferred, &promise) != napi_ok) return Unavailable(env);
+  if (g_test_deferred_reaper_completed) {
+    napi_value result{};
+    if (napi_get_undefined(env, &result) != napi_ok || napi_resolve_deferred(env, deferred, result) != napi_ok) return Unavailable(env);
+    return promise;
+  }
+  g_test_deferred_reaper_completion = deferred;
+  return promise;
 }
 
 napi_value ReplacementRaceResult(napi_env env, bool hook_executed, DWORD replacement_error, bool read_succeeded, const char* stage) {
@@ -1469,10 +1698,11 @@ NAPI_MODULE_INIT() {
     {"readKnownHosts", nullptr, ReadKnownHosts, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"captureKnownHostsSnapshot", nullptr, CaptureKnownHostsSnapshot, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"disposeKnownHostsSnapshot", nullptr, DisposeKnownHostsSnapshot, nullptr, nullptr, nullptr, napi_default, nullptr},
-    {"validateAgentKeyReadiness", nullptr, ValidateNativeAgentKeyReadiness, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"isKnownHostsSnapshotBusy", nullptr, IsKnownHostsSnapshotBusy, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"startAgentKeyReadiness", nullptr, StartNativeAgentKeyReadiness, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"resolveOpenSsh", nullptr, ResolveOpenSsh, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"probeSshAdd", nullptr, ProbeSshAdd, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"startSshAddProbe", nullptr, StartSshAddProbe, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"readCredential", nullptr, ReadCredential, nullptr, nullptr, nullptr, napi_default, nullptr},
 #ifdef SSH_MCP_NATIVE_TEST
     {"testReadReplacementRace", nullptr, TestReadReplacementRace, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -1487,6 +1717,10 @@ NAPI_MODULE_INIT() {
     {"testSnapshotArtifactCount", nullptr, TestSnapshotArtifactCount, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"testFinalizeSnapshotCapability", nullptr, TestFinalizeSnapshotCapability, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"testReadinessDescriptor", nullptr, TestReadinessDescriptor, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"testBlockDeferredReaper", nullptr, TestBlockDeferredReaper, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"testReleaseDeferredReaper", nullptr, TestReleaseDeferredReaper, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"testWaitForMasterStarted", nullptr, TestWaitForMasterStarted, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"testDeferredReaperCompletion", nullptr, TestDeferredReaperCompletion, nullptr, nullptr, nullptr, napi_default, nullptr},
 #endif
   };
   if (napi_define_properties(env, exports, sizeof(properties) / sizeof(properties[0]), properties) != napi_ok) return nullptr;

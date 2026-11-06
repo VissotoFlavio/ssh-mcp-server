@@ -17,17 +17,18 @@ export interface WindowsOpenSshPaths {
 export interface WindowsOpenSshBinding {
   resolveOpenSsh(): WindowsOpenSshPaths;
   probeSshAdd(timeoutMs: number): number;
+  startSshAddProbe(timeoutMs: number): { readonly promise: Promise<boolean>; readonly cancel: () => void };
 }
 
 export interface WindowsOpenSshCommandRunner {
-  run(executable: string, args: readonly string[], timeoutMs: number, verifyBeforeLaunch?: () => string): Promise<number>;
+  run(executable: string, args: readonly string[], timeoutMs: number, verifyBeforeLaunch?: () => string, signal?: AbortSignal): Promise<number>;
 }
 
-const DEFAULT_TIMEOUT_MS = 10_000;
 const MAX_TIMEOUT_MS = 60_000;
 
 function boundedTimeout(timeoutMs: number): number {
-  return Number.isInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= MAX_TIMEOUT_MS ? timeoutMs : DEFAULT_TIMEOUT_MS;
+  if (!Number.isInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > MAX_TIMEOUT_MS) return unavailable();
+  return timeoutMs;
 }
 
 /**
@@ -35,7 +36,7 @@ function boundedTimeout(timeoutMs: number): number {
  * It discards all child output and never accepts shell options from callers.
  */
 export class DirectWindowsOpenSshCommandRunner implements WindowsOpenSshCommandRunner {
-  run(executable: string, args: readonly string[], timeoutMs: number, verifyBeforeLaunch?: () => string): Promise<number> {
+  run(executable: string, args: readonly string[], timeoutMs: number, verifyBeforeLaunch?: () => string, signal?: AbortSignal): Promise<number> {
     return new Promise((resolve, reject) => {
       try {
         if (verifyBeforeLaunch !== undefined && verifyBeforeLaunch() !== executable) return reject(new WindowsOpenSshError());
@@ -64,8 +65,12 @@ export class DirectWindowsOpenSshCommandRunner implements WindowsOpenSshCommandR
       const deadline = setTimeout(() => {
         stop();
       }, boundedTimeout(timeoutMs));
+      const onAbort = () => stop();
+      if (signal?.aborted) return settle(() => reject(new WindowsOpenSshError()));
+      signal?.addEventListener('abort', onAbort, { once: true });
       child.once('error', () => settle(() => reject(new WindowsOpenSshError())));
       child.once('close', (code) => {
+        signal?.removeEventListener('abort', onAbort);
         settle(() => resolve(code ?? 1));
       });
     });
@@ -126,7 +131,8 @@ function loadNativeBinding(): WindowsOpenSshBinding {
     typeof candidate !== 'object' ||
     candidate === null ||
     typeof (candidate as { resolveOpenSsh?: unknown }).resolveOpenSsh !== 'function' ||
-    typeof (candidate as { probeSshAdd?: unknown }).probeSshAdd !== 'function'
+    typeof (candidate as { probeSshAdd?: unknown }).probeSshAdd !== 'function' ||
+    typeof (candidate as { startSshAddProbe?: unknown }).startSshAddProbe !== 'function'
   ) {
     return unavailable();
   }
@@ -161,6 +167,25 @@ export class WindowsOpenSshResolver implements OpenSshExecutableResolver {
       return unavailable();
     }
   }
+
+  async probeSshAddAsync(timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
+    if (signal?.aborted) return unavailable();
+    try {
+      const operation = this.binding.startSshAddProbe(boundedTimeout(timeoutMs));
+      if (!operation || typeof operation.cancel !== 'function' || !(operation.promise instanceof Promise)) return unavailable();
+      const cancel = () => operation.cancel();
+      signal?.addEventListener('abort', cancel, { once: true });
+      try {
+        const available = await operation.promise;
+        if (signal?.aborted || typeof available !== 'boolean') return unavailable();
+        return available;
+      } finally {
+        signal?.removeEventListener('abort', cancel);
+      }
+    } catch {
+      return unavailable();
+    }
+  }
 }
 
 /** Probes the agent through the verified ssh-add executable without exposing key material. */
@@ -171,11 +196,12 @@ export class WindowsSshAddIdentity {
     private readonly commands: WindowsOpenSshCommandRunner = new DirectWindowsOpenSshCommandRunner(),
   ) {}
 
-  async isAvailable(): Promise<boolean> {
+  async isAvailable(signal?: AbortSignal): Promise<boolean> {
     try {
       return this.commands instanceof DirectWindowsOpenSshCommandRunner
-        ? this.resolver.probeSshAdd(this.timeoutMs) === 0
-        : (await this.commands.run(this.resolver.paths().sshAdd, ['-l'], this.timeoutMs, () => this.resolver.paths().sshAdd)) === 0;
+        ? await this.resolver.probeSshAddAsync(this.timeoutMs, signal)
+        : (await this.commands.run(this.resolver.paths().sshAdd, ['-l'], this.timeoutMs, () => this.resolver.paths().sshAdd, signal)) === 0 &&
+            !signal?.aborted;
     } catch {
       return false;
     }

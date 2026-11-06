@@ -14,6 +14,7 @@ export interface WindowsTrustBinding {
   readKnownHosts(profileId: string): Buffer;
   captureKnownHostsSnapshot(profileId: string): { readonly bytes: Buffer; readonly capability: object };
   disposeKnownHostsSnapshot(capability: object): void;
+  isKnownHostsSnapshotBusy(capability: object): boolean;
   readCredential(locator: string): string;
 }
 
@@ -46,6 +47,7 @@ function loadNativeBinding(): WindowsTrustBinding {
     typeof (candidate as { readKnownHosts?: unknown }).readKnownHosts !== 'function' ||
     typeof (candidate as { captureKnownHostsSnapshot?: unknown }).captureKnownHostsSnapshot !== 'function' ||
     typeof (candidate as { disposeKnownHostsSnapshot?: unknown }).disposeKnownHostsSnapshot !== 'function' ||
+    typeof (candidate as { isKnownHostsSnapshotBusy?: unknown }).isKnownHostsSnapshotBusy !== 'function' ||
     typeof (candidate as { readCredential?: unknown }).readCredential !== 'function'
   ) {
     return unavailable();
@@ -163,7 +165,13 @@ export class WindowsSecureStorage {
       try {
         this.binding.disposeKnownHostsSnapshot(snapshot.capability);
       } catch {
-        unavailable();
+        let busy = false;
+        try {
+          busy = this.binding.isKnownHostsSnapshotBusy(snapshot.capability) === true;
+        } catch {
+          // A failed busy check is not an ownership transfer.
+        }
+        if (!busy) unavailable();
       }
     }
   }

@@ -5,6 +5,7 @@ import { validateProfileSelection } from '../profiles/connection-profile.js';
 
 import { WindowsCredentialManager } from './windows-credential-manager.js';
 import { WindowsNativeAgentReadiness } from './windows-native-agent-readiness.js';
+import { WindowsOpenSshResolver, WindowsSshAddIdentity } from './windows-openssh.js';
 import { WindowsInMemoryPasswordTransport, type WindowsPasswordValidationRequest } from './windows-password-transport.js';
 import { WindowsSecureStorage } from './windows-secure-storage.js';
 
@@ -64,7 +65,7 @@ export interface WindowsPasswordReadinessTransport {
 
 export interface WindowsValidationSessionDependencies {
   readonly storage: Pick<WindowsSecureStorage, 'getProfile' | 'withKnownHostsSnapshot'>;
-  readonly agentIdentity: { isAvailable(): boolean | Promise<boolean> };
+  readonly agentIdentity: { isAvailable(timeoutMs?: number, signal?: AbortSignal): boolean | Promise<boolean> };
   readonly agentReadiness: Pick<WindowsNativeAgentReadiness, 'validate'>;
   readonly createPasswordTransport: (approvedReference: string) => WindowsPasswordReadinessTransport;
   readonly timeoutMs?: number;
@@ -76,8 +77,10 @@ function defaultDependencies(
   const timeoutMs = DEFAULT_TIMEOUT_MS;
   return {
     storage,
-    // The native readiness worker performs ssh-add within its one budget.
-    agentIdentity: { isAvailable: async () => true },
+    agentIdentity: {
+      isAvailable: async (remainingMs, signal) =>
+        new WindowsSshAddIdentity(new WindowsOpenSshResolver(), remainingMs ?? timeoutMs).isAvailable(signal),
+    },
     agentReadiness: new WindowsNativeAgentReadiness(),
     createPasswordTransport: (approvedReference) =>
       new WindowsInMemoryPasswordTransport(new WindowsCredentialManager(undefined, [approvedReference])),
@@ -117,7 +120,7 @@ export class WindowsValidationSession {
         knownHosts: {
           getEntries: (reference) => (reference === profile.approvedKnownHostsReference ? entries : unavailable()),
         },
-        agentIdentity: this.dependencies.agentIdentity,
+        agentIdentity: { isAvailable: () => this.dependencies.agentIdentity.isAvailable(remaining(), signal) },
         credentialResolver: {
           isApproved: (reference) => profile.authMode === 'password' && reference === profile.credentialReference,
         },

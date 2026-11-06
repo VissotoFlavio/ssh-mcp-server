@@ -6,15 +6,15 @@ The planned native Windows alpha has a separate, fail-closed
 [Windows trust model](docs/windows-trust-model.md), including its
 per-user configuration boundary. Windows configuration and approved state are
 never shared across local users, and the MCP does not require administrator
-execution. The current production runtime remains supported on Linux and macOS
-only.
+execution. Linux and macOS use the standard provider; on the supported Windows
+alpha envelope, validation is additionally available only when every native
+trust, OpenSSH-agent, known-hosts, and Credential Manager boundary is present.
 
 For the Windows alpha's supported host envelope, per-user installation, secure
 state layout, and Codex stdio configuration, see
 [Windows installation and Codex setup](docs/windows-codex-setup.md). The
-current Windows composition intentionally exposes discovery only; it does not
-advertise connection validation until every required trusted boundary can be
-composed.
+Windows runtime advertises `validate_connection` only when every required
+trusted boundary is available; otherwise it omits the tool and fails closed.
 
 ## Runtime configuration
 
