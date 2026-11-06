@@ -9,8 +9,10 @@ publish a release.
 
 - Windows password validation now reports redacted host-key, authentication,
   connection, and timeout failures with their stable MCP diagnostic codes.
-- Windows agent-key readiness now permits the approved current-user
-  `ssh-agent` identity when no private-key path is available to the MCP.
+- Windows agent-key readiness now selects the protected dedicated public key
+  and its matching current-user `ssh-agent` identity without using a private-key path.
+- Windows agent-key readiness uses the TypeScript non-interactive transport
+  runner and its bounded authentication marker instead of ControlMaster sockets.
 
 ### Added
 

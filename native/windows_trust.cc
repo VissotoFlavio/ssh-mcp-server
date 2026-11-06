@@ -479,6 +479,47 @@ bool ReadProtectedFile(const std::wstring& root, const std::wstring& leaf, PSID 
   return true;
 }
 
+bool IsDedicatedAgentPublicKey(const std::vector<BYTE>& value) {
+  static constexpr char kPrefix[] = "ssh-ed25519 ";
+  static constexpr char kSuffix[] = " ssh-mcp-agent";
+  size_t size = value.size();
+  if (size > 0 && value[size - 1] == '\n') --size;
+  if (size > 0 && value[size - 1] == '\r') --size;
+  if (size <= sizeof(kPrefix) + sizeof(kSuffix) || std::memcmp(value.data(), kPrefix, sizeof(kPrefix) - 1) != 0 || std::memcmp(value.data() + size - (sizeof(kSuffix) - 1), kSuffix, sizeof(kSuffix) - 1) != 0) return false;
+  const size_t encoded_start = sizeof(kPrefix) - 1;
+  const size_t encoded_end = size - (sizeof(kSuffix) - 1);
+  if (encoded_end <= encoded_start) return false;
+  for (size_t index = encoded_start; index < encoded_end; ++index) {
+    const unsigned char character = value[index];
+    if (!((character >= 'A' && character <= 'Z') || (character >= 'a' && character <= 'z') || (character >= '0' && character <= '9') || character == '+' || character == '/' || character == '=')) return false;
+  }
+  return true;
+}
+
+bool ShortNtfsPath(const std::wstring& value, std::wstring* short_path) {
+  const DWORD required = GetShortPathNameW(value.c_str(), nullptr, 0);
+  if (required == 0 || required >= 32768) return false;
+  std::vector<wchar_t> buffer(required + 1);
+  const DWORD written = GetShortPathNameW(value.c_str(), buffer.data(), static_cast<DWORD>(buffer.size()));
+  if (written == 0 || written >= buffer.size()) return false;
+  short_path->assign(buffer.data(), written);
+  return IsAbsoluteLocalPath(*short_path) && IsLocalNtfsPath(*short_path) && short_path->find_first_of(L" \t\r\n") == std::wstring::npos;
+}
+
+bool DedicatedAgentPublicKeyPath(std::wstring* path) {
+  std::wstring state_root;
+  std::wstring known_hosts_root;
+  std::vector<BYTE> operator_sid;
+  std::vector<BYTE> public_key;
+  if (!LoadConfiguration(&state_root, &known_hosts_root, &operator_sid)) return false;
+  const size_t separator = state_root.find_last_of(L"\\/");
+  if (separator == std::wstring::npos || separator <= 2) return false;
+  const std::wstring key_root = state_root.substr(0, separator) + L"\\keys";
+  static constexpr wchar_t kPublicKeyLeaf[] = L"ssh-mcp-agent-ed25519.pub";
+  if (!ReadProtectedFile(key_root, kPublicKeyLeaf, operator_sid.data(), &public_key) || !IsDedicatedAgentPublicKey(public_key)) return false;
+  return ShortNtfsPath(key_root + L"\\" + kPublicKeyLeaf, path);
+}
+
 class PrivateSecurityAttributes final {
  public:
   explicit PrivateSecurityAttributes(PSID operator_sid) {
@@ -629,7 +670,7 @@ class SnapshotSession final {
   void Release() { busy_.store(false); }
   bool busy() const { return busy_.load(); }
 
-  bool ReadyKnownHostsPath(std::wstring* path, std::wstring* directory) const {
+  bool ReadyKnownHostsPath(std::wstring* path, std::wstring* directory) {
     if (!IsValidCapability() || !parent_identity_known_ || !directory_identity_known_ || !file_identity_known_ ||
         !HasIdentity(parent_.get(), parent_identity_) || !HasIdentity(directory_.get(), directory_identity_) ||
         !HasIdentity(file_.get(), file_identity_) || !VerifyFile(parent_.get(), operator_sid(), true) ||
@@ -641,8 +682,16 @@ class SnapshotSession final {
     final_directory = StripExtendedPrefix(final_directory);
     final_file = StripExtendedPrefix(final_file);
     if (_wcsicmp(final_file.c_str(), (final_directory + L"\\known_hosts").c_str()) != 0) return false;
+    snapshot_file_path_ = final_file;
     *directory = std::move(final_directory);
     *path = std::move(final_file);
+    return true;
+  }
+
+  bool ReleaseFileForReadiness() {
+    if (file_.get() == INVALID_HANDLE_VALUE || snapshot_file_path_.empty() || !file_identity_known_ ||
+        !HasIdentity(file_.get(), file_identity_) || !VerifyFile(file_.get(), operator_sid(), false)) return false;
+    file_.reset();
     return true;
   }
 
@@ -664,6 +713,17 @@ class SnapshotSession final {
       delete_info.DeleteFile = TRUE;
       if (!SetFileInformationByHandle(file_.get(), FileDispositionInfo, &delete_info, sizeof(delete_info))) return false;
       file_.reset();
+      snapshot_file_path_.clear();
+    } else if (!snapshot_file_path_.empty()) {
+      Handle reopened(CreateFileW(snapshot_file_path_.c_str(), DELETE | FILE_READ_ATTRIBUTES | READ_CONTROL,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                                  FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+      if (reopened.get() == INVALID_HANDLE_VALUE || !file_identity_known_ || !HasIdentity(reopened.get(), file_identity_) ||
+          !VerifyFile(reopened.get(), operator_sid(), false)) return false;
+      FILE_DISPOSITION_INFO delete_info{};
+      delete_info.DeleteFile = TRUE;
+      if (!SetFileInformationByHandle(reopened.get(), FileDispositionInfo, &delete_info, sizeof(delete_info))) return false;
+      snapshot_file_path_.clear();
     }
     if (directory_.get() != INVALID_HANDLE_VALUE) {
       const bool directory_verified = directory_identity_known_ ? parent_identity_known_ && HasIdentity(parent_.get(), parent_identity_) && HasIdentity(directory_.get(), directory_identity_) && VerifyFile(parent_.get(), operator_sid(), true) && VerifyFile(directory_.get(), operator_sid(), true) : RevalidateFreshDirectory();
@@ -702,6 +762,7 @@ class SnapshotSession final {
   Handle parent_;
   Handle directory_;
   Handle file_;
+  std::wstring snapshot_file_path_;
   FILE_ID_INFO parent_identity_{};
   FILE_ID_INFO directory_identity_{};
   FILE_ID_INFO file_identity_{};
@@ -1076,6 +1137,29 @@ napi_value IsKnownHostsSnapshotBusy(napi_env env, napi_callback_info info) {
   if (!ReadSnapshotCapability(env, info, &snapshot)) return Unavailable(env);
   napi_value result{};
   return napi_get_boolean(env, snapshot->busy(), &result) == napi_ok ? result : Unavailable(env);
+}
+
+// This prepares only native-verified, current-user paths for the TypeScript
+// process runner. The MCP protocol never accepts or returns either path.
+napi_value PrepareAgentKeyReadiness(napi_env env, napi_callback_info info) {
+  SnapshotSession* snapshot = nullptr;
+  std::wstring known_hosts;
+  std::wstring snapshot_directory;
+  std::wstring known_hosts_short;
+  std::wstring identity_file;
+  if (!ReadSnapshotCapability(env, info, &snapshot) || snapshot->busy() ||
+      !snapshot->ReadyKnownHostsPath(&known_hosts, &snapshot_directory) ||
+      !ShortNtfsPath(known_hosts, &known_hosts_short) || !snapshot->ReleaseFileForReadiness() ||
+      !DedicatedAgentPublicKeyPath(&identity_file)) return Unavailable(env);
+  napi_value result{};
+  napi_value known_hosts_value{};
+  napi_value identity_file_value{};
+  if (napi_create_object(env, &result) != napi_ok ||
+      napi_create_string_utf16(env, reinterpret_cast<const char16_t*>(known_hosts_short.c_str()), known_hosts_short.size(), &known_hosts_value) != napi_ok ||
+      napi_create_string_utf16(env, reinterpret_cast<const char16_t*>(identity_file.c_str()), identity_file.size(), &identity_file_value) != napi_ok ||
+      napi_set_named_property(env, result, "knownHostsPath", known_hosts_value) != napi_ok ||
+      napi_set_named_property(env, result, "identityFile", identity_file_value) != napi_ok) return Unavailable(env);
+  return result;
 }
 
 struct NativeCancellation final { std::atomic<bool> requested{false}; };
@@ -1702,6 +1786,7 @@ NAPI_MODULE_INIT() {
     {"captureKnownHostsSnapshot", nullptr, CaptureKnownHostsSnapshot, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"disposeKnownHostsSnapshot", nullptr, DisposeKnownHostsSnapshot, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"isKnownHostsSnapshotBusy", nullptr, IsKnownHostsSnapshotBusy, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"prepareAgentKeyReadiness", nullptr, PrepareAgentKeyReadiness, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"startAgentKeyReadiness", nullptr, StartNativeAgentKeyReadiness, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"resolveOpenSsh", nullptr, ResolveOpenSsh, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"probeSshAdd", nullptr, ProbeSshAdd, nullptr, nullptr, nullptr, napi_default, nullptr},
