@@ -23,6 +23,25 @@ such identifier. It never becomes an SSH terminal.
 | Verify approved host identity and authentication readiness | Accept a host, user, port, path, SSH option, key, password, token, or command from an agent  |
 | Return a minimal, redacted readiness result                | Reveal hostnames, usernames, credential references, known-hosts paths, host keys, or secrets |
 
+## Release package candidates
+
+An authorized repository owner, member, or collaborator can comment exactly
+`/generate-candidate` on an open, same-repository `release/<version>` or
+`hotfix/<version>` pull request targeting `master`. The workflow validates the
+immutable pull-request commit, then creates or verifies a GitHub prerelease
+candidate and reports its result on the pull request.
+
+The candidate version is derived from the stable branch version and the exact
+pull-request commit. It is not an npm publication or a stable release. Because
+the native Windows addon is ABI-specific, each candidate release has separate
+Windows x64 assets for Node.js 22 and Node.js 24. Select the asset matching the
+Node.js major version used by Codex, install it from a trusted local file, and
+do not copy its addon into another environment.
+
+The package contains only the compiled runtime, the production Windows addon,
+and operator documentation. It intentionally excludes source, tests, CI files,
+development configuration, and the test-only native addon.
+
 Readiness is not authorization. A successful result says only that the
 approved connection's constrained readiness check completed; it does not
 authorize a remote change, prove that a later operation is permitted, or widen

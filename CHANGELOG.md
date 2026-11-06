@@ -16,6 +16,8 @@ publish a release.
 
 ### Added
 
+- An authorized `/generate-candidate` workflow for immutable Windows runtime
+  package candidates on qualifying release and hotfix pull requests.
 - README onboarding and a reproducible POSIX setup guide for approved SSH
   profile discovery and connection-readiness checks, including safe MCP tool
   examples and platform-specific guidance.
