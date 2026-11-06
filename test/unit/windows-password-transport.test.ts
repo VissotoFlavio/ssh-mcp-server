@@ -4,6 +4,7 @@ import test from 'node:test';
 
 import type { ConnectConfig } from 'ssh2';
 
+import { mapConnectionError } from '../../src/diagnostics/redacted-diagnostics-audit.js';
 import {
   WindowsInMemoryPasswordTransport,
   WindowsPasswordTransportError,
@@ -34,8 +35,8 @@ class FakeClient implements InMemorySshClient {
     return this;
   }
 
-  emit(event: 'ready' | 'error'): void {
-    this.listeners.get(event)?.();
+  emit(event: 'ready' | 'error', ...args: readonly unknown[]): void {
+    this.listeners.get(event)?.(...args);
   }
 }
 
@@ -89,7 +90,69 @@ test('rejects an unapproved host before any credential lookup and redacts transp
   assert.equal(authentication, false);
   assert.equal(lookups, 0);
   client.emit('error');
-  await assert.rejects(connected, WindowsPasswordTransportError);
+  await assert.rejects(connected, (error) => error instanceof WindowsPasswordTransportError && mapConnectionError(error).code === 'host-key-failure');
+});
+
+test('classifies an unavailable credential as an authentication failure without releasing a password', async () => {
+  const client = new FakeClient();
+  const transport = new WindowsInMemoryPasswordTransport(
+    {
+      getPassword: () => {
+        throw new Error('credential=private');
+      },
+    },
+    () => client,
+  );
+  const connected = transport.connect(request);
+  assert.equal((client.config!.hostVerifier as (key: Buffer) => boolean)(key), true);
+  let authentication: unknown;
+  (client.config!.authHandler as unknown as (left: unknown, partial: unknown, callback: (value: unknown) => void) => void)(null, null, (value) => {
+    authentication = value;
+  });
+  assert.equal(authentication, false);
+  client.emit('error');
+  await assert.rejects(
+    connected,
+    (error) => error instanceof WindowsPasswordTransportError && mapConnectionError(error).code === 'authentication-failure',
+  );
+});
+
+test('classifies a transport error after password submission as a connection failure', async () => {
+  const client = new FakeClient();
+  const transport = new WindowsInMemoryPasswordTransport({ getPassword: () => ({ password: 'private' }) }, () => client);
+  const connected = transport.connect(request);
+  assert.equal((client.config!.hostVerifier as (key: Buffer) => boolean)(key), true);
+  let authentication: unknown;
+  (client.config!.authHandler as unknown as (left: unknown, partial: unknown, callback: (value: unknown) => void) => void)(null, null, (value) => {
+    authentication = value;
+  });
+  assert.deepEqual(authentication, { type: 'password', username: 'deploy', password: 'private' });
+  client.emit('error');
+  await assert.rejects(
+    connected,
+    (error) =>
+      error instanceof WindowsPasswordTransportError && mapConnectionError(error).code === 'connection-failure' && !error.message.includes('private'),
+  );
+});
+
+test('classifies an explicit remote authentication rejection after password submission as an authentication failure', async () => {
+  const client = new FakeClient();
+  const transport = new WindowsInMemoryPasswordTransport({ getPassword: () => ({ password: 'private' }) }, () => client);
+  const connected = transport.connect(request);
+  assert.equal((client.config!.hostVerifier as (key: Buffer) => boolean)(key), true);
+  (client.config!.authHandler as unknown as (left: unknown, partial: unknown, callback: (value: unknown) => void) => void)(
+    null,
+    null,
+    () => undefined,
+  );
+  client.emit('error', { level: 'client-authentication' });
+  await assert.rejects(
+    connected,
+    (error) =>
+      error instanceof WindowsPasswordTransportError &&
+      mapConnectionError(error).code === 'authentication-failure' &&
+      !error.message.includes('private'),
+  );
 });
 
 test('does not start a connection or retrieve credentials after cancellation', async () => {
@@ -148,7 +211,7 @@ test('times out with a redacted error and destroys the client before credential 
   const transport = new WindowsInMemoryPasswordTransport({ getPassword: () => ({ password: (++lookups, 'private') }) }, () => client);
   await assert.rejects(
     transport.connect({ ...request, timeoutMs: 5 }),
-    (error) => error instanceof WindowsPasswordTransportError && !error.message.includes('private'),
+    (error) => error instanceof WindowsPasswordTransportError && mapConnectionError(error).code === 'timeout' && !error.message.includes('private'),
   );
   assert.equal(client.destroyed, true);
   assert.equal(lookups, 0);

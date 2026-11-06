@@ -92,7 +92,20 @@ success audit event. The in-process password transport opened no session,
 channel, command, file transfer, or forwarding request, so it made no change
 to the VPS.
 
-The agent-key success path and the host-key mismatch, unavailable credential,
-timeout, and invalid-input matrix entries remain pending. They require
-separate approved local profiles or pre-existing unavailable endpoints; this
-evidence does not claim those cases passed.
+On the same environment, controlled non-secret local profiles were added only
+for the duration of three negative checks and the original profile state was
+restored after the run. A deliberately different host fingerprint returned
+`host-key-failure` in less than one second. An approved password profile with
+no matching Generic Credential returned `authentication-failure` in less than
+one second. Invalid MCP input returned `invalid-input` in less than one
+second. Each result had the same allowlisted audit code, and no test output or
+audit record retained connection identifiers, credential references,
+fingerprints, paths, or secrets. The negative checks issue no remote command;
+the host-key check stops before credential lookup, the unavailable-credential
+check cannot release a password, and invalid input stops before profile lookup
+or network activity.
+
+The agent-key success path and timeout matrix entry remain pending. They
+require a pre-authorized current-user agent identity and a pre-existing
+unavailable non-production endpoint; this evidence does not claim those cases
+passed.

@@ -5,6 +5,11 @@ publish a release.
 
 ## Unreleased
 
+### Fixed
+
+- Windows password validation now reports redacted host-key, authentication,
+  connection, and timeout failures with their stable MCP diagnostic codes.
+
 ### Added
 
 - Documentation for the native Windows alpha support boundary, internal
