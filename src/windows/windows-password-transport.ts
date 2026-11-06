@@ -27,7 +27,7 @@ export interface InMemorySshClient {
 export type InMemorySshClientFactory = () => InMemorySshClient;
 
 export class WindowsPasswordTransportError extends Error {
-  constructor() {
+  constructor(readonly diagnosticCode?: 'authentication-failure' | 'host-key-failure' | 'ssh-connection-failed' | 'ssh-timeout') {
     super('Windows password transport is unavailable');
     this.name = 'WindowsPasswordTransportError';
   }
@@ -60,6 +60,9 @@ export class WindowsInMemoryPasswordTransport {
       const client = this.clients();
       let finished = false;
       let hostVerified = false;
+      let hostRejected = false;
+      let credentialRejected = false;
+      let passwordSubmitted = false;
       const finish = (error?: Error) => {
         if (finished) return;
         finished = true;
@@ -80,10 +83,24 @@ export class WindowsInMemoryPasswordTransport {
           finish(new WindowsPasswordTransportError());
         }
       };
-      const timer = setTimeout(abort, boundedTimeout(request.timeoutMs));
+      const timeout = () => {
+        try {
+          client.destroy();
+        } finally {
+          finish(new WindowsPasswordTransportError('ssh-timeout'));
+        }
+      };
+      const timer = setTimeout(timeout, boundedTimeout(request.timeoutMs));
       signal?.addEventListener('abort', abort, { once: true });
       client.on('ready', () => finish());
-      client.on('error', () => finish(new WindowsPasswordTransportError()));
+      client.on('error', () => {
+        const diagnosticCode = hostRejected
+          ? 'host-key-failure'
+          : credentialRejected || passwordSubmitted
+            ? 'authentication-failure'
+            : 'ssh-connection-failed';
+        finish(new WindowsPasswordTransportError(diagnosticCode));
+      });
       try {
         client.connect({
           host: request.host,
@@ -92,6 +109,7 @@ export class WindowsInMemoryPasswordTransport {
           readyTimeout: boundedTimeout(request.timeoutMs),
           hostVerifier: (key: Buffer) => {
             hostVerified = matchesFingerprint(key, request.expectedHostFingerprint);
+            hostRejected = !hostVerified;
             return hostVerified;
           },
           authHandler: (_methodsLeft, _partialSuccess, callback) => {
@@ -101,9 +119,14 @@ export class WindowsInMemoryPasswordTransport {
             try {
               password = this.credentials.getPassword(request.credentialReference).password;
               if (finished || signal?.aborted) return rejectAuthentication(false);
-              if (password.length === 0 || password.includes('\u0000')) return rejectAuthentication(false);
+              if (password.length === 0 || password.includes('\u0000')) {
+                credentialRejected = true;
+                return rejectAuthentication(false);
+              }
+              passwordSubmitted = true;
               callback({ type: 'password', username: request.user, password });
             } catch {
+              credentialRejected = true;
               rejectAuthentication(false);
             } finally {
               password = '';
