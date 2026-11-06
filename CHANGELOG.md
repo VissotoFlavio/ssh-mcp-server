@@ -16,6 +16,8 @@ publish a release.
 
 ### Added
 
+- README onboarding for approved SSH profile discovery and connection-readiness
+  checks, including safe MCP tool examples and platform-specific guidance.
 - Documentation for the native Windows alpha support boundary, internal
   source-checkout distribution decision, and reproducible local build process.
 - A protected `master` branch based on `develop`, with the repository CI

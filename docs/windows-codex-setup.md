@@ -248,8 +248,11 @@ prerequisites.
   user, configure and validate the key in the MCP process identity. Do not
   attempt to share agent state between users.
 
-For a future `password` profile, use `"authMode": "password"` and add an
-opaque `"credentialReference": "os://ssh/<opaque-locator>"`. Create the
+For a `password` profile, use `"authMode": "password"` and add an opaque
+`"credentialReference": "os://ssh/<opaque-locator>"`. Password readiness is
+implemented only for the supported Windows alpha and only when the verified
+storage, known-hosts, Credential Manager, and in-memory transport boundaries
+are available; otherwise `validate_connection` is not advertised. Create the
 matching Generic Credential in the current user's Windows Credential Manager
 with target name `Vissoto/ssh-mcp-server/<opaque-locator>`. Enter the secret in
 the Credential Manager UI; never use a command line, environment variable,
