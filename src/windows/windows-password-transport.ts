@@ -62,7 +62,6 @@ export class WindowsInMemoryPasswordTransport {
       let hostVerified = false;
       let hostRejected = false;
       let credentialRejected = false;
-      let passwordSubmitted = false;
       const finish = (error?: Error) => {
         if (finished) return;
         finished = true;
@@ -94,11 +93,7 @@ export class WindowsInMemoryPasswordTransport {
       signal?.addEventListener('abort', abort, { once: true });
       client.on('ready', () => finish());
       client.on('error', () => {
-        const diagnosticCode = hostRejected
-          ? 'host-key-failure'
-          : credentialRejected || passwordSubmitted
-            ? 'authentication-failure'
-            : 'ssh-connection-failed';
+        const diagnosticCode = hostRejected ? 'host-key-failure' : credentialRejected ? 'authentication-failure' : 'ssh-connection-failed';
         finish(new WindowsPasswordTransportError(diagnosticCode));
       });
       try {
@@ -123,7 +118,6 @@ export class WindowsInMemoryPasswordTransport {
                 credentialRejected = true;
                 return rejectAuthentication(false);
               }
-              passwordSubmitted = true;
               callback({ type: 'password', username: request.user, password });
             } catch {
               credentialRejected = true;

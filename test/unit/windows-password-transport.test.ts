@@ -117,6 +117,24 @@ test('classifies an unavailable credential as an authentication failure without 
   );
 });
 
+test('classifies a transport error after password submission as a connection failure', async () => {
+  const client = new FakeClient();
+  const transport = new WindowsInMemoryPasswordTransport({ getPassword: () => ({ password: 'private' }) }, () => client);
+  const connected = transport.connect(request);
+  assert.equal((client.config!.hostVerifier as (key: Buffer) => boolean)(key), true);
+  let authentication: unknown;
+  (client.config!.authHandler as unknown as (left: unknown, partial: unknown, callback: (value: unknown) => void) => void)(null, null, (value) => {
+    authentication = value;
+  });
+  assert.deepEqual(authentication, { type: 'password', username: 'deploy', password: 'private' });
+  client.emit('error');
+  await assert.rejects(
+    connected,
+    (error) =>
+      error instanceof WindowsPasswordTransportError && mapConnectionError(error).code === 'connection-failure' && !error.message.includes('private'),
+  );
+});
+
 test('does not start a connection or retrieve credentials after cancellation', async () => {
   const client = new FakeClient();
   let lookups = 0;
