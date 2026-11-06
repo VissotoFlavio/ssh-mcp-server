@@ -3,7 +3,7 @@
 ## Status and support boundary
 
 This document is the authoritative security model for the native Windows
-runtime proposed for `v0.1.0-alpha.1`. It is a design boundary, not a claim
+runtime released in `v0.1.0`. It is a design boundary, not a claim
 that the current POSIX runtime supports Windows.
 
 The Windows runtime is **per-user only**. It never requires elevation, reads

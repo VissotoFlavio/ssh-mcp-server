@@ -2,9 +2,10 @@
 
 ## Status
 
-This is an internal delivery-preparation record. It does not create, assign,
-or publish a release version, and it does not authorize a tag, deployment,
-announcement, or package publication.
+`v0.1.0` is the first internal, source-built pre-1.0 release. It is intended
+for controlled production validation before any `v1.0.0` release. The release
+tag identifies the reviewed source only; it does not authorize a deployment,
+package publication, standalone executable, or binary artifact.
 
 The native Windows runtime is supported only within the envelope defined by
 the [Windows trust model](windows-trust-model.md) and the
@@ -14,10 +15,10 @@ and native-boundary condition must leave validation unavailable.
 
 ## Distribution decision
 
-The current alpha is available only as an internal source checkout built by
-the operator. There is no published package, standalone executable, or binary
-artifact. Do not copy a build artifact into another environment as a
-substitute for a trusted build.
+The current pre-1.0 release is available only as an internal source checkout
+built by the operator. There is no published package, standalone executable,
+or binary artifact. Do not copy a build artifact into another environment as
+a substitute for a trusted build.
 
 No license is selected by this preparation work. Distribution beyond the
 repository's existing access controls requires separate legal direction and a
@@ -53,4 +54,4 @@ subject to protection, force-push and deletion are disabled, and conversation
 resolution is required. Changes reach `master` only through a reviewed pull
 request after the required checks pass.
 
-This preparation does not merge any pull request or publish any artifact.
+This release boundary does not authorize package or binary publication.

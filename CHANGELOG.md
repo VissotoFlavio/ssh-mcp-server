@@ -5,6 +5,8 @@ publish a release.
 
 ## Unreleased
 
+## 0.1.0 - 2026-11-06
+
 ### Fixed
 
 - Windows password validation now reports redacted host-key, authentication,

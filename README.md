@@ -9,10 +9,11 @@ operator-authorized step. The server exposes a deliberately small surface:
 agents can discover safe profile identifiers and validate the readiness of one
 such identifier. It never becomes an SSH terminal.
 
-> **Status:** source-built alpha. This repository is public, but npm publishing
-> is disabled. No npm package, standalone binary, or license has been
-> published. Distribution remains controlled from source; publishing or choosing
-> a license is a separate decision.
+> **Status:** `v0.1.0` is a source-built, pre-1.0 release. The native Windows
+> runtime remains within its alpha support boundary. This repository is public,
+> but npm publishing is disabled. No npm package, standalone binary, or license
+> has been published. Distribution remains controlled from source; publishing
+> or choosing a license is a separate decision.
 
 ## What it does—and does not do
 
