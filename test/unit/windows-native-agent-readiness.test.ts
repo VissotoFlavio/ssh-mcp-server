@@ -8,71 +8,54 @@ import {
 } from '../../src/windows/windows-native-agent-readiness.js';
 
 const descriptor: NativeAgentKeyReadinessDescriptor = Object.freeze({ host: 'api.internal.example', port: 22, user: 'deploy' });
+const prepared = Object.freeze({ knownHostsPath: 'C:\\safe\\known_hosts', identityFile: 'C:\\safe\\agent.pub' });
 
-test('passes only an opaque capability, a frozen descriptor, and bounded timeout to the native readiness boundary', async () => {
-  const capability = {};
+test('runs only fixed non-interactive OpenSSH arguments from native-verified paths', async () => {
   const calls: unknown[] = [];
-  const readiness = new WindowsNativeAgentReadiness({
-    startAgentKeyReadiness: (...values) => {
-      calls.push(values);
-      return { promise: Promise.resolve(), cancel: () => undefined };
+  const readiness = new WindowsNativeAgentReadiness(
+    {
+      prepareAgentKeyReadiness: (capability) => {
+        calls.push(capability);
+        return prepared;
+      },
     },
-  });
-  await readiness.validate(capability, descriptor, 10_000);
-  assert.deepEqual(calls, [[capability, descriptor, 10_000]]);
-});
-
-test('rejects mutable or caller-shaped descriptors before native readiness', async () => {
-  const readiness = new WindowsNativeAgentReadiness({ startAgentKeyReadiness: () => assert.fail('must not run') });
-  await assert.rejects(() => readiness.validate({}, { ...descriptor }, 10_000), WindowsNativeAgentReadinessError);
-  await assert.rejects(
-    () => readiness.validate({}, Object.freeze({ ...descriptor, command: 'id' }) as NativeAgentKeyReadinessDescriptor, 10_000),
-    WindowsNativeAgentReadinessError,
+    { resolve: () => 'C:\\Windows\\System32\\OpenSSH\\ssh.exe' },
+    {
+      run: async (...values) => {
+        calls.push(values);
+      },
+    },
   );
+  await readiness.validate({}, descriptor, 10_000);
+  assert.equal(calls.length, 2);
+  const [, args] = calls[1] as [string, readonly string[]];
+  assert.ok(args.includes('-N') && args.includes('-T') && args.includes('BatchMode=yes'));
+  assert.ok(!args.some((value) => value === 'exec' || value === 'shell' || value.includes('Forward')));
 });
 
-test('maps native failures to the fixed non-sensitive validation error', async () => {
-  const readiness = new WindowsNativeAgentReadiness({
-    startAgentKeyReadiness: () => {
-      throw new Error('C:\\private\\known_hosts deploy@api.internal.example');
-    },
-  });
+test('rejects mutable descriptors and untrusted native preparation', async () => {
+  const readiness = new WindowsNativeAgentReadiness(
+    { prepareAgentKeyReadiness: () => ({ knownHostsPath: 'relative', identityFile: 'C:\\safe\\agent.pub' }) },
+    { resolve: () => 'C:\\Windows\\System32\\OpenSSH\\ssh.exe' },
+    { run: async () => assert.fail('must not run') },
+  );
+  await assert.rejects(() => readiness.validate({}, { ...descriptor }, 10_000), WindowsNativeAgentReadinessError);
   await assert.rejects(() => readiness.validate({}, descriptor, 10_000), WindowsNativeAgentReadinessError);
 });
 
-test('forwards cancellation to the native operation and redacts its rejection', async () => {
-  const controller = new AbortController();
-  let cancelled = 0;
-  let rejectOperation!: (reason?: unknown) => void;
-  const readiness = new WindowsNativeAgentReadiness({
-    startAgentKeyReadiness: () => ({
-      promise: new Promise<void>((_resolve, reject) => {
-        rejectOperation = reject;
-      }),
-      cancel: () => {
-        cancelled += 1;
-        rejectOperation(new Error('C:\\private\\known_hosts deploy@api.internal.example'));
+test('redacts runner failures and forwards cancellation', async () => {
+  let signal: AbortSignal | undefined;
+  const readiness = new WindowsNativeAgentReadiness(
+    { prepareAgentKeyReadiness: () => prepared },
+    { resolve: () => 'C:\\Windows\\System32\\OpenSSH\\ssh.exe' },
+    {
+      run: async (_executable, _args, _timeout, received) => {
+        signal = received;
+        throw new Error('sensitive transcript');
       },
-    }),
-  });
-
-  const validation = readiness.validate({}, descriptor, 10_000, controller.signal);
-  controller.abort();
-  await assert.rejects(validation, WindowsNativeAgentReadinessError);
-  assert.equal(cancelled, 1);
-});
-
-test('does not start native readiness for an already-aborted signal or expired budget', async () => {
-  let starts = 0;
-  const readiness = new WindowsNativeAgentReadiness({
-    startAgentKeyReadiness: () => {
-      starts += 1;
-      return { promise: Promise.resolve(), cancel: () => undefined };
     },
-  });
+  );
   const controller = new AbortController();
-  controller.abort();
   await assert.rejects(() => readiness.validate({}, descriptor, 10_000, controller.signal), WindowsNativeAgentReadinessError);
-  await assert.rejects(() => readiness.validate({}, descriptor, 0), WindowsNativeAgentReadinessError);
-  assert.equal(starts, 0);
+  assert.equal(signal, controller.signal);
 });

@@ -31,21 +31,24 @@ or pull request.
 - Capture a local baseline of the MCP process's standard error audit stream
   and the non-production VPS's existing SSH audit source, if available. The
   latter is read-only evidence; do not alter VPS logging to perform this test.
+- For `agent-key` success, the key must be generated and loaded by the same
+  normal Windows user that runs Codex. Stop on an ownership, protected-DACL,
+  agent-service, or identity-loading failure; do not run Codex elevated or
+  weaken local security controls as a workaround.
 
 ## Test matrix
 
-| Scenario               | Local setup                                                                                                              | Expected MCP result                                 | Required evidence                                                                        |
-| ---------------------- | ------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| Agent-key success      | Approved `agent-key` profile and loaded current-user agent key                                                           | `{ "profileId": "…", "ready": true }`               | Redacted audit record; no command argument or remote-command evidence                    |
-| Password success       | Approved `password` profile and existing matching Generic Credential                                                     | `{ "profileId": "…", "ready": true }`               | Redacted audit record; Credential Manager access occurs only after host-key verification |
-| Host-key mismatch      | Local test profile with a deliberately nonmatching approved fingerprint or known-hosts entry                             | Fixed `host-key-failure` result                     | No Credential Manager lookup; no secret, host, user, or key material in MCP/audit output |
-| Unavailable credential | Locally approved password profile whose matching Generic Credential is absent                                            | Fixed redacted failure                              | No password is logged, passed as an argument, or returned by MCP                         |
-| Timeout                | Locally approved profile targeting a pre-existing unavailable endpoint in the designated non-production test environment | Fixed `timeout` result within the configured budget | Redacted timeout audit; child/client cleanup completes                                   |
-| Invalid MCP input      | Extra argument, non-object input, or invalid profile identifier                                                          | Fixed `invalid-input` result                        | No profile lookup, credential access, child process, or network connection               |
+| Scenario               | Local setup                                                                                  | Expected MCP result                   | Required evidence                                                                        |
+| ---------------------- | -------------------------------------------------------------------------------------------- | ------------------------------------- | ---------------------------------------------------------------------------------------- |
+| Agent-key success      | Approved `agent-key` profile and loaded current-user agent key                               | `{ "profileId": "…", "ready": true }` | Redacted audit record; no command argument or remote-command evidence                    |
+| Password success       | Approved `password` profile and existing matching Generic Credential                         | `{ "profileId": "…", "ready": true }` | Redacted audit record; Credential Manager access occurs only after host-key verification |
+| Host-key mismatch      | Local test profile with a deliberately nonmatching approved fingerprint or known-hosts entry | Fixed `host-key-failure` result       | No Credential Manager lookup; no secret, host, user, or key material in MCP/audit output |
+| Unavailable credential | Locally approved password profile whose matching Generic Credential is absent                | Fixed redacted failure                | No password is logged, passed as an argument, or returned by MCP                         |
+| Invalid MCP input      | Extra argument, non-object input, or invalid profile identifier                              | Fixed `invalid-input` result          | No profile lookup, credential access, child process, or network connection               |
 
-Do not replace the timeout case with an arbitrary caller-supplied host,
-command, path, credential, or connection setting. Every destination is
-selected only by an operator-approved local profile.
+Do not replace any matrix case with arbitrary caller-supplied connection
+settings. Every destination is selected only by an operator-approved local
+profile.
 
 ## Execution procedure
 
@@ -78,6 +81,11 @@ run. It must never include raw JSON-RPC transcripts, hostnames, IP addresses,
 usernames, profile IDs, Credential Manager target names, fingerprints,
 known-hosts data, executable paths, or secrets.
 
+When a prerequisite is unavailable, record only its category (for example,
+current-user key ownership or agent identity) and mark the case as not run.
+Do not include raw ACL output, key material, service configuration, or
+connection details.
+
 ## Sanitized execution evidence
 
 On 2026-11-06, a controlled password-authentication readiness check completed
@@ -105,7 +113,7 @@ the host-key check stops before credential lookup, the unavailable-credential
 check cannot release a password, and invalid input stops before profile lookup
 or network activity.
 
-The agent-key success path and timeout matrix entry remain pending. They
-require a pre-authorized current-user agent identity and a pre-existing
-unavailable non-production endpoint; this evidence does not claim those cases
-passed.
+The agent-key success path subsequently completed with the approved
+current-user agent identity. It returned the fixed success result within the
+configured budget, with redaction, child cleanup, and no-remote-command checks
+confirmed.
