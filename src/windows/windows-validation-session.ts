@@ -64,7 +64,7 @@ export interface WindowsPasswordReadinessTransport {
 }
 
 export interface WindowsValidationSessionDependencies {
-  readonly storage: Pick<WindowsSecureStorage, 'getProfile' | 'withKnownHostsSnapshot'>;
+  readonly storage: Pick<WindowsSecureStorage, 'getProfile' | 'readKnownHosts' | 'withKnownHostsSnapshot'>;
   readonly agentIdentity: { isAvailable(timeoutMs?: number, signal?: AbortSignal): boolean | Promise<boolean> };
   readonly agentReadiness: Pick<WindowsNativeAgentReadiness, 'validate'>;
   readonly createPasswordTransport: (approvedReference: string) => WindowsPasswordReadinessTransport;
@@ -72,7 +72,7 @@ export interface WindowsValidationSessionDependencies {
 }
 
 function defaultDependencies(
-  storage: Pick<WindowsSecureStorage, 'getProfile' | 'withKnownHostsSnapshot'> = new WindowsSecureStorage(),
+  storage: Pick<WindowsSecureStorage, 'getProfile' | 'readKnownHosts' | 'withKnownHostsSnapshot'> = new WindowsSecureStorage(),
 ): WindowsValidationSessionDependencies {
   const timeoutMs = DEFAULT_TIMEOUT_MS;
   return {
@@ -111,6 +111,40 @@ export class WindowsValidationSession {
     const selection = validateProfileSelection(input);
     const profile = this.dependencies.storage.getProfile(selection.profileId);
     if (profile === undefined) return unavailable();
+
+    // Password validation never passes a known-hosts pathname to a child
+    // process. The verified bytes can therefore remain in memory, avoiding a
+    // temporary snapshot while preserving host-key verification before any
+    // credential lookup.
+    if (profile.authMode === 'password') {
+      if (remaining() === 0) return unavailable();
+      const entries = parseKnownHosts(this.dependencies.storage.readKnownHosts(profile.approvedKnownHostsReference));
+      const policy = new HostIdentityCredentialPolicy({
+        profiles: { getProfile: (profileId) => (profileId === selection.profileId ? profile : undefined) },
+        knownHosts: {
+          getEntries: (reference) => (reference === profile.approvedKnownHostsReference ? entries : unavailable()),
+        },
+        agentIdentity: { isAvailable: () => this.dependencies.agentIdentity.isAvailable(remaining(), signal) },
+        credentialResolver: {
+          isApproved: (reference) => reference === profile.credentialReference,
+        },
+      });
+      const authorized = await policy.authorize(selection);
+      if (authorized.authentication.mode !== 'password' || remaining() === 0) return unavailable();
+
+      await this.dependencies.createPasswordTransport(authorized.authentication.credentialReference).connect(
+        {
+          host: authorized.profile.host,
+          port: authorized.profile.port,
+          user: authorized.profile.user,
+          expectedHostFingerprint: authorized.hostIdentity.fingerprint,
+          credentialReference: authorized.authentication.credentialReference,
+          timeoutMs: remaining(),
+        },
+        signal,
+      );
+      return;
+    }
 
     await this.dependencies.storage.withKnownHostsSnapshot(profile.approvedKnownHostsReference, async (bytes, capability) => {
       if (remaining() === 0) return unavailable();
@@ -154,7 +188,7 @@ export class WindowsValidationSession {
 }
 
 export function createWindowsValidationSession(
-  storage: Pick<WindowsSecureStorage, 'getProfile' | 'withKnownHostsSnapshot'>,
+  storage: Pick<WindowsSecureStorage, 'getProfile' | 'readKnownHosts' | 'withKnownHostsSnapshot'>,
 ): WindowsValidationSession {
   return new WindowsValidationSession(defaultDependencies(storage));
 }

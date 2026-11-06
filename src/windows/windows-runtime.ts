@@ -15,12 +15,23 @@ export interface WindowsRuntimeProviders {
  */
 export function createWindowsRuntimeProviders(
   storage: Pick<WindowsSecureStorage, 'listProfiles'> &
-    Partial<Pick<WindowsSecureStorage, 'getProfile' | 'withKnownHostsSnapshot'>> = new WindowsSecureStorage(),
+    Partial<Pick<WindowsSecureStorage, 'getProfile' | 'readKnownHosts' | 'withKnownHostsSnapshot'>> = new WindowsSecureStorage(),
   validationSession: Pick<WindowsValidationSession, 'validate'> | undefined = (() => {
     try {
-      storage.listProfiles();
+      const profiles = storage.listProfiles();
       if (typeof storage.getProfile !== 'function' || typeof storage.withKnownHostsSnapshot !== 'function') return undefined;
-      return createWindowsValidationSession(storage as Pick<WindowsSecureStorage, 'getProfile' | 'withKnownHostsSnapshot'>);
+      const readKnownHosts = storage.readKnownHosts;
+      if (profiles.some((profile) => profile.authMode === 'password') && typeof readKnownHosts !== 'function') return undefined;
+      return createWindowsValidationSession({
+        getProfile: storage.getProfile.bind(storage),
+        readKnownHosts:
+          typeof readKnownHosts === 'function'
+            ? readKnownHosts.bind(storage)
+            : () => {
+                throw new TypeError('Windows known-hosts storage is unavailable');
+              },
+        withKnownHostsSnapshot: storage.withKnownHostsSnapshot.bind(storage),
+      });
     } catch {
       return undefined;
     }

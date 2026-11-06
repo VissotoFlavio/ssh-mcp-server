@@ -16,13 +16,15 @@ platform, architecture, version, filesystem, or safety failure is unavailable
 rather than partially supported.
 
 The Windows runtime advertises `validate_connection` only when the supported
-native addon, protected profile state, known-hosts snapshot boundary, trusted
+native addon, protected profile state, verified known-hosts boundary, trusted
 OpenSSH/agent boundary, and Credential Manager boundary are all available.
 It validates only an approved profile identifier; agent-key validation first
 uses the native `ssh-add -l` probe and then a cancellable native no-command
-readiness check. If any prerequisite is unavailable, the tool is omitted as a
-safe fail-closed result, not an invitation to pass hosts, credentials, paths,
-or commands to the MCP server.
+readiness check with a private known-hosts snapshot. Password validation keeps
+the verified known-hosts bytes in memory because it launches no SSH child. If
+any prerequisite is unavailable, the tool is omitted as a safe fail-closed
+result, not an invitation to pass hosts, credentials, paths, or commands to
+the MCP server.
 
 ## Prerequisites
 
