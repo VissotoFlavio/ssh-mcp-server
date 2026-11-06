@@ -9,9 +9,10 @@ operator-authorized step. The server exposes a deliberately small surface:
 agents can discover safe profile identifiers and validate the readiness of one
 such identifier. It never becomes an SSH terminal.
 
-> **Status:** this repository is private and distributed as an internal,
-> source-built alpha. There is no published package, binary artifact, or
-> selected license. Publishing or choosing a license is a separate decision.
+> **Status:** source-built alpha. This repository is public, but npm publishing
+> is disabled. No npm package, standalone binary, or license has been
+> published. Distribution remains controlled from source; publishing or choosing
+> a license is a separate decision.
 
 ## What it does—and does not do
 
@@ -119,7 +120,8 @@ This illustrative `connection-profiles.json` entry is suitable for the POSIX
 
 Obtain the corresponding host key and fingerprint from an independently
 approved source. Do not trust an interactive first-connection prompt. POSIX
-production validation deliberately has no password provider.
+production validation deliberately has no password provider. For the complete,
+reproducible procedure, see the [POSIX setup guide](docs/posix-setup.md).
 
 ### Native Windows alpha
 
@@ -141,18 +143,24 @@ administrator execution.
 ## Register with a Codex MCP client
 
 Build first, then register the stdio server with absolute, operator-approved
-paths. The following is illustrative; replace both paths with the local
-trusted Node.js executable and checkout:
+paths. On Linux and macOS, register the two state roots with the server so the
+configuration remains available when Codex starts it later. The following is
+illustrative; replace all paths with local trusted values:
 
 ```sh
-codex mcp add ssh-mcp-server -- /absolute/path/to/node /absolute/path/to/ssh-mcp-server/dist/server.js
+codex mcp add ssh-mcp-server \
+  --env SSH_MCP_STATE_ROOT=/absolute/path/to/state \
+  --env SSH_MCP_KNOWN_HOSTS_ROOT=/absolute/path/to/known-hosts \
+  -- /absolute/path/to/node /absolute/path/to/ssh-mcp-server/dist/server.js
 codex mcp list
 ```
 
 The MCP server reserves standard input and output for JSON-RPC. Do not run
-`node dist/server.js` interactively as a diagnostic. The Windows guide includes
-the equivalent PowerShell and TOML examples with its required absolute
-`node.exe` path.
+`node dist/server.js` interactively as a diagnostic. On the native Windows
+alpha, do **not** pass POSIX environment variables: follow the
+[Windows installation and Codex setup](docs/windows-codex-setup.md), which uses
+the protected per-user registry values and its required absolute `node.exe`
+path.
 
 ## Tool reference
 
