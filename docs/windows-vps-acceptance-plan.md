@@ -77,3 +77,22 @@ The acceptance report may state whether each case passed, failed, or was not
 run. It must never include raw JSON-RPC transcripts, hostnames, IP addresses,
 usernames, profile IDs, Credential Manager target names, fingerprints,
 known-hosts data, executable paths, or secrets.
+
+## Sanitized execution evidence
+
+On 2026-11-06, a controlled password-authentication readiness check completed
+against the designated non-production VPS. The local environment was Windows
+build 26200, Node.js 24.13.0, and Microsoft OpenSSH 9.5p2. The operator
+independently confirmed the host-key fingerprint before it entered the private
+known-hosts store.
+
+Approved-profile discovery returned one password profile. The MCP
+`validate_connection` call returned `ready: true` and emitted the allowlisted
+success audit event. The in-process password transport opened no session,
+channel, command, file transfer, or forwarding request, so it made no change
+to the VPS.
+
+The agent-key success path and the host-key mismatch, unavailable credential,
+timeout, and invalid-input matrix entries remain pending. They require
+separate approved local profiles or pre-existing unavailable endpoints; this
+evidence does not claim those cases passed.
