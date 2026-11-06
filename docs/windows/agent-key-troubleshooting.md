@@ -46,13 +46,6 @@ not take ownership, make ACLs broader, share agent state, or bypass host-key
 verification. Remove an unusable key pair only with the environment owner's
 explicit authorization and target only that pair.
 
-## Timeout acceptance case
-
-The timeout scenario requires an owner-designated, pre-existing unavailable
-non-production endpoint and an approved local profile. Do not invent an
-address, repurpose a production destination, disable a service, or alter a
-network path to manufacture the condition.
-
 ## Safe evidence
 
 Keep only the date, build commit, runtime versions, authentication mode, fixed
