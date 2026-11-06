@@ -155,7 +155,8 @@ test('exposes only allowlisted approved profile metadata through the discovery t
     tools: [
       {
         name: listApprovedProfilesToolName,
-        description: 'Lists the identifiers of profiles approved by the operator. Connection, credential, and host details are not disclosed.',
+        description:
+          'Lists operator-approved profile IDs only. Use an ID returned here for validation; connection, credential, and host details are never disclosed.',
         inputSchema: { type: 'object', properties: {}, additionalProperties: false },
       },
     ],
@@ -304,10 +305,21 @@ test('validates an approved profile through the trusted readiness provider', asy
     id: 2,
     method: 'tools/list',
   });
-  assert.equal(
-    (listedTools.result as { tools: readonly { readonly name: string }[] }).tools.some((tool) => tool.name === validateConnectionToolName),
-    true,
+  const validationTool = (listedTools.result as { tools: readonly unknown[] }).tools.find(
+    (tool): tool is { readonly name: string } =>
+      typeof tool === 'object' && tool !== null && (tool as { readonly name?: unknown }).name === validateConnectionToolName,
   );
+  assert.deepEqual(validationTool, {
+    name: validateConnectionToolName,
+    description:
+      'Checks readiness for one operator-approved SSH profile ID. Use only a discovered or explicitly authorized ID; it accepts no commands, connection settings, credentials, or paths.',
+    inputSchema: {
+      type: 'object',
+      properties: { profileId: { type: 'string', pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$' } },
+      required: ['profileId'],
+      additionalProperties: false,
+    },
+  });
   const response = await requestResponse(input, output, {
     jsonrpc: '2.0',
     id: 3,
