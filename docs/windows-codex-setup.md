@@ -16,15 +16,17 @@ platform, architecture, version, filesystem, or safety failure is unavailable
 rather than partially supported.
 
 The Windows runtime advertises `validate_connection` only when the supported
-native addon, protected profile state, verified known-hosts boundary, trusted
-OpenSSH/agent boundary, and Credential Manager boundary are all available.
-It validates only an approved profile identifier; agent-key validation first
-uses the native `ssh-add -l` probe and then a cancellable native no-command
-readiness check with a private known-hosts snapshot. Password validation keeps
-the verified known-hosts bytes in memory because it launches no SSH child. If
-any prerequisite is unavailable, the tool is omitted as a safe fail-closed
-result, not an invitation to pass hosts, credentials, paths, or commands to
-the MCP server.
+native runtime and provider-composition boundaries are available, including
+protected profile state and verified known-hosts storage. It validates only an
+approved profile identifier; agent-key validation first uses the native
+`ssh-add -l` probe and then a cancellable native no-command readiness check
+with a private known-hosts snapshot. Password validation keeps the verified
+known-hosts bytes in memory because it launches no SSH child. A listed tool
+does not guarantee that a later validation succeeds: each call still fails
+closed when, for example, the approved credential is unavailable, SSH
+authentication fails, or host identity verification fails. If a required
+composition boundary is unavailable, the tool is omitted; this is not an
+invitation to pass hosts, credentials, paths, or commands to the MCP server.
 
 ## Prerequisites
 
@@ -250,13 +252,15 @@ prerequisites.
 
 For a `password` profile, use `"authMode": "password"` and add an opaque
 `"credentialReference": "os://ssh/<opaque-locator>"`. Password readiness is
-implemented only for the supported Windows alpha and only when the verified
-storage, known-hosts, Credential Manager, and in-memory transport boundaries
-are available; otherwise `validate_connection` is not advertised. Create the
-matching Generic Credential in the current user's Windows Credential Manager
-with target name `Vissoto/ssh-mcp-server/<opaque-locator>`. Enter the secret in
-the Credential Manager UI; never use a command line, environment variable,
-profile JSON, or Codex configuration for it.
+implemented only for the supported Windows alpha. The required runtime and
+provider-composition boundaries determine whether `validate_connection` is
+advertised; the Credential Manager lookup, host-identity verification, and
+authentication happen during each validation request and can still return a
+fail-closed tool error. Create the matching Generic Credential in the current
+user's Windows Credential Manager with target name
+`Vissoto/ssh-mcp-server/<opaque-locator>`. Enter the secret in the Credential
+Manager UI; never use a command line, environment variable, profile JSON, or
+Codex configuration for it.
 
 ## Register the stdio server with Codex
 
@@ -283,12 +287,14 @@ args = ['D:\path\to\ssh-mcp-server\dist\server.js']
 ```
 
 Restart Codex after changing its MCP configuration, then inspect the server's
-listed tools. On a supported, fully configured Windows alpha host, the expected
-tools are `list_approved_profiles` and `validate_connection`; on an unsupported
-or incompletely configured host, `validate_connection` is omitted. If state is
-missing or unsafe, discovery fails closed when called and returns no profile
-data. Do not run `node dist/server.js` interactively to test it: its standard
-input and output are reserved exclusively for MCP JSON-RPC.
+listed tools. On a supported host with complete provider composition, the
+expected tools are `list_approved_profiles` and `validate_connection`; on an
+unsupported host or when composition is incomplete, `validate_connection` is
+omitted. Its presence does not guarantee connection readiness: an individual
+call can still fail closed. If state is missing or unsafe, discovery fails
+closed when called and returns no profile data. Do not run
+`node dist/server.js` interactively to test it: its standard input and output
+are reserved exclusively for MCP JSON-RPC.
 
 ## Diagnostics and safe operation
 
