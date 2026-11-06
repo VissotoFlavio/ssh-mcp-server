@@ -16,6 +16,10 @@ state layout, and Codex stdio configuration, see
 Windows runtime advertises `validate_connection` only when every required
 trusted boundary is available; otherwise it omits the tool and fails closed.
 
+The internal alpha distribution decision, reproducible build process, and
+protected delivery boundary are recorded in
+[Native Windows alpha delivery boundary](docs/windows-alpha-delivery.md).
+
 ## Runtime configuration
 
 Set `SSH_MCP_STATE_ROOT` to the absolute operator-owned directory containing the fixed `connection-profiles.json` state file. Set `SSH_MCP_KNOWN_HOSTS_ROOT` to a separate absolute operator-owned directory containing one `<profile-id>.known_hosts` file for each approved `known-hosts://<profile-id>` reference. On supported POSIX hosts, both roots and their files must be owned by the MCP process user, have no group/other write bits, and contain no symbolic links. Discovery returns only approved profile identifiers and a fixed `operator-approved` classification; it never returns connection, credential, path, or host-identity details.
