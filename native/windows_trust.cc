@@ -937,7 +937,10 @@ NativeReadinessResult ValidateAgentKeyReadiness(SnapshotSession* snapshot, const
       L"-o", L"ControlPersist=no", L"-o", L"CanonicalizeHostname=no", L"-o", L"ProxyCommand=none", L"-o", L"ProxyJump=none",
       L"-o", L"HostName=" + host, L"-o", L"BatchMode=yes", L"-o", L"StrictHostKeyChecking=yes", L"-o", L"UserKnownHostsFile=" + known_hosts,
       L"-o", L"GlobalKnownHostsFile=NUL", L"-o", L"PasswordAuthentication=no", L"-o", L"KbdInteractiveAuthentication=no",
-      L"-o", L"NumberOfPasswordPrompts=0", L"-o", L"IdentitiesOnly=yes", L"-p", std::to_wstring(port), L"--", destination};
+      // The approved key is deliberately held only by the current-user agent;
+      // no private-key path is available to this native boundary. Restricting
+      // identities here would therefore suppress that agent identity.
+      L"-o", L"NumberOfPasswordPrompts=0", L"-o", L"IdentitiesOnly=no", L"-p", std::to_wstring(port), L"--", destination};
   Handle master;
   if (!StartHiddenProcess(ssh, FixedCommandLine(ssh, master_arguments), &master)) return result;
   const ULONGLONG started = GetTickCount64();

@@ -9,6 +9,8 @@ publish a release.
 
 - Windows password validation now reports redacted host-key, authentication,
   connection, and timeout failures with their stable MCP diagnostic codes.
+- Windows agent-key readiness now permits the approved current-user
+  `ssh-agent` identity when no private-key path is available to the MCP.
 
 ### Added
 
