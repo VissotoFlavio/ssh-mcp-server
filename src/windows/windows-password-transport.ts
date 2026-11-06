@@ -44,6 +44,16 @@ function matchesFingerprint(key: Buffer, expected: string): boolean {
   return actualBytes.byteLength === expectedBytes.byteLength && timingSafeEqual(actualBytes, expectedBytes);
 }
 
+function isRemoteAuthenticationRejection(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, 'level');
+    return descriptor !== undefined && 'value' in descriptor && descriptor.value === 'client-authentication';
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Establishes an in-memory password validation connection. `hostVerifier` is
  * reached during the SSH handshake before `authHandler` reads the credential.
@@ -92,8 +102,12 @@ export class WindowsInMemoryPasswordTransport {
       const timer = setTimeout(timeout, boundedTimeout(request.timeoutMs));
       signal?.addEventListener('abort', abort, { once: true });
       client.on('ready', () => finish());
-      client.on('error', () => {
-        const diagnosticCode = hostRejected ? 'host-key-failure' : credentialRejected ? 'authentication-failure' : 'ssh-connection-failed';
+      client.on('error', (error) => {
+        const diagnosticCode = hostRejected
+          ? 'host-key-failure'
+          : credentialRejected || isRemoteAuthenticationRejection(error)
+            ? 'authentication-failure'
+            : 'ssh-connection-failed';
         finish(new WindowsPasswordTransportError(diagnosticCode));
       });
       try {
