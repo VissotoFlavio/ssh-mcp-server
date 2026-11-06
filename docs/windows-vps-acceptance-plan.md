@@ -31,6 +31,14 @@ or pull request.
 - Capture a local baseline of the MCP process's standard error audit stream
   and the non-production VPS's existing SSH audit source, if available. The
   latter is read-only evidence; do not alter VPS logging to perform this test.
+- For `agent-key` success, the key must be generated and loaded by the same
+  normal Windows user that runs Codex. Stop on an ownership, protected-DACL,
+  agent-service, or identity-loading failure; do not run Codex elevated or
+  weaken local security controls as a workaround.
+- For timeout, obtain an owner-designated, pre-existing unavailable
+  non-production endpoint and an approved local profile before testing. Do
+  not invent an address, repurpose production, or make an endpoint unavailable
+  to create this case.
 
 ## Test matrix
 
@@ -77,6 +85,11 @@ The acceptance report may state whether each case passed, failed, or was not
 run. It must never include raw JSON-RPC transcripts, hostnames, IP addresses,
 usernames, profile IDs, Credential Manager target names, fingerprints,
 known-hosts data, executable paths, or secrets.
+
+When a prerequisite is unavailable, record only its category (for example,
+current-user key ownership, agent identity, or approved timeout endpoint) and
+mark the case as not run. Do not include raw ACL output, key material, service
+configuration, or connection details.
 
 ## Sanitized execution evidence
 
