@@ -78,7 +78,7 @@ test('does not advertise password validation without verified known-hosts bytes'
   assert.equal(runtime.connectionValidationProvider, undefined);
 });
 
-test('keeps agent-key validation available without direct known-hosts reads', () => {
+test('keeps an injected agent-key validation session available without direct known-hosts reads', async () => {
   const profiles = [
     {
       profileId: 'production-api',
@@ -90,13 +90,23 @@ test('keeps agent-key validation available without direct known-hosts reads', ()
       expectedHostFingerprint: 'SHA256:1111111111111111111111111111111111111111111',
     },
   ];
-  const runtime = createWindowsRuntimeProviders({
-    listProfiles: () => profiles,
-    getProfile: (profileId) => profiles.find((profile) => profile.profileId === profileId),
-    withKnownHostsSnapshot: async (_reference, work) => work(Buffer.from('approved'), {}),
-  });
+  const validated: unknown[] = [];
+  const runtime = createWindowsRuntimeProviders(
+    {
+      listProfiles: () => profiles,
+      getProfile: (profileId) => profiles.find((profile) => profile.profileId === profileId),
+      withKnownHostsSnapshot: async (_reference, work) => work(Buffer.from('approved'), {}),
+    },
+    {
+      validate: async (input) => {
+        validated.push(input);
+      },
+    },
+  );
 
   assert.notEqual(runtime.connectionValidationProvider, undefined);
+  await runtime.connectionValidationProvider!.validateConnection({ profileId: 'production-api' });
+  assert.deepEqual(validated, [{ profileId: 'production-api' }]);
 });
 
 test('does not advertise validate_connection with an incomplete native storage boundary', async () => {
