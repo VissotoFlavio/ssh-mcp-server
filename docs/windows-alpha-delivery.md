@@ -24,6 +24,19 @@ No license is selected by this preparation work. Distribution beyond the
 repository's existing access controls requires separate legal direction and a
 reviewed license decision.
 
+## Candidate packages
+
+On an eligible release or hotfix pull request, an authorized exact
+`/generate-candidate` comment can create a GitHub prerelease candidate bound
+to that pull request's immutable head commit. It never publishes to npm and
+never creates a stable release.
+
+Candidate assets are Windows x64 packages containing the compiled runtime and
+only the production native addon. They are emitted separately for Node.js 22
+and Node.js 24 because native addon ABIs are not interchangeable. A candidate
+is suitable only for the documented native Windows envelope and the matching
+Node.js major version.
+
 ## Reproducible local build
 
 On a supported x64 Windows host, use a clean checkout and an approved Node.js
