@@ -228,6 +228,10 @@ the profile's host identity matches it. The profile contains only connection
 metadata and an approved known-hosts reference; it contains no private-key
 path, passphrase, or secret.
 
+See the [agent-key troubleshooting runbook](windows/agent-key-troubleshooting.md)
+for fail-closed ownership, agent identity, remote authorization, and timeout
+prerequisites.
+
 ### Stop conditions and recovery
 
 - If the key directory or either key leaf is not owned by the current user or

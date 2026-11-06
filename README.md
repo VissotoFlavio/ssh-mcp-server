@@ -15,6 +15,8 @@ state layout, and Codex stdio configuration, see
 [Windows installation and Codex setup](docs/windows-codex-setup.md). The
 Windows runtime advertises `validate_connection` only when every required
 trusted boundary is available; otherwise it omits the tool and fails closed.
+For current-user agent, ACL, and controlled-timeout prerequisites, see the
+[Windows agent-key troubleshooting runbook](docs/windows/agent-key-troubleshooting.md).
 
 The internal alpha distribution decision, reproducible build process, and
 protected delivery boundary are recorded in
