@@ -217,12 +217,15 @@ jobs:
         env:
           CANDIDATE_VERSION: ${{ needs.resolve.outputs.candidate_version }}
         run: |
-          $manifest = Get-Content -Raw package.json | ConvertFrom-Json
-          $lock = Get-Content -Raw package-lock.json | ConvertFrom-Json
-          if ($manifest.version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' -or $manifest.version -ne $lock.version -or $manifest.version -ne $lock.packages.' '.version) {
+          $versions = node -e "const fs = require('node:fs'); const manifest = JSON.parse(fs.readFileSync('package.json', 'utf8')); const lock = JSON.parse(fs.readFileSync('package-lock.json', 'utf8')); console.log(manifest.version); console.log(lock.version); console.log(lock.packages[''].version);"
+          if ($LASTEXITCODE -ne 0 -or $versions.Count -ne 3) {
+            throw 'Unable to read package metadata.'
+          }
+          $manifestVersion, $lockVersion, $rootPackageVersion = $versions
+          if ($manifestVersion -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' -or $manifestVersion -ne $lockVersion -or $manifestVersion -ne $rootPackageVersion) {
             throw 'package.json and package-lock.json must match the stable branch version.'
           }
-          if ($env:CANDIDATE_VERSION -notmatch "^$([regex]::Escape($manifest.version))-(rc|hotfix)\.\d+\.[0-9a-f]{12}$") {
+          if ($env:CANDIDATE_VERSION -notmatch "^$([regex]::Escape($manifestVersion))-(rc|hotfix)\.\d+\.[0-9a-f]{12}$") {
             throw 'The candidate version does not match the stable package version.'
           }
 
@@ -394,10 +397,17 @@ jobs:
           else
             body="$(printf '%s\n\n## Package candidate unavailable\n\nReason: %s\n\nRun: %s\n\nVerify the release branch and retry `/generate-candidate`.' "$marker" "$reason" "$run_url")"
           fi
-          comments="$(gh api "repos/$REPOSITORY/issues/$PULL_REQUEST_NUMBER/comments" --paginate)"
+          if ! comments="$(gh api "repos/$REPOSITORY/issues/$PULL_REQUEST_NUMBER/comments" --paginate)"; then
+            echo "::warning::Unable to read existing candidate comments; the check was updated but no PR comment was written."
+            exit 0
+          fi
           comment_id="$(jq --raw-output --arg marker "$marker" '[.[] | select((.user.login == "github-actions[bot]" or .user.id == 41898282) and (.body | startswith($marker)))] | first | .id // empty' <<<"$comments")"
           if [[ -n "$comment_id" ]]; then
-            gh api --method PATCH "repos/$REPOSITORY/issues/comments/$comment_id" --raw-field body="$body" >/dev/null
+            if ! gh api --method PATCH "repos/$REPOSITORY/issues/comments/$comment_id" --raw-field body="$body" >/dev/null; then
+              echo "::warning::Unable to update the candidate PR comment; the check was updated."
+            fi
           else
-            gh api --method POST "repos/$REPOSITORY/issues/$PULL_REQUEST_NUMBER/comments" --raw-field body="$body" >/dev/null
+            if ! gh api --method POST "repos/$REPOSITORY/issues/$PULL_REQUEST_NUMBER/comments" --raw-field body="$body" >/dev/null; then
+              echo "::warning::Unable to create the candidate PR comment; the check was updated."
+            fi
           fi
