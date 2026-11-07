@@ -3,7 +3,7 @@
 ## Status and support boundary
 
 This document is the authoritative security model for the native Windows
-runtime proposed for `v0.1.0-alpha.1`. It is a design boundary, not a claim
+runtime released in `v0.1.0`. It is a design boundary, not a claim
 that the current POSIX runtime supports Windows.
 
 The Windows runtime is **per-user only**. It never requires elevation, reads
@@ -111,13 +111,16 @@ runtime must apply all of these rules before reading or trusting content:
   opened. The final handle path must remain directly beneath the verified
   root, on the same local NTFS volume.
 
-Known-hosts data is read through its verified source handle and copied into an
-immutable snapshot in a new private directory before any SSH child starts.
-Only the verified snapshot pathname is passed to OpenSSH; the source pathname
-is never passed to a child. Creation uses exclusive handles, and the snapshot
-directory and leaf identities and ACLs are verified before data is written,
-read, used, or removed. A replacement of the source after capture cannot
-alter the snapshot supplied to SSH.
+Known-hosts data is read through its verified source handle. Agent-key
+validation copies those bytes into an immutable snapshot in a new private
+directory before any SSH child starts. Only the verified snapshot pathname is
+passed to OpenSSH; the source pathname is never passed to a child. Creation
+uses exclusive handles, and the snapshot directory and leaf identities and
+ACLs are verified before data is written, read, used, or removed. A
+replacement of the source after capture cannot alter the snapshot supplied to
+SSH. Password validation uses the verified bytes only in memory: it launches
+no child process and never passes either source or snapshot pathname to a
+transport.
 
 Other temporary state is also created only through this boundary in a new,
 private directory. Cleanup is handle/identity-aware and never recursively
@@ -161,12 +164,12 @@ is never used to automate password prompts.
 
 ## Authentication ordering
 
-All authentication modes first verify the approved profile and capture the
-approved known-hosts data through the storage boundary. `agent-key` validation
-may then use the verified Windows OpenSSH executables and its private snapshot.
-Password validation must instead use an in-process transport and a narrow
-Credential Manager boundary. The transport must complete the server host-key
-handshake, compare the presented key with the captured approved data, and
+All authentication modes first verify the approved profile and read approved
+known-hosts data through the storage boundary. `agent-key` validation then
+uses its private snapshot with the verified Windows OpenSSH executables.
+Password validation uses the verified bytes in an in-process transport and a
+narrow Credential Manager boundary. The transport must complete the server
+host-key handshake, compare the presented key with the approved data, and
 signal verified identity before the Credential Manager is queried or a
 password callback can release material. A host-key failure therefore requests
 no credential. Passwords remain in memory and never enter arguments,

@@ -1,0 +1,413 @@
+name: Generate package candidate from comment
+
+on:
+  issue_comment:
+    types:
+      - created
+
+permissions:
+  contents: read
+
+concurrency:
+  group: package-candidate-${{ github.repository }}-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    if: >-
+      github.event.issue.pull_request &&
+      github.event.comment.body == '/generate-candidate'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      accepted: ${{ steps.request.outputs.accepted }}
+      candidate_version: ${{ steps.request.outputs.candidate_version }}
+      error: ${{ steps.request.outputs.error }}
+      pull_request_number: ${{ steps.request.outputs.pull_request_number }}
+      source_sha: ${{ steps.request.outputs.source_sha }}
+    steps:
+      - id: request
+        name: Resolve trusted candidate request
+        shell: bash
+        env:
+          COMMENT_ASSOCIATION: ${{ github.event.comment.author_association }}
+          GH_TOKEN: ${{ github.token }}
+          PULL_REQUEST_NUMBER: ${{ github.event.issue.number }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          accepted=false
+          candidate_version=''
+          error='Candidate generation requires an authorized actor on an open same-repository release/* or hotfix/* pull request targeting master.'
+          source_sha=''
+          pull_request="$(gh api "repos/$REPOSITORY/pulls/$PULL_REQUEST_NUMBER")"
+          head_branch="$(jq --raw-output '.head.ref // empty' <<<"$pull_request")"
+          head_repository="$(jq --raw-output '.head.repo.full_name // empty' <<<"$pull_request")"
+          source_sha="$(jq --raw-output '.head.sha // empty' <<<"$pull_request")"
+
+          if [[ "$COMMENT_ASSOCIATION" =~ ^(OWNER|MEMBER|COLLABORATOR)$ ]] &&
+             jq --exit-status \
+               --arg repository "$REPOSITORY" \
+               '.state == "open" and
+                .merged_at == null and
+                .base.ref == "master" and
+                (.head.ref | startswith("release/") or startswith("hotfix/")) and
+                .head.repo.full_name == $repository and
+                (.head.sha | test("^[0-9a-f]{40}$"))' <<<"$pull_request" >/dev/null; then
+            if [[ "$head_branch" == release/* ]]; then
+              base_version="${head_branch#release/}"
+              channel=rc
+            else
+              base_version="${head_branch#hotfix/}"
+              channel=hotfix
+            fi
+
+            if [[ "$base_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              accepted=true
+              candidate_version="${base_version}-${channel}.${PULL_REQUEST_NUMBER}.${source_sha:0:12}"
+              error=''
+            else
+              error='Candidate branches must use release/<stable-semver> or hotfix/<stable-semver>.'
+            fi
+          fi
+
+          {
+            echo "accepted=$accepted"
+            echo "candidate_version=$candidate_version"
+            echo "error=$error"
+            echo "pull_request_number=$PULL_REQUEST_NUMBER"
+            echo "source_sha=$source_sha"
+          } >> "$GITHUB_OUTPUT"
+
+  check:
+    needs: resolve
+    if: needs.resolve.outputs.source_sha != ''
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+    outputs:
+      id: ${{ steps.create.outputs.id }}
+    steps:
+      - id: create
+        name: Create package candidate check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          check="$(gh api --method POST "repos/$REPOSITORY/check-runs" \
+            --raw-field name='Package candidate' \
+            --raw-field head_sha="$SOURCE_SHA" \
+            --raw-field status=in_progress \
+            --raw-field details_url="$GITHUB_SERVER_URL/$REPOSITORY/actions/runs/$GITHUB_RUN_ID")"
+          echo "id=$(jq --raw-output .id <<<"$check")" >> "$GITHUB_OUTPUT"
+
+  validate-linux:
+    needs: resolve
+    if: needs.resolve.outputs.accepted == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [22.x, 24.x]
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Check out candidate source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          persist-credentials: false
+
+      - name: Revalidate pull request identity
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PULL_REQUEST_NUMBER: ${{ needs.resolve.outputs.pull_request_number }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPOSITORY/pulls/$PULL_REQUEST_NUMBER" | jq --exit-status \
+            --arg repository "$REPOSITORY" \
+            --arg source_sha "$SOURCE_SHA" \
+            '.state == "open" and .merged_at == null and .base.ref == "master" and
+             (.head.ref | startswith("release/") or startswith("hotfix/")) and
+             .head.repo.full_name == $repository and .head.sha == $source_sha' >/dev/null
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - name: Validate candidate
+        run: |
+          npm ci
+          npm run format:check
+          npm run lint
+          npm test
+          npm run build
+
+  validate-windows:
+    needs: resolve
+    if: needs.resolve.outputs.accepted == 'true'
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-major: [22, 24]
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Check out candidate source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          persist-credentials: false
+
+      - name: Revalidate pull request identity
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PULL_REQUEST_NUMBER: ${{ needs.resolve.outputs.pull_request_number }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPOSITORY/pulls/$PULL_REQUEST_NUMBER" | jq --exit-status \
+            --arg repository "$REPOSITORY" \
+            --arg source_sha "$SOURCE_SHA" \
+            '.state == "open" and .merged_at == null and .base.ref == "master" and
+             (.head.ref | startswith("release/") or startswith("hotfix/")) and
+             .head.repo.full_name == $repository and .head.sha == $source_sha' >/dev/null
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-major }}.x
+          cache: npm
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Validate Windows candidate
+        shell: pwsh
+        run: |
+          npm ci
+          npm run format:check
+          npm run lint
+          npm run build:native
+          if (-not (Test-Path 'build/Release/windows_trust.node') -or -not (Test-Path 'build/Release/windows_trust_test.node')) {
+            throw 'The production and test-only Windows native trust boundaries were not built.'
+          }
+          npm test
+          npm run build
+
+      - id: metadata
+        name: Verify release metadata
+        shell: pwsh
+        env:
+          CANDIDATE_VERSION: ${{ needs.resolve.outputs.candidate_version }}
+        run: |
+          $versions = node -e "const fs = require('node:fs'); const manifest = JSON.parse(fs.readFileSync('package.json', 'utf8')); const lock = JSON.parse(fs.readFileSync('package-lock.json', 'utf8')); console.log(manifest.version); console.log(lock.version); console.log(lock.packages[''].version);"
+          if ($LASTEXITCODE -ne 0 -or $versions.Count -ne 3) {
+            throw 'Unable to read package metadata.'
+          }
+          $manifestVersion, $lockVersion, $rootPackageVersion = $versions
+          if ($manifestVersion -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' -or $manifestVersion -ne $lockVersion -or $manifestVersion -ne $rootPackageVersion) {
+            throw 'package.json and package-lock.json must match the stable branch version.'
+          }
+          if ($env:CANDIDATE_VERSION -notmatch "^$([regex]::Escape($manifestVersion))-(rc|hotfix)\.\d+\.[0-9a-f]{12}$") {
+            throw 'The candidate version does not match the stable package version.'
+          }
+
+      - id: pack
+        name: Pack Windows runtime candidate
+        shell: pwsh
+        env:
+          CANDIDATE_VERSION: ${{ needs.resolve.outputs.candidate_version }}
+          NODE_MAJOR: ${{ matrix.node-major }}
+        run: |
+          npm version $env:CANDIDATE_VERSION --no-git-tag-version --ignore-scripts
+          $pack = npm pack --json | ConvertFrom-Json
+          $result = $pack[0]
+          $allowed = @('CHANGELOG.md', 'README.md', 'package.json')
+          $unexpected = @($result.files.path | Where-Object {
+            $_ -notin $allowed -and
+            -not $_.StartsWith('dist/') -and
+            -not $_.StartsWith('docs/') -and
+            $_ -ne 'build/Release/windows_trust.node'
+          })
+          if (-not $result.filename -or
+              -not ($result.files.path -contains 'dist/server.js') -or
+              -not ($result.files.path -contains 'build/Release/windows_trust.node') -or
+              ($result.files.path -contains 'build/Release/windows_trust_test.node') -or
+              $unexpected.Count -ne 0) {
+            throw 'npm pack did not produce the expected runtime-only package.'
+          }
+          $asset = "ssh-mcp-server-$($env:CANDIDATE_VERSION)-win32-x64-node$($env:NODE_MAJOR).tgz"
+          Move-Item -LiteralPath $result.filename -Destination $asset
+          "asset_name=$asset" | Add-Content $env:GITHUB_OUTPUT
+
+      - name: Upload candidate package
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate-node${{ matrix.node-major }}
+          path: ${{ steps.pack.outputs.asset_name }}
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs:
+      - resolve
+      - validate-linux
+      - validate-windows
+    if: needs.validate-linux.result == 'success' && needs.validate-windows.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    outputs:
+      release_url: ${{ steps.release.outputs.release_url }}
+    steps:
+      - name: Download candidate packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: candidate-node*
+          path: candidate
+          merge-multiple: true
+
+      - id: release
+        name: Publish or verify candidate prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PULL_REQUEST_NUMBER: ${{ needs.resolve.outputs.pull_request_number }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          VERSION: ${{ needs.resolve.outputs.candidate_version }}
+        run: |
+          set -euo pipefail
+
+          fail() {
+            echo "::error::$1"
+            exit 1
+          }
+
+          gh api "repos/$REPOSITORY/pulls/$PULL_REQUEST_NUMBER" | jq --exit-status \
+            --arg repository "$REPOSITORY" \
+            --arg source_sha "$SOURCE_SHA" \
+            '.state == "open" and .merged_at == null and .base.ref == "master" and
+             (.head.ref | startswith("release/") or startswith("hotfix/")) and
+             .head.repo.full_name == $repository and .head.sha == $source_sha' >/dev/null || fail 'The pull request changed while the candidate was being generated.'
+
+          expected=(
+            "ssh-mcp-server-$VERSION-win32-x64-node22.tgz"
+            "ssh-mcp-server-$VERSION-win32-x64-node24.tgz"
+          )
+          for asset in "${expected[@]}"; do
+            [[ -f "candidate/$asset" ]] || fail "The validated candidate asset $asset is unavailable."
+          done
+
+          tag="v$VERSION"
+          if release="$(gh release view "$tag" --repo "$REPOSITORY" --json isPrerelease,targetCommitish,url 2>/dev/null)"; then
+            jq --exit-status --arg source_sha "$SOURCE_SHA" '.isPrerelease == true and .targetCommitish == $source_sha' <<<"$release" >/dev/null || fail "Existing $tag Release is not the expected prerelease."
+          else
+            gh release create "$tag" --repo "$REPOSITORY" --target "$SOURCE_SHA" --title "Candidate $VERSION" --generate-notes --prerelease
+          fi
+
+          assets="$(gh release view "$tag" --repo "$REPOSITORY" --json assets --jq '.assets')"
+          for asset in "${expected[@]}"; do
+            if ! jq --exit-status --arg asset "$asset" '.[] | select(.name == $asset)' <<<"$assets" >/dev/null; then
+              gh release upload "$tag" "candidate/$asset" --repo "$REPOSITORY"
+            fi
+          done
+
+          echo "release_url=$(gh release view "$tag" --repo "$REPOSITORY" --json url --jq '.url')" >> "$GITHUB_OUTPUT"
+
+  report:
+    needs:
+      - resolve
+      - check
+      - validate-linux
+      - validate-windows
+      - publish
+    if: always() && needs.resolve.result != 'skipped'
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+      issues: write
+      pull-requests: read
+    steps:
+      - name: Complete check and report candidate outcome
+        shell: bash
+        env:
+          CANDIDATE_VERSION: ${{ needs.resolve.outputs.candidate_version }}
+          CHECK_ID: ${{ needs.check.outputs.id }}
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+          PULL_REQUEST_NUMBER: ${{ needs.resolve.outputs.pull_request_number }}
+          REPOSITORY: ${{ github.repository }}
+          REQUEST_ACCEPTED: ${{ needs.resolve.outputs.accepted }}
+          REQUEST_ERROR: ${{ needs.resolve.outputs.error }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          VALIDATE_LINUX_RESULT: ${{ needs.validate-linux.result }}
+          VALIDATE_WINDOWS_RESULT: ${{ needs.validate-windows.result }}
+        run: |
+          set -euo pipefail
+
+          status=failure
+          title='Package candidate was not started'
+          reason="$REQUEST_ERROR"
+          if [[ "$REQUEST_ACCEPTED" == true ]]; then
+            if [[ "$VALIDATE_LINUX_RESULT" == success && "$VALIDATE_WINDOWS_RESULT" == success && "$PUBLISH_RESULT" == success ]]; then
+              status=success
+              title="Package candidate $CANDIDATE_VERSION generated"
+              reason=''
+            elif [[ "$VALIDATE_LINUX_RESULT" != success || "$VALIDATE_WINDOWS_RESULT" != success ]]; then
+              title='Package candidate validation failed'
+              reason='The candidate did not pass validation or package inspection.'
+            else
+              title='Package candidate publication failed'
+              reason='The validated candidate could not be published to its prerelease.'
+            fi
+          fi
+
+          run_url="$GITHUB_SERVER_URL/$REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          if [[ -n "$CHECK_ID" ]]; then
+            gh api --method PATCH "repos/$REPOSITORY/check-runs/$CHECK_ID" \
+              --raw-field status=completed \
+              --raw-field conclusion="$status" \
+              --raw-field details_url="$run_url" \
+              --raw-field "output[title]=$title" \
+              --raw-field "output[summary]=${reason:-Immutable candidate $CANDIDATE_VERSION was generated for $SOURCE_SHA.}" >/dev/null
+          fi
+
+          marker="<!-- ssh-mcp-server:candidate:$REPOSITORY:$PULL_REQUEST_NUMBER -->"
+          if [[ "$status" == success ]]; then
+            body="$(printf '%s\n\n## Package candidate generated\n\nVersion: `%s`\n\nAssets: Windows x64 packages for Node.js 22 and Node.js 24 are attached to the [candidate prerelease](%s).\n\nCommit: `%s`\n\nRun: %s' "$marker" "$CANDIDATE_VERSION" "${{ needs.publish.outputs.release_url }}" "$SOURCE_SHA" "$run_url")"
+          else
+            body="$(printf '%s\n\n## Package candidate unavailable\n\nReason: %s\n\nRun: %s\n\nVerify the release branch and retry `/generate-candidate`.' "$marker" "$reason" "$run_url")"
+          fi
+          if ! comments="$(gh api "repos/$REPOSITORY/issues/$PULL_REQUEST_NUMBER/comments" --paginate)"; then
+            echo "::warning::Unable to read existing candidate comments; the check was updated but no PR comment was written."
+            exit 0
+          fi
+          comment_id="$(jq --raw-output --arg marker "$marker" '[.[] | select((.user.login == "github-actions[bot]" or .user.id == 41898282) and (.body | startswith($marker)))] | first | .id // empty' <<<"$comments")"
+          if [[ -n "$comment_id" ]]; then
+            if ! gh api --method PATCH "repos/$REPOSITORY/issues/comments/$comment_id" --raw-field body="$body" >/dev/null; then
+              echo "::warning::Unable to update the candidate PR comment; the check was updated."
+            fi
+          else
+            if ! gh api --method POST "repos/$REPOSITORY/issues/$PULL_REQUEST_NUMBER/comments" --raw-field body="$body" >/dev/null; then
+              echo "::warning::Unable to create the candidate PR comment; the check was updated."
+            fi
+          fi

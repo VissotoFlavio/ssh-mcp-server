@@ -25,11 +25,16 @@ function session(
 ) {
   let captures = 0;
   let disposals = 0;
+  let reads = 0;
   const requests: unknown[] = [];
   const agentRequests: unknown[] = [];
   const candidate = new WindowsValidationSession({
     storage: {
       getProfile: (profileId) => (profileId === profile.profileId ? (overrides.profile ?? profile) : undefined),
+      readKnownHosts: () => {
+        reads += 1;
+        return overrides.bytes ?? knownHosts;
+      },
       withKnownHostsSnapshot: async (_reference, work) => {
         captures += 1;
         try {
@@ -52,10 +57,10 @@ function session(
       },
     }),
   });
-  return { candidate, captures: () => captures, disposals: () => disposals, requests, agentRequests };
+  return { candidate, reads: () => reads, captures: () => captures, disposals: () => disposals, requests, agentRequests };
 }
 
-test('composes captured known-hosts bytes, policy, and in-memory password readiness without caller connection fields', async () => {
+test('composes verified known-hosts bytes, policy, and in-memory password readiness without caller connection fields', async () => {
   const candidate = session();
   await candidate.candidate.validate({ profileId: profile.profileId });
   assert.equal(candidate.requests.length, 1);
@@ -72,13 +77,15 @@ test('composes captured known-hosts bytes, policy, and in-memory password readin
     },
   );
   assert.ok(request.timeoutMs > 0 && request.timeoutMs <= 10_000);
-  assert.equal(candidate.captures(), 1);
-  assert.equal(candidate.disposals(), 1);
+  assert.equal(candidate.reads(), 1);
+  assert.equal(candidate.captures(), 0);
+  assert.equal(candidate.disposals(), 0);
 });
 
 test('rejects caller-controlled connection fields before profile lookup, snapshot capture, or password readiness', async () => {
   const candidate = session();
   await assert.rejects(candidate.candidate.validate({ profileId: profile.profileId, host: 'attacker.example' }));
+  assert.equal(candidate.reads(), 0);
   assert.equal(candidate.captures(), 0);
   assert.equal(candidate.disposals(), 0);
   assert.deepEqual(candidate.requests, []);
@@ -115,6 +122,7 @@ test('forwards cancellation to the native ssh-add identity gate before readiness
   const candidate = new WindowsValidationSession({
     storage: {
       getProfile: () => ({ ...profile, authMode: 'agent-key' }),
+      readKnownHosts: () => knownHosts,
       withKnownHostsSnapshot: async (_reference, work) => work(knownHosts, {}),
     },
     agentIdentity: {
@@ -138,11 +146,12 @@ test('forwards cancellation to the native ssh-add identity gate before readiness
   assert.equal(received, controller.signal);
 });
 
-test('disposes the captured snapshot when known-hosts parsing rejects unsafe data', async () => {
+test('rejects unsafe verified known-hosts data before password readiness', async () => {
   const candidate = session({ bytes: Buffer.from('api.internal.example ssh-ed25519 not-base64!\n') });
   await assert.rejects(candidate.candidate.validate({ profileId: profile.profileId }), WindowsValidationSessionError);
-  assert.equal(candidate.captures(), 1);
-  assert.equal(candidate.disposals(), 1);
+  assert.equal(candidate.reads(), 1);
+  assert.equal(candidate.captures(), 0);
+  assert.equal(candidate.disposals(), 0);
   assert.deepEqual(candidate.requests, []);
 });
 
@@ -151,6 +160,7 @@ test('propagates cancellation before storage access', async () => {
   const controller = new AbortController();
   controller.abort();
   await assert.rejects(candidate.candidate.validate({ profileId: profile.profileId }, controller.signal), WindowsValidationSessionError);
+  assert.equal(candidate.reads(), 0);
   assert.equal(candidate.captures(), 0);
   assert.deepEqual(candidate.requests, []);
 });
@@ -159,14 +169,19 @@ test('uses one remaining validation budget after snapshot capture', async () => 
   const observed: Array<{ timeoutMs: number; signal: AbortSignal | undefined }> = [];
   const timed = new WindowsValidationSession({
     storage: {
-      getProfile: () => profile,
+      getProfile: () => ({ ...profile, authMode: 'agent-key' }),
+      readKnownHosts: () => knownHosts,
       withKnownHostsSnapshot: async (_reference, work) => {
         await new Promise((resolve) => setTimeout(resolve, 20));
         return work(knownHosts, {});
       },
     },
-    agentIdentity: { isAvailable: () => false },
-    agentReadiness: { validate: async () => undefined },
+    agentIdentity: { isAvailable: () => true },
+    agentReadiness: {
+      validate: async (_capability, _descriptor, timeoutMs, signal) => {
+        observed.push({ timeoutMs, signal });
+      },
+    },
     createPasswordTransport: () => ({
       connect: async (request, signal) => {
         observed.push({ timeoutMs: request.timeoutMs, signal });

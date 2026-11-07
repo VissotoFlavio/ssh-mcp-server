@@ -2,7 +2,14 @@
   "name": "ssh-mcp-server",
   "version": "0.1.0",
   "private": true,
-  "description": "A secure, policy-driven Model Context Protocol server for approved SSH operations.",
+  "files": [
+    "dist",
+    "build/Release/windows_trust.node",
+    "README.md",
+    "CHANGELOG.md",
+    "docs"
+  ],
+  "description": "Secure MCP server for approved SSH profile discovery and connection readiness checks. No remote command execution or agent-supplied credentials.",
   "type": "module",
   "engines": {
     "node": ">=22"

@@ -16,13 +16,17 @@ platform, architecture, version, filesystem, or safety failure is unavailable
 rather than partially supported.
 
 The Windows runtime advertises `validate_connection` only when the supported
-native addon, protected profile state, known-hosts snapshot boundary, trusted
-OpenSSH/agent boundary, and Credential Manager boundary are all available.
-It validates only an approved profile identifier; agent-key validation first
-uses the native `ssh-add -l` probe and then a cancellable native no-command
-readiness check. If any prerequisite is unavailable, the tool is omitted as a
-safe fail-closed result, not an invitation to pass hosts, credentials, paths,
-or commands to the MCP server.
+native runtime and provider-composition boundaries are available, including
+protected profile state and verified known-hosts storage. It validates only an
+approved profile identifier; agent-key validation first uses the native
+`ssh-add -l` probe and then a cancellable native no-command readiness check
+with a private known-hosts snapshot. Password validation keeps the verified
+known-hosts bytes in memory because it launches no SSH child. A listed tool
+does not guarantee that a later validation succeeds: each call still fails
+closed when, for example, the approved credential is unavailable, SSH
+authentication fails, or host identity verification fails. If a required
+composition boundary is unavailable, the tool is omitted; this is not an
+invitation to pass hosts, credentials, paths, or commands to the MCP server.
 
 ## Prerequisites
 
@@ -173,12 +177,90 @@ If either ACL operation or the later MCP call fails, stop and diagnose the
 current-user ownership, protected DACL, local NTFS location, and reparse-point
 status. Never weaken the ACL or substitute a shared location.
 
-For a future `password` profile, use `"authMode": "password"` and add an
-opaque `"credentialReference": "os://ssh/<opaque-locator>"`. Create the
-matching Generic Credential in the current user's Windows Credential Manager
-with target name `Vissoto/ssh-mcp-server/<opaque-locator>`. Enter the secret in
-the Credential Manager UI; never use a command line, environment variable,
-profile JSON, or Codex configuration for it.
+## Configure an agent-key identity
+
+Perform this procedure in a normal, non-administrative PowerShell session for
+the same Windows user that runs Codex and the MCP server. Do not generate a
+key from an elevated Codex session and then attempt to use it from a normal
+session: the owner or DACL can differ, and the MCP must fail closed instead of
+relaxing the ACL.
+
+Create a dedicated private key beneath the already private per-user root. The
+following command intentionally prompts for a passphrase without placing it on
+a command line. If local policy explicitly permits a passphrase-free key for
+unattended agent loading, use the corresponding OpenSSH option only after
+ensuring the private-key ACL remains restricted to the current user.
+
+```powershell
+$keyRoot = Join-Path $root 'keys'
+New-Item -ItemType Directory -Force $keyRoot | Out-Null
+Set-PrivateFileAcl $keyRoot $true
+
+$keyPath = Join-Path $keyRoot 'ssh-mcp-agent-ed25519'
+if (Test-Path -LiteralPath $keyPath) {
+  throw 'Refusing to overwrite an existing MCP agent key.'
+}
+
+& (Join-Path $openSsh 'ssh-keygen.exe') -t ed25519 -a 64 -f $keyPath -C 'ssh-mcp-agent'
+Set-PrivateFileAcl $keyPath $false
+Set-PrivateFileAcl "$keyPath.pub" $false
+```
+
+The public key may be added to the intended account's `authorized_keys` only
+with explicit authorization from that environment's owner. Never copy, upload,
+or record the private key, passphrase, key path, or a public-key fingerprint in
+an MCP profile, Codex configuration, pull request, issue, or support record.
+
+Load the key only into the same current-user OpenSSH agent that the MCP will
+probe:
+
+```powershell
+& (Join-Path $openSsh 'ssh-add.exe') $keyPath
+& (Join-Path $openSsh 'ssh-add.exe') -l
+```
+
+Keep the second command's identity output local; it is a readiness check, not
+evidence to paste into a ticket. If the agent service is disabled or unavailable,
+have the device administrator enable the supported Windows OpenSSH service.
+Do not run Codex or the MCP elevated as a workaround.
+
+Before adding an `agent-key` profile, obtain the target host key and SHA-256
+fingerprint out of band, populate the approved known-hosts entry, and verify
+the profile's host identity matches it. The profile contains only connection
+metadata and an approved known-hosts reference; it contains no private-key
+path, passphrase, or secret.
+
+See the [agent-key troubleshooting runbook](windows/agent-key-troubleshooting.md)
+for fail-closed ownership, agent identity, remote authorization, and timeout
+prerequisites.
+
+### Stop conditions and recovery
+
+- If the key directory or either key leaf is not owned by the current user or
+  lacks a protected private DACL, stop. Do not take ownership, loosen the ACL,
+  or reuse that key from another Windows identity; recreate it from the
+  intended user's normal session.
+- If an elevated process created an unusable key, remove it only with the
+  environment owner's explicit authorization. The removal is separate from
+  generation and must target only the identified key pair.
+- If no approved agent identity is loaded, do not generate an arbitrary key
+  and claim success. The corresponding public key must first be authorized on
+  the intended environment.
+- If the MCP runs under a different Windows identity from the interactive
+  user, configure and validate the key in the MCP process identity. Do not
+  attempt to share agent state between users.
+
+For a `password` profile, use `"authMode": "password"` and add an opaque
+`"credentialReference": "os://ssh/<opaque-locator>"`. Password readiness is
+implemented only for the supported Windows alpha. The required runtime and
+provider-composition boundaries determine whether `validate_connection` is
+advertised; the Credential Manager lookup, host-identity verification, and
+authentication happen during each validation request and can still return a
+fail-closed tool error. Create the matching Generic Credential in the current
+user's Windows Credential Manager with target name
+`Vissoto/ssh-mcp-server/<opaque-locator>`. Enter the secret in the Credential
+Manager UI; never use a command line, environment variable, profile JSON, or
+Codex configuration for it.
 
 ## Register the stdio server with Codex
 
@@ -205,12 +287,14 @@ args = ['D:\path\to\ssh-mcp-server\dist\server.js']
 ```
 
 Restart Codex after changing its MCP configuration, then inspect the server's
-listed tools. On a supported, fully configured Windows alpha host, the expected
-tools are `list_approved_profiles` and `validate_connection`; on an unsupported
-or incompletely configured host, `validate_connection` is omitted. If state is
-missing or unsafe, discovery fails closed when called and returns no profile
-data. Do not run `node dist/server.js` interactively to test it: its standard
-input and output are reserved exclusively for MCP JSON-RPC.
+listed tools. On a supported host with complete provider composition, the
+expected tools are `list_approved_profiles` and `validate_connection`; on an
+unsupported host or when composition is incomplete, `validate_connection` is
+omitted. Its presence does not guarantee connection readiness: an individual
+call can still fail closed. If state is missing or unsafe, discovery fails
+closed when called and returns no profile data. Do not run
+`node dist/server.js` interactively to test it: its standard input and output
+are reserved exclusively for MCP JSON-RPC.
 
 ## Diagnostics and safe operation
 

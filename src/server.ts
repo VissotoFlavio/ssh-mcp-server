@@ -28,9 +28,9 @@ export const listApprovedProfilesToolName = 'list_approved_profiles';
 export const validateConnectionToolName = 'validate_connection';
 
 const LIST_APPROVED_PROFILES_DESCRIPTION =
-  'Lists the identifiers of profiles approved by the operator. Connection, credential, and host details are not disclosed.';
+  'Lists operator-approved profile IDs only. Use an ID returned here for validation; connection, credential, and host details are never disclosed.';
 const VALIDATE_CONNECTION_DESCRIPTION =
-  'Validates readiness for an operator-approved SSH connection. It accepts only a profile identifier and never accepts commands or connection settings.';
+  'Checks readiness for one operator-approved SSH profile ID. Use only a discovered or explicitly authorized ID; it accepts no commands, connection settings, credentials, or paths.';
 const SAFE_PROFILE_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
 const MAX_DISCOVERABLE_PROFILES = 256;
 
