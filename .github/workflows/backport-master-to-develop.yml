@@ -28,6 +28,18 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Validate BACKPORT_TOKEN
+        env:
+          BACKPORT_TOKEN: ${{ secrets.BACKPORT_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${BACKPORT_TOKEN:-}" ]]; then
+            echo "::error::The BACKPORT_TOKEN Actions secret is not configured."
+            exit 1
+          fi
+
       - name: Validate source and existing backport
         id: validate
         env:
@@ -80,13 +92,13 @@ jobs:
           branch_sha="$(jq -r --arg ref "$branch_ref" '.[] | select(.ref == $ref) | .object.sha' <<<"$refs_json")"
 
           prs_json="$(gh api --method GET "repos/${REPOSITORY}/pulls" \
-            -f state=open \
+            -f state=all \
             -f head="${REPOSITORY_OWNER}:${backport_branch}" \
             -f per_page=100)"
           pr_count="$(jq 'length' <<<"$prs_json")"
 
           if (( pr_count > 1 )); then
-            fail "More than one open backport pull request exists for ${backport_branch}."
+            fail "More than one matching backport pull request exists for ${backport_branch}."
           fi
 
           action="create_branch_and_pr"
@@ -99,17 +111,33 @@ jobs:
           if (( pr_count == 1 )); then
             pr_base="$(jq -r '.[0].base.ref' <<<"$prs_json")"
             pr_head_sha="$(jq -r '.[0].head.sha' <<<"$prs_json")"
+            pr_head_repo="$(jq -r '.[0].head.repo.full_name // ""' <<<"$prs_json")"
+            pr_head_ref="$(jq -r '.[0].head.ref // ""' <<<"$prs_json")"
+            pr_state="$(jq -r '.[0].state' <<<"$prs_json")"
+            pr_merged_at="$(jq -r '.[0].merged_at // ""' <<<"$prs_json")"
             existing_pr_url="$(jq -r '.[0].html_url' <<<"$prs_json")"
 
-            if [[ -z "$branch_sha" ]]; then
-              fail "An open backport pull request exists but its deterministic branch is missing."
+            if [[ "$pr_head_repo" != "$REPOSITORY" || "$pr_head_ref" != "$backport_branch" ]]; then
+              fail "The existing backport pull request head provenance does not match the repository and deterministic branch."
             fi
 
-            if [[ "$pr_base" != "develop" || "$pr_head_sha" != "$MERGE_SHA" ]]; then
-              fail "The existing backport pull request does not represent the expected merge commit to develop."
-            fi
+            if [[ "$pr_base" == "develop" && "$pr_head_sha" == "$MERGE_SHA" && -n "$pr_merged_at" ]]; then
+              action="complete"
+            elif [[ "$pr_state" == "open" ]]; then
+              if [[ -z "$branch_sha" ]]; then
+                fail "An open backport pull request exists but its deterministic branch is missing."
+              fi
 
-            action="reuse"
+              if [[ "$pr_base" != "develop" || "$pr_head_sha" != "$MERGE_SHA" ]]; then
+                fail "The existing backport pull request does not represent the expected merge commit to develop."
+              fi
+
+              action="reuse"
+            elif [[ "$pr_state" == "closed" && -z "$pr_merged_at" ]]; then
+              fail "A closed, unmerged backport pull request already exists for ${backport_branch}; resolve it before retrying."
+            else
+              fail "The existing backport pull request does not represent the expected merged commit to develop."
+            fi
           elif [[ -n "$branch_sha" ]]; then
             action="create_pr"
           fi
@@ -124,6 +152,9 @@ jobs:
             if [[ -n "$existing_pr_url" ]]; then
               echo "- Existing pull request: ${existing_pr_url}"
             fi
+            if [[ "$action" == "complete" ]]; then
+              echo "- Completion: the existing backport pull request is merged; no mutation is required."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
           echo "action=${action}" >> "$GITHUB_OUTPUT"
           echo "backport_branch=${backport_branch}" >> "$GITHUB_OUTPUT"
@@ -131,7 +162,7 @@ jobs:
           echo "existing_pr_url=${existing_pr_url}" >> "$GITHUB_OUTPUT"
 
       - name: Create backport branch and pull request
-        if: steps.validate.outputs.action != 'reuse'
+        if: steps.validate.outputs.action == 'create_branch_and_pr' || steps.validate.outputs.action == 'create_pr'
         env:
           GH_TOKEN: ${{ secrets.BACKPORT_TOKEN }}
           REPOSITORY: ${{ github.repository }}
@@ -149,22 +180,18 @@ jobs:
             exit 1
           }
 
-          if [[ -z "${GH_TOKEN:-}" ]]; then
-            fail "The BACKPORT_TOKEN Actions secret is not configured."
-          fi
-
           branch_ref="refs/heads/${BACKPORT_BRANCH}"
           refs_json="$(gh api --method GET "repos/${REPOSITORY}/git/matching-refs/heads/${BACKPORT_BRANCH}")"
           branch_sha="$(jq -r --arg ref "$branch_ref" '.[] | select(.ref == $ref) | .object.sha' <<<"$refs_json")"
 
           prs_json="$(gh api --method GET "repos/${REPOSITORY}/pulls" \
-            -f state=open \
+            -f state=all \
             -f head="${REPOSITORY_OWNER}:${BACKPORT_BRANCH}" \
             -f per_page=100)"
           pr_count="$(jq 'length' <<<"$prs_json")"
 
           if (( pr_count > 1 )); then
-            fail "More than one open backport pull request exists for ${BACKPORT_BRANCH}."
+            fail "More than one matching backport pull request exists for ${BACKPORT_BRANCH}."
           fi
 
           if [[ -n "$branch_sha" && "$branch_sha" != "$MERGE_SHA" ]]; then
@@ -174,11 +201,36 @@ jobs:
           if (( pr_count == 1 )); then
             pr_base="$(jq -r '.[0].base.ref' <<<"$prs_json")"
             pr_head_sha="$(jq -r '.[0].head.sha' <<<"$prs_json")"
+            pr_head_repo="$(jq -r '.[0].head.repo.full_name // ""' <<<"$prs_json")"
+            pr_head_ref="$(jq -r '.[0].head.ref // ""' <<<"$prs_json")"
+            pr_state="$(jq -r '.[0].state' <<<"$prs_json")"
+            pr_merged_at="$(jq -r '.[0].merged_at // ""' <<<"$prs_json")"
             pr_url="$(jq -r '.[0].html_url' <<<"$prs_json")"
 
-            if [[ "$branch_sha" == "$MERGE_SHA" && "$pr_base" == "develop" && "$pr_head_sha" == "$MERGE_SHA" ]]; then
+            if [[ "$pr_head_repo" != "$REPOSITORY" || "$pr_head_ref" != "$BACKPORT_BRANCH" ]]; then
+              fail "The existing backport pull request head provenance does not match the repository and deterministic branch."
+            fi
+
+            if [[ "$pr_base" == "develop" && "$pr_head_sha" == "$MERGE_SHA" && -n "$pr_merged_at" ]]; then
+              {
+                echo "### Backport validation"
+                echo "Existing backport pull request is merged: ${pr_url}"
+                echo "No mutation is required."
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+
+            if [[ "$pr_state" == "open" && -z "$branch_sha" ]]; then
+              fail "An open backport pull request exists but its deterministic branch is missing."
+            fi
+
+            if [[ "$pr_state" == "open" && "$branch_sha" == "$MERGE_SHA" && "$pr_base" == "develop" && "$pr_head_sha" == "$MERGE_SHA" ]]; then
               echo "Backport pull request already exists: ${pr_url}"
               exit 0
+            fi
+
+            if [[ "$pr_state" == "closed" && -z "$pr_merged_at" ]]; then
+              fail "A closed, unmerged backport pull request already exists for ${BACKPORT_BRANCH}; resolve it before retrying."
             fi
 
             fail "An existing backport pull request does not represent the expected merge commit to develop."

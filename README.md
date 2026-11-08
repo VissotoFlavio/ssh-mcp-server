@@ -38,6 +38,13 @@ Windows x64 assets for Node.js 22 and Node.js 24. Select the asset matching the
 Node.js major version used by Codex, install it from a trusted local file, and
 do not copy its addon into another environment.
 
+Merged `release/*` and `hotfix/*` pull requests are backported automatically
+from `master` to `develop`. Repository maintainers must configure the
+repository-scoped `BACKPORT_TOKEN` Actions secret with the minimum permissions
+described in the [automated backport guide](docs/backport-automation.md). The
+workflow fails closed with an actionable error when the secret is unavailable;
+this repository does not contain or claim to configure its value.
+
 The package contains only the compiled runtime, the production Windows addon,
 and operator documentation. It intentionally excludes source, tests, CI files,
 development configuration, and the test-only native addon.
