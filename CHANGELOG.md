@@ -16,8 +16,10 @@ publish a release.
 
 - Package-candidate workflow metadata validation now reads the npm lockfile's
   empty root-package key with Node.js, allowing Windows candidate packaging to proceed.
-- Package-candidate PR-comment reporting no longer fails the workflow after its
-  check result is recorded when the GitHub comment API is unavailable.
+- Package-candidate reporting now gates checks and marked PR-comment mutation to
+  authorized requests, uses the minimum report permissions, isolates check
+  completion failures from comment publication, and fails explicitly with
+  actionable guidance when reporting is unavailable.
 - Windows password validation now reports redacted host-key, authentication,
   connection, and timeout failures with their stable MCP diagnostic codes.
 - Windows agent-key readiness now selects the protected dedicated public key

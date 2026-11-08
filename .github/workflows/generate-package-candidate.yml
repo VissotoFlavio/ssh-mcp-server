@@ -26,6 +26,7 @@ jobs:
       candidate_version: ${{ steps.request.outputs.candidate_version }}
       error: ${{ steps.request.outputs.error }}
       pull_request_number: ${{ steps.request.outputs.pull_request_number }}
+      reportable: ${{ steps.request.outputs.reportable }}
       source_sha: ${{ steps.request.outputs.source_sha }}
     steps:
       - id: request
@@ -42,11 +43,12 @@ jobs:
           accepted=false
           candidate_version=''
           error='Candidate generation requires an authorized actor on an open same-repository release/* or hotfix/* pull request targeting master.'
+          reportable=false
           source_sha=''
           pull_request="$(gh api "repos/$REPOSITORY/pulls/$PULL_REQUEST_NUMBER")"
           head_branch="$(jq --raw-output '.head.ref // empty' <<<"$pull_request")"
           head_repository="$(jq --raw-output '.head.repo.full_name // empty' <<<"$pull_request")"
-          source_sha="$(jq --raw-output '.head.sha // empty' <<<"$pull_request")"
+          resolved_source_sha="$(jq --raw-output '.head.sha // empty' <<<"$pull_request")"
 
           if [[ "$COMMENT_ASSOCIATION" =~ ^(OWNER|MEMBER|COLLABORATOR)$ ]] &&
              jq --exit-status \
@@ -57,6 +59,8 @@ jobs:
                 (.head.ref | startswith("release/") or startswith("hotfix/")) and
                 .head.repo.full_name == $repository and
                 (.head.sha | test("^[0-9a-f]{40}$"))' <<<"$pull_request" >/dev/null; then
+            reportable=true
+            source_sha="$resolved_source_sha"
             if [[ "$head_branch" == release/* ]]; then
               base_version="${head_branch#release/}"
               channel=rc
@@ -79,12 +83,13 @@ jobs:
             echo "candidate_version=$candidate_version"
             echo "error=$error"
             echo "pull_request_number=$PULL_REQUEST_NUMBER"
+            echo "reportable=$reportable"
             echo "source_sha=$source_sha"
           } >> "$GITHUB_OUTPUT"
 
   check:
     needs: resolve
-    if: needs.resolve.outputs.source_sha != ''
+    if: needs.resolve.outputs.reportable == 'true'
     runs-on: ubuntu-latest
     permissions:
       checks: write
@@ -340,12 +345,11 @@ jobs:
       - validate-linux
       - validate-windows
       - publish
-    if: always() && needs.resolve.result != 'skipped'
+    if: always() && needs.resolve.result != 'skipped' && needs.resolve.outputs.reportable == 'true'
     runs-on: ubuntu-latest
     permissions:
       checks: write
-      issues: write
-      pull-requests: read
+      pull-requests: write
     steps:
       - name: Complete check and report candidate outcome
         shell: bash
@@ -361,6 +365,7 @@ jobs:
           SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
           VALIDATE_LINUX_RESULT: ${{ needs.validate-linux.result }}
           VALIDATE_WINDOWS_RESULT: ${{ needs.validate-windows.result }}
+          CHECK_RESULT: ${{ needs.check.result }}
         run: |
           set -euo pipefail
 
@@ -382,13 +387,26 @@ jobs:
           fi
 
           run_url="$GITHUB_SERVER_URL/$REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          if [[ -n "$CHECK_ID" ]]; then
-            gh api --method PATCH "repos/$REPOSITORY/check-runs/$CHECK_ID" \
-              --raw-field status=completed \
-              --raw-field conclusion="$status" \
-              --raw-field details_url="$run_url" \
-              --raw-field "output[title]=$title" \
-              --raw-field "output[summary]=${reason:-Immutable candidate $CANDIDATE_VERSION was generated for $SOURCE_SHA.}" >/dev/null
+          check_report_failed=false
+          if [[ "$CHECK_RESULT" != success || -z "$CHECK_ID" ]]; then
+            echo "::error::Unable to create the candidate check. Verify checks: write access for GITHUB_TOKEN and rerun /generate-candidate. The marked PR comment will still be attempted."
+            status=failure
+            title='Package candidate check reporting failed'
+            reason='The candidate result could not be recorded in the GitHub check. Verify checks: write access for GITHUB_TOKEN and rerun /generate-candidate.'
+            check_report_failed=true
+          else
+            if ! gh api --method PATCH "repos/$REPOSITORY/check-runs/$CHECK_ID" \
+                --raw-field status=completed \
+                --raw-field conclusion="$status" \
+                --raw-field details_url="$run_url" \
+                --raw-field "output[title]=$title" \
+                --raw-field "output[summary]=${reason:-Immutable candidate $CANDIDATE_VERSION was generated for $SOURCE_SHA.}" >/dev/null; then
+              echo "::error::Unable to complete the candidate check. Verify checks: write access for GITHUB_TOKEN and rerun /generate-candidate. The marked PR comment will still be attempted."
+              status=failure
+              title='Package candidate check reporting failed'
+              reason='The candidate result could not be recorded in the GitHub check. Verify checks: write access for GITHUB_TOKEN and rerun /generate-candidate.'
+              check_report_failed=true
+            fi
           fi
 
           marker="<!-- ssh-mcp-server:candidate:$REPOSITORY:$PULL_REQUEST_NUMBER -->"
@@ -397,17 +415,25 @@ jobs:
           else
             body="$(printf '%s\n\n## Package candidate unavailable\n\nReason: %s\n\nRun: %s\n\nVerify the release branch and retry `/generate-candidate`.' "$marker" "$reason" "$run_url")"
           fi
+          comment_publication_failed=false
           if ! comments="$(gh api "repos/$REPOSITORY/issues/$PULL_REQUEST_NUMBER/comments" --paginate)"; then
-            echo "::warning::Unable to read existing candidate comments; the check was updated but no PR comment was written."
-            exit 0
-          fi
-          comment_id="$(jq --raw-output --arg marker "$marker" '[.[] | select((.user.login == "github-actions[bot]" or .user.id == 41898282) and (.body | startswith($marker)))] | first | .id // empty' <<<"$comments")"
-          if [[ -n "$comment_id" ]]; then
-            if ! gh api --method PATCH "repos/$REPOSITORY/issues/comments/$comment_id" --raw-field body="$body" >/dev/null; then
-              echo "::warning::Unable to update the candidate PR comment; the check was updated."
-            fi
+            echo "::error::Unable to read the existing candidate PR comment. Grant the report job pull-requests: write and rerun /generate-candidate."
+            comment_publication_failed=true
           else
-            if ! gh api --method POST "repos/$REPOSITORY/issues/$PULL_REQUEST_NUMBER/comments" --raw-field body="$body" >/dev/null; then
-              echo "::warning::Unable to create the candidate PR comment; the check was updated."
+            comment_id="$(jq --raw-output --arg marker "$marker" '[.[] | select((.user.login == "github-actions[bot]" or .user.id == 41898282) and (.body | startswith($marker)))] | first | .id // empty' <<<"$comments")"
+            if [[ -n "$comment_id" ]]; then
+              if ! gh api --method PATCH "repos/$REPOSITORY/issues/comments/$comment_id" --raw-field body="$body" >/dev/null; then
+                echo "::error::Unable to update the existing candidate PR comment. Verify pull-requests: write access for GITHUB_TOKEN and rerun /generate-candidate."
+                comment_publication_failed=true
+              fi
+            else
+              if ! gh api --method POST "repos/$REPOSITORY/issues/$PULL_REQUEST_NUMBER/comments" --raw-field body="$body" >/dev/null; then
+                echo "::error::Unable to create the candidate PR comment. Verify pull-requests: write access for GITHUB_TOKEN and rerun /generate-candidate."
+                comment_publication_failed=true
+              fi
             fi
+          fi
+          if [[ "$check_report_failed" == true || "$comment_publication_failed" == true ]]; then
+            echo "::error::Candidate reporting failed; the workflow result is failure and success was not reported as complete."
+            exit 1
           fi
