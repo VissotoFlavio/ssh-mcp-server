@@ -11,9 +11,15 @@ publish a release.
   Windows readiness categories, including local credential availability and
   known-hosts identity compatibility, without returning credential material or
   contacting a remote host.
+- Operational documentation and a contract test now cover the repository-scoped
+  `BACKPORT_TOKEN` required by automated release and hotfix backports.
+- Backport retries now recognize already merged pull requests and fail closed
+  on closed, unmerged matches instead of creating duplicate pull requests.
 
 ### Fixed
 
+- Automated backport retries now verify the existing pull request's source
+  repository and deterministic branch before treating it as reusable or complete.
 - Package-candidate workflow metadata validation now reads the npm lockfile's
   empty root-package key with Node.js, allowing Windows candidate packaging to proceed.
 - Package-candidate reporting now gates checks and marked PR-comment mutation to
