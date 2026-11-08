@@ -45,6 +45,25 @@ test('does not turn a known-hosts reference into an arbitrary filename', () => {
   assert.match(storage.readKnownHosts('known-hosts://production-api').toString('utf8'), /ssh-ed25519/u);
 });
 
+test('probes only an approved credential locator without reading password material', () => {
+  let passwordReads = 0;
+  let probeLocator: string | undefined;
+  const storage = new WindowsSecureStorage({
+    ...binding(),
+    readCredential: () => ((passwordReads += 1), 'secret'),
+    credentialAvailable: (locator) => {
+      probeLocator = locator;
+      return false;
+    },
+  });
+
+  assert.equal(storage.credentialAvailable('os://ssh/production-api'), false);
+  assert.equal(probeLocator, 'production-api');
+  assert.equal(passwordReads, 0);
+  assert.throws(() => storage.credentialAvailable('os://ssh/../private'), WindowsSecureStorageError);
+  assert.equal(passwordReads, 0);
+});
+
 test('fails closed for malformed state or native failures', () => {
   assert.throws(
     () => new WindowsSecureStorage(binding({ profiles: [{ ...profile, password: 'secret' }] })).listProfiles(),

@@ -125,7 +125,7 @@ test('does not advertise validate_connection with an incomplete native storage b
   const tools = JSON.parse(String(response)) as { result: { tools: Array<{ name: string }> } };
   assert.deepEqual(
     tools.result.tools.map(({ name }) => name),
-    ['list_approved_profiles'],
+    ['list_approved_profiles', 'get_windows_readiness_status'],
   );
   input.end();
   await server;
@@ -142,7 +142,10 @@ test('keeps unsupported and unknown platforms fail closed', () => {
     composed += 1;
     return createWindowsRuntimeProviders({ listProfiles: () => [] });
   };
-  assert.deepEqual(createProductionRuntimeProviders('win32', false, factory), {});
+  const unsupportedWindows = createProductionRuntimeProviders('win32', false, factory);
+  assert.equal(unsupportedWindows.approvedProfileListingProvider, undefined);
+  assert.equal(unsupportedWindows.connectionValidationProvider, undefined);
+  assert.notEqual(unsupportedWindows.windowsReadinessStatusProvider, undefined);
   assert.deepEqual(createProductionRuntimeProviders('freebsd', true, factory), {});
   assert.equal(composed, 0);
 });
@@ -176,8 +179,11 @@ test('does not advertise tools when Windows runtime support is unavailable', asy
   const listed = once(output, 'data');
   input.write('{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n');
   const [response] = await listed;
-  const tools = JSON.parse(String(response)) as { result: { tools: unknown[] } };
-  assert.deepEqual(tools.result.tools, []);
+  const tools = JSON.parse(String(response)) as { result: { tools: Array<{ name: string }> } };
+  assert.deepEqual(
+    tools.result.tools.map((tool) => tool.name),
+    ['get_windows_readiness_status'],
+  );
   input.end();
   await server;
 });

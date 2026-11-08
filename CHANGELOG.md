@@ -5,6 +5,13 @@ publish a release.
 
 ## Unreleased
 
+### Added
+
+- A redacted `get_windows_readiness_status` MCP tool reports bounded local
+  Windows readiness categories, including local credential availability and
+  known-hosts identity compatibility, without returning credential material or
+  contacting a remote host.
+
 ### Fixed
 
 - Package-candidate workflow metadata validation now reads the npm lockfile's

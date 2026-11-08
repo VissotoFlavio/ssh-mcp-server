@@ -75,7 +75,9 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
 } else {
   const binding = nativeRequire(addonPath) as {
     readProfileState(): Buffer;
+    inspectReadiness(): { readonly registry: string; readonly filesystem: string; readonly configuration: string };
     readKnownHosts(profileId: string): Buffer;
+    credentialAvailable(locator: string): boolean;
     captureKnownHostsSnapshot(profileId: string): { bytes: Buffer; capability: object };
     disposeKnownHostsSnapshot(capability: unknown): void;
     startAgentKeyReadiness(
@@ -157,8 +159,10 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
       runFixture('safe', root);
       configured = true;
       assert.equal(binding.readProfileState().toString('utf8'), '{"profiles":[]}');
+      assert.deepEqual(binding.inspectReadiness(), { registry: 'ready', filesystem: 'ready', configuration: 'ready' });
       assert.match(binding.readKnownHosts('production-api').toString('utf8'), /ssh-ed25519/u);
       assert.throws(() => binding.readCredential('.'), /Windows secure storage is unavailable/u);
+      assert.equal(typeof binding.credentialAvailable, 'function');
       const ssh = binding.resolveOpenSsh();
       assert.match(ssh.ssh, /\\System32\\OpenSSH\\ssh\.exe$/iu);
       assert.match(ssh.sshAdd, /\\System32\\OpenSSH\\ssh-add\.exe$/iu);
@@ -401,6 +405,21 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
   test('launches a completed native child and terminates a timed-out native child', () => {
     assert.deepEqual(testBinding.testLaunch('exit', 5_000), { completed: true, timedOut: false, exitCode: 23 });
     assert.deepEqual(testBinding.testLaunch('hang', 100), { completed: false, timedOut: true, exitCode: 0 });
+  });
+
+  test('reports an unsafe root as a redacted filesystem prerequisite', () => {
+    const root = uniqueRoot('unsafe-readiness-root');
+    let configured = false;
+    try {
+      runFixture('unsafe-root', root);
+      configured = true;
+      const readiness = binding.inspectReadiness();
+      assert.deepEqual(readiness, { registry: 'ready', filesystem: 'unavailable', configuration: 'not-checked' });
+      assert.equal(JSON.stringify(readiness).includes(root), false);
+      assert.equal(JSON.stringify(readiness).includes('\\'), false);
+    } finally {
+      if (configured) runFixture('cleanup', root);
+    }
   });
 
   const registryMutationRights: readonly RegistryMutationRight[] = [
