@@ -1065,6 +1065,73 @@ napi_value ReadProfileState(napi_env env, napi_callback_info) {
   return ToBuffer(env, data);
 }
 
+// Exposes only fixed local-prerequisite categories. In particular, this probe
+// never returns configured roots, profile contents, known-hosts data, or any
+// Credential Manager value.
+napi_value InspectReadiness(napi_env env, napi_callback_info info) {
+  size_t count = 0;
+  if (napi_get_cb_info(env, info, &count, nullptr, nullptr, nullptr) != napi_ok || count != 0) return Unavailable(env);
+
+  const char* registry = "unavailable";
+  const char* filesystem = "not-checked";
+  const char* configuration = "not-checked";
+  std::vector<BYTE> operator_sid;
+  HKEY raw_key = nullptr;
+  std::wstring state_root;
+  std::wstring known_hosts_root;
+  std::vector<BYTE> state;
+
+  if (!CurrentUserSid(&operator_sid) ||
+      RegOpenKeyExW(HKEY_CURRENT_USER, kConfigurationKey, 0, KEY_READ | READ_CONTROL, &raw_key) != ERROR_SUCCESS) {
+    goto result;
+  }
+  {
+    RegistryKey key(raw_key);
+    raw_key = nullptr;
+    if (!VerifyRegistryConfiguration(key.get(), operator_sid.data())) goto result;
+    registry = "ready";
+    if (!ReadStringValue(key.get(), L"StateRoot", &state_root) || !ReadStringValue(key.get(), L"KnownHostsRoot", &known_hosts_root) ||
+        !IsLocalNtfsPath(state_root) || !IsLocalNtfsPath(known_hosts_root)) {
+      configuration = "unavailable";
+      goto result;
+    }
+  }
+  if (!VerifyDirectoryChain(state_root, operator_sid.data()) || !VerifyDirectoryChain(known_hosts_root, operator_sid.data())) {
+    filesystem = "unavailable";
+    goto result;
+  }
+  filesystem = "ready";
+  // Root identity and nesting are configuration properties. Directory-chain
+  // safety is checked first so absent, unsafe, or reparse roots are reported
+  // as a filesystem prerequisite rather than an ambiguous configuration error.
+  if (!RootsAreDistinct(state_root, known_hosts_root, operator_sid.data())) {
+    configuration = "unavailable";
+    goto result;
+  }
+  if (!ReadProtectedFile(state_root, kStateFile, operator_sid.data(), &state)) {
+    configuration = "unavailable";
+    goto result;
+  }
+  configuration = "ready";
+
+result:
+  if (raw_key != nullptr) RegCloseKey(raw_key);
+  napi_value result{};
+  napi_value registry_value{};
+  napi_value filesystem_value{};
+  napi_value configuration_value{};
+  if (napi_create_object(env, &result) != napi_ok ||
+      napi_create_string_utf8(env, registry, NAPI_AUTO_LENGTH, &registry_value) != napi_ok ||
+      napi_create_string_utf8(env, filesystem, NAPI_AUTO_LENGTH, &filesystem_value) != napi_ok ||
+      napi_create_string_utf8(env, configuration, NAPI_AUTO_LENGTH, &configuration_value) != napi_ok ||
+      napi_set_named_property(env, result, "registry", registry_value) != napi_ok ||
+      napi_set_named_property(env, result, "filesystem", filesystem_value) != napi_ok ||
+      napi_set_named_property(env, result, "configuration", configuration_value) != napi_ok) {
+    return Unavailable(env);
+  }
+  return result;
+}
+
 napi_value ReadKnownHosts(napi_env env, napi_callback_info info) {
   std::string profile_id;
   std::wstring state_root;
@@ -1445,22 +1512,48 @@ napi_value ProbeSshAdd(napi_env env, napi_callback_info info) {
   return napi_create_int32(env, static_cast<int32_t>(exit_code), &result) == napi_ok ? result : Unavailable(env);
 }
 
+bool HasUsableCredentialBlob(const CREDENTIALW* credential) {
+  if (credential == nullptr || credential->CredentialBlob == nullptr || credential->CredentialBlobSize == 0 ||
+      credential->CredentialBlobSize > 4096 || (credential->CredentialBlobSize % sizeof(wchar_t)) != 0) {
+    return false;
+  }
+  const auto* units = reinterpret_cast<const wchar_t*>(credential->CredentialBlob);
+  const size_t length = credential->CredentialBlobSize / sizeof(wchar_t);
+  for (size_t index = 0; index < length; ++index) {
+    if (units[index] == L'\0') return false;
+  }
+  return true;
+}
+
 napi_value ReadCredential(napi_env env, napi_callback_info info) {
   std::string locator;
   if (!ReadCredentialLocator(env, info, &locator)) return Unavailable(env);
   std::wstring target = kCredentialTargetPrefix + std::wstring(locator.begin(), locator.end());
   PCREDENTIALW credential = nullptr;
-  if (!CredReadW(target.c_str(), CRED_TYPE_GENERIC, 0, &credential) || credential == nullptr || credential->CredentialBlobSize == 0 || credential->CredentialBlobSize > 4096 || (credential->CredentialBlobSize % sizeof(wchar_t)) != 0) {
+  if (!CredReadW(target.c_str(), CRED_TYPE_GENERIC, 0, &credential) || !HasUsableCredentialBlob(credential)) {
     if (credential != nullptr) CredFree(credential);
     return Unavailable(env);
   }
   std::wstring password(reinterpret_cast<wchar_t*>(credential->CredentialBlob), credential->CredentialBlobSize / sizeof(wchar_t));
   CredFree(credential);
-  if (password.empty() || password.find(L'\0') != std::wstring::npos) return Unavailable(env);
   napi_value result{};
   const napi_status status = napi_create_string_utf16(env, reinterpret_cast<const char16_t*>(password.data()), password.size(), &result);
   std::fill(password.begin(), password.end(), L'\0');
   return status == napi_ok ? result : Unavailable(env);
+}
+
+// Credential Manager does not offer metadata-only lookup. This intentionally
+// observes only whether its non-secret structure is usable, then releases it
+// immediately without copying, converting, or returning its blob.
+napi_value CredentialAvailable(napi_env env, napi_callback_info info) {
+  std::string locator;
+  if (!ReadCredentialLocator(env, info, &locator)) return Unavailable(env);
+  const std::wstring target = kCredentialTargetPrefix + std::wstring(locator.begin(), locator.end());
+  PCREDENTIALW credential = nullptr;
+  const bool available = CredReadW(target.c_str(), CRED_TYPE_GENERIC, 0, &credential) != 0 && HasUsableCredentialBlob(credential);
+  if (credential != nullptr) CredFree(credential);
+  napi_value result{};
+  return napi_get_boolean(env, available, &result) == napi_ok ? result : Unavailable(env);
 }
 
 #ifdef SSH_MCP_NATIVE_TEST
@@ -1782,6 +1875,7 @@ napi_value TestLaunch(napi_env env, napi_callback_info info) {
 NAPI_MODULE_INIT() {
   napi_property_descriptor properties[] = {
     {"readProfileState", nullptr, ReadProfileState, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"inspectReadiness", nullptr, InspectReadiness, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"readKnownHosts", nullptr, ReadKnownHosts, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"captureKnownHostsSnapshot", nullptr, CaptureKnownHostsSnapshot, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"disposeKnownHostsSnapshot", nullptr, DisposeKnownHostsSnapshot, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -1792,6 +1886,7 @@ NAPI_MODULE_INIT() {
     {"probeSshAdd", nullptr, ProbeSshAdd, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"startSshAddProbe", nullptr, StartSshAddProbe, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"readCredential", nullptr, ReadCredential, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"credentialAvailable", nullptr, CredentialAvailable, nullptr, nullptr, nullptr, napi_default, nullptr},
 #ifdef SSH_MCP_NATIVE_TEST
     {"testReadReplacementRace", nullptr, TestReadReplacementRace, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"testReadStateFile", nullptr, TestReadStateFile, nullptr, nullptr, nullptr, napi_default, nullptr},

@@ -1,9 +1,8 @@
-import { createHash } from 'node:crypto';
-
-import { HostIdentityCredentialPolicy, type ApprovedKnownHostsEntry } from '../policy/host-identity-credential-policy.js';
+import { HostIdentityCredentialPolicy } from '../policy/host-identity-credential-policy.js';
 import { validateProfileSelection } from '../profiles/connection-profile.js';
 
 import { WindowsCredentialManager } from './windows-credential-manager.js';
+import { parseWindowsKnownHosts } from './windows-known-hosts.js';
 import { WindowsNativeAgentReadiness } from './windows-native-agent-readiness.js';
 import { WindowsOpenSshResolver, WindowsSshAddIdentity } from './windows-openssh.js';
 import { WindowsInMemoryPasswordTransport, type WindowsPasswordValidationRequest } from './windows-password-transport.js';
@@ -25,38 +24,6 @@ function unavailable(): never {
 
 function boundedTimeout(value: number | undefined): number {
   return Number.isInteger(value) && value !== undefined && value > 0 && value <= MAX_TIMEOUT_MS ? value : DEFAULT_TIMEOUT_MS;
-}
-
-function parseKnownHosts(bytes: Buffer): readonly ApprovedKnownHostsEntry[] {
-  const contents = bytes.toString('utf8');
-  if (!Buffer.from(contents, 'utf8').equals(bytes)) return unavailable();
-
-  const entries: ApprovedKnownHostsEntry[] = [];
-  for (const line of contents.split(/\r?\n/u)) {
-    const value = line.trim();
-    if (value === '' || value.startsWith('#')) continue;
-    const fields = value.split(/\s+/u);
-    const endpoint = /^(?:\[([^\]]+)\]:(\d+)|([A-Za-z0-9.-]+))$/u.exec(fields[0] ?? '');
-    const encodedKey = fields[2];
-    if (
-      fields.length !== 3 ||
-      endpoint === null ||
-      !/^[A-Za-z0-9@._+-]+$/u.test(fields[1] ?? '') ||
-      !/^[A-Za-z0-9+/]+={0,2}$/u.test(encodedKey ?? '')
-    ) {
-      return unavailable();
-    }
-    const key = Buffer.from(encodedKey, 'base64');
-    const host = endpoint[1] ?? endpoint[3];
-    const port = endpoint[2] === undefined ? 22 : Number(endpoint[2]);
-    if (host === undefined || key.byteLength === 0 || !Number.isInteger(port) || port < 1 || port > 65_535) return unavailable();
-    entries.push({
-      host,
-      port,
-      fingerprint: `SHA256:${createHash('sha256').update(key).digest('base64').replace(/=+$/u, '')}`,
-    });
-  }
-  return entries;
 }
 
 export interface WindowsPasswordReadinessTransport {
@@ -118,7 +85,7 @@ export class WindowsValidationSession {
     // credential lookup.
     if (profile.authMode === 'password') {
       if (remaining() === 0) return unavailable();
-      const entries = parseKnownHosts(this.dependencies.storage.readKnownHosts(profile.approvedKnownHostsReference));
+      const entries = parseWindowsKnownHosts(this.dependencies.storage.readKnownHosts(profile.approvedKnownHostsReference), unavailable);
       const policy = new HostIdentityCredentialPolicy({
         profiles: { getProfile: (profileId) => (profileId === selection.profileId ? profile : undefined) },
         knownHosts: {
@@ -148,7 +115,7 @@ export class WindowsValidationSession {
 
     await this.dependencies.storage.withKnownHostsSnapshot(profile.approvedKnownHostsReference, async (bytes, capability) => {
       if (remaining() === 0) return unavailable();
-      const entries = parseKnownHosts(bytes);
+      const entries = parseWindowsKnownHosts(bytes, unavailable);
       const policy = new HostIdentityCredentialPolicy({
         profiles: { getProfile: (profileId) => (profileId === selection.profileId ? profile : undefined) },
         knownHosts: {

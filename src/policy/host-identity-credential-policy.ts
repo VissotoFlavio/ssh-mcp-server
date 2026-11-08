@@ -299,6 +299,34 @@ function validateEntry(entry: unknown): ApprovedKnownHostsEntry {
   return { host: host as string, port: entry.port as number, fingerprint: fingerprint as string };
 }
 
+function resolveApprovedHostIdentity(profile: ConnectionProfile, entries: unknown): ApprovedKnownHostsEntry {
+  if (!Array.isArray(entries)) {
+    fail('known-hosts-unavailable', 'Approved known-hosts data is unavailable');
+  }
+  const normalizedEntries = entries.map(validateEntry);
+  const matchingEndpoint = normalizedEntries.filter((entry) => entry.host === profile.host && entry.port === profile.port);
+  if (matchingEndpoint.length === 0) {
+    fail('known-hosts-entry-missing', 'Approved known-hosts entry is missing');
+  }
+  if (matchingEndpoint.length !== 1) {
+    fail('known-hosts-entry-ambiguous', 'Approved known-hosts entry is ambiguous');
+  }
+  const hostIdentity = matchingEndpoint[0];
+  if (hostIdentity.fingerprint !== profile.expectedHostFingerprint) {
+    fail('known-hosts-entry-mismatch', 'Approved known-hosts entry does not match');
+  }
+  return hostIdentity;
+}
+
+/**
+ * Verify one locally approved profile against parsed known-hosts entries
+ * without checking an agent, touching credentials, or opening a connection.
+ */
+export function assertApprovedHostIdentity(profileInput: unknown, entries: unknown): void {
+  const profile = validatePolicyProfile(profileInput);
+  resolveApprovedHostIdentity(profile, entries);
+}
+
 /**
  * Check host identity and select an approved authentication mechanism. The
  * returned plan contains references and metadata only; no secret or key data.
@@ -329,22 +357,7 @@ export async function authorizeConnection(input: unknown, dependencies: HostIden
   } catch {
     fail('known-hosts-unavailable', 'Approved known-hosts data is unavailable');
   }
-  if (!Array.isArray(entries)) {
-    fail('known-hosts-unavailable', 'Approved known-hosts data is unavailable');
-  }
-
-  const normalizedEntries = entries.map(validateEntry);
-  const matchingEndpoint = normalizedEntries.filter((entry) => entry.host === profile.host && entry.port === profile.port);
-  if (matchingEndpoint.length === 0) {
-    fail('known-hosts-entry-missing', 'Approved known-hosts entry is missing');
-  }
-  if (matchingEndpoint.length !== 1) {
-    fail('known-hosts-entry-ambiguous', 'Approved known-hosts entry is ambiguous');
-  }
-  const hostIdentity = matchingEndpoint[0];
-  if (hostIdentity.fingerprint !== profile.expectedHostFingerprint) {
-    fail('known-hosts-entry-mismatch', 'Approved known-hosts entry does not match');
-  }
+  const hostIdentity = resolveApprovedHostIdentity(profile, entries);
 
   if (profile.authMode === 'agent-key') {
     let available = false;

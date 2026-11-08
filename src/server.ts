@@ -19,6 +19,13 @@ import {
   type ConnectionValidationProvider,
 } from './validation/trusted-connection-validation.js';
 import { WindowsOpenSshResolver } from './windows/windows-openssh.js';
+import {
+  WINDOWS_READINESS_STATUS_KIND,
+  WINDOWS_READINESS_STATUS_VERSION,
+  createWindowsReadinessStatusProvider,
+  type WindowsReadinessStatus,
+  type WindowsReadinessStatusProvider,
+} from './windows/windows-readiness-status.js';
 import { supportsWindowsAlphaRuntime } from './windows/windows-runtime-support.js';
 import { createWindowsRuntimeProviders } from './windows/windows-runtime.js';
 
@@ -26,11 +33,14 @@ export const serverName = 'ssh-mcp-server';
 export const serverVersion = '0.1.0';
 export const listApprovedProfilesToolName = 'list_approved_profiles';
 export const validateConnectionToolName = 'validate_connection';
+export const getWindowsReadinessStatusToolName = 'get_windows_readiness_status';
 
 const LIST_APPROVED_PROFILES_DESCRIPTION =
   'Lists operator-approved profile IDs only. Use an ID returned here for validation; connection, credential, and host details are never disclosed.';
 const VALIDATE_CONNECTION_DESCRIPTION =
   'Checks readiness for one operator-approved SSH profile ID. Use only a discovered or explicitly authorized ID; it accepts no commands, connection settings, credentials, or paths.';
+const WINDOWS_READINESS_STATUS_DESCRIPTION =
+  'Reports bounded local Windows readiness categories only. It accepts no connection settings, profile IDs, credentials, paths, or commands and never contacts a remote host.';
 const SAFE_PROFILE_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
 const MAX_DISCOVERABLE_PROFILES = 256;
 
@@ -41,6 +51,8 @@ export interface ServerOptions {
   readonly connectionValidationProvider?: ConnectionValidationProvider;
   /** Internal sink for already-allowlisted validation audit records. */
   readonly auditSink?: (serializedEvent: string) => void;
+  /** Local-only, redacted Windows prerequisite status provider. */
+  readonly windowsReadinessStatusProvider?: WindowsReadinessStatusProvider;
 }
 
 export interface StdioServerOptions {
@@ -50,6 +62,7 @@ export interface StdioServerOptions {
   installSignalHandlers?: boolean;
   approvedProfileListingProvider?: ApprovedProfileListingProvider;
   connectionValidationProvider?: ConnectionValidationProvider;
+  windowsReadinessStatusProvider?: WindowsReadinessStatusProvider;
 }
 
 function isEmptyDiscoveryInput(input: unknown): boolean {
@@ -161,6 +174,10 @@ function unavailableDiscoveryResult(): ReturnType<typeof textToolResult> {
   return textToolResult('Approved profile discovery is unavailable.', true);
 }
 
+function unavailableWindowsReadinessStatusResult(): ReturnType<typeof textToolResult> {
+  return textToolResult('Windows readiness status is unavailable.', true);
+}
+
 function validationResult(outcome: unknown, isError = false): ReturnType<typeof textToolResult> {
   return textToolResult(JSON.stringify(outcome), isError);
 }
@@ -201,6 +218,63 @@ function safeValidationOutcome(value: unknown, requestedProfileId: string): Conn
   return { profileId: profileId.value, ready: true };
 }
 
+function statusField(value: unknown, allowed: readonly string[]): string {
+  if (typeof value !== 'string' || !allowed.includes(value)) throw new TypeError('Trusted Windows readiness provider returned an invalid result');
+  return value;
+}
+
+/** Project the Windows status through a fixed response schema with no dynamic fields. */
+function safeWindowsReadinessStatus(value: unknown): WindowsReadinessStatus {
+  if (typeof value !== 'object' || value === null || Array.isArray(value))
+    throw new TypeError('Trusted Windows readiness provider returned an invalid result');
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) throw new TypeError('Trusted Windows readiness provider returned an invalid result');
+  const keys = Reflect.ownKeys(value);
+  const expected = [
+    'kind',
+    'version',
+    'runtime',
+    'registry',
+    'filesystem',
+    'configuration',
+    'knownHosts',
+    'credentials',
+    'validationProvider',
+    'remoteAuthentication',
+  ];
+  if (keys.length !== expected.length || !expected.every((key) => keys.includes(key))) {
+    throw new TypeError('Trusted Windows readiness provider returned an invalid result');
+  }
+  const fields = Object.fromEntries(
+    expected.map((key) => {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor === undefined || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) {
+        throw new TypeError('Trusted Windows readiness provider returned an invalid result');
+      }
+      return [key, descriptor.value];
+    }),
+  ) as Record<string, unknown>;
+  if (fields.kind !== WINDOWS_READINESS_STATUS_KIND || fields.version !== WINDOWS_READINESS_STATUS_VERSION) {
+    throw new TypeError('Trusted Windows readiness provider returned an invalid result');
+  }
+  const checkValues = ['ready', 'unavailable', 'invalid', 'not-checked'];
+  const runtime = statusField(fields.runtime, ['ready', 'unsupported']) as WindowsReadinessStatus['runtime'];
+  const credentials = statusField(fields.credentials, ['ready', 'unavailable', 'not-checked']);
+  const remoteAuthentication = statusField(fields.remoteAuthentication, ['not-checked']);
+  return {
+    kind: WINDOWS_READINESS_STATUS_KIND,
+    version: WINDOWS_READINESS_STATUS_VERSION,
+    runtime,
+    registry: statusField(fields.registry, checkValues) as WindowsReadinessStatus['registry'],
+    filesystem: statusField(fields.filesystem, checkValues) as WindowsReadinessStatus['filesystem'],
+    configuration: statusField(fields.configuration, checkValues) as WindowsReadinessStatus['configuration'],
+    knownHosts: statusField(fields.knownHosts, checkValues) as WindowsReadinessStatus['knownHosts'],
+    credentials: credentials as WindowsReadinessStatus['credentials'],
+    validationProvider: statusField(fields.validationProvider, checkValues) as WindowsReadinessStatus['validationProvider'],
+    remoteAuthentication: remoteAuthentication as 'not-checked',
+  };
+}
+
 /** Emit a fixed startup diagnostic without exposing the triggering failure. */
 export function reportEntrypointFailure(errorOutput: Pick<Writable, 'write'>, _error: unknown): void {
   errorOutput.write('MCP server failed to start\n');
@@ -219,6 +293,7 @@ function registerTools(
   server: Server,
   approvedProfileListingProvider: ApprovedProfileListingProvider | undefined,
   connectionValidationProvider: ConnectionValidationProvider | undefined,
+  windowsReadinessStatusProvider: WindowsReadinessStatusProvider | undefined,
   auditSink: ((serializedEvent: string) => void) | undefined,
 ): void {
   server.setRequestHandler(ListToolsRequestSchema, () => ({
@@ -250,6 +325,19 @@ function registerTools(
               },
             },
           ]),
+      ...(windowsReadinessStatusProvider === undefined
+        ? []
+        : [
+            {
+              name: getWindowsReadinessStatusToolName,
+              description: WINDOWS_READINESS_STATUS_DESCRIPTION,
+              inputSchema: {
+                type: 'object',
+                properties: {},
+                additionalProperties: false,
+              },
+            },
+          ]),
     ],
   }));
 
@@ -264,6 +352,17 @@ function registerTools(
       } catch {
         // Provider failures and malformed provider output stay inside the trusted boundary.
         return unavailableDiscoveryResult();
+      }
+    }
+
+    if (request.params.name === getWindowsReadinessStatusToolName) {
+      if (!isEmptyDiscoveryInput(request.params.arguments) || windowsReadinessStatusProvider === undefined) {
+        return unavailableWindowsReadinessStatusResult();
+      }
+      try {
+        return textToolResult(JSON.stringify(safeWindowsReadinessStatus(await windowsReadinessStatusProvider.getWindowsReadinessStatus())));
+      } catch {
+        return unavailableWindowsReadinessStatusResult();
       }
     }
 
@@ -303,9 +402,14 @@ function registerTools(
   });
 }
 
-export function createServer({ approvedProfileListingProvider, connectionValidationProvider, auditSink }: ServerOptions = {}): Server {
+export function createServer({
+  approvedProfileListingProvider,
+  connectionValidationProvider,
+  auditSink,
+  windowsReadinessStatusProvider,
+}: ServerOptions = {}): Server {
   const server = new Server({ name: serverName, version: serverVersion }, { capabilities: { tools: {} } });
-  registerTools(server, approvedProfileListingProvider, connectionValidationProvider, auditSink);
+  registerTools(server, approvedProfileListingProvider, connectionValidationProvider, windowsReadinessStatusProvider, auditSink);
   return server;
 }
 
@@ -320,10 +424,12 @@ export async function runStdioServer({
   installSignalHandlers = input === process.stdin,
   approvedProfileListingProvider,
   connectionValidationProvider,
+  windowsReadinessStatusProvider,
 }: StdioServerOptions = {}): Promise<void> {
   const server = createServer({
     approvedProfileListingProvider,
     connectionValidationProvider,
+    windowsReadinessStatusProvider,
     auditSink: (serializedEvent) => errorOutput.write(`${serializedEvent}\n`),
   });
   const transport = new StdioServerTransport(input, output);
@@ -416,14 +522,17 @@ export function createProductionRuntimeProviders(
         return false;
       }
     })(),
-  windowsRuntimeFactory: () => Pick<ServerOptions, 'approvedProfileListingProvider' | 'connectionValidationProvider'> = createWindowsRuntimeProviders,
-): Pick<ServerOptions, 'approvedProfileListingProvider' | 'connectionValidationProvider'> {
+  windowsRuntimeFactory: () => Pick<
+    ServerOptions,
+    'approvedProfileListingProvider' | 'connectionValidationProvider' | 'windowsReadinessStatusProvider'
+  > = createWindowsRuntimeProviders,
+): Pick<ServerOptions, 'approvedProfileListingProvider' | 'connectionValidationProvider' | 'windowsReadinessStatusProvider'> {
   if (platform === 'win32') {
-    if (!windowsSupported) return {};
+    if (!windowsSupported) return { windowsReadinessStatusProvider: createWindowsReadinessStatusProvider(false) };
     try {
       return windowsRuntimeFactory();
     } catch {
-      return {};
+      return { windowsReadinessStatusProvider: createWindowsReadinessStatusProvider(true) };
     }
   }
   if (platform === 'linux' || platform === 'darwin') {

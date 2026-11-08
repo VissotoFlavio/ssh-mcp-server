@@ -1,5 +1,6 @@
 import { createRequire } from 'node:module';
 
+import { parseCredentialReference } from '../credentials/credential-store.js';
 import { validateConnectionProfile, validateProfileSelection, type ConnectionProfile } from '../profiles/connection-profile.js';
 
 import { supportsWindowsAlphaRuntime } from './windows-runtime-support.js';
@@ -12,10 +13,12 @@ const KNOWN_HOSTS_REFERENCE = /^known-hosts:\/\/([a-z0-9]+(?:-[a-z0-9]+)*)$/u;
 export interface WindowsTrustBinding {
   readProfileState(): Buffer;
   readKnownHosts(profileId: string): Buffer;
+  inspectReadiness?(): unknown;
   captureKnownHostsSnapshot(profileId: string): { readonly bytes: Buffer; readonly capability: object };
   disposeKnownHostsSnapshot(capability: object): void;
   isKnownHostsSnapshotBusy(capability: object): boolean;
   readCredential(locator: string): string;
+  credentialAvailable?(locator: string): boolean;
 }
 
 export class WindowsSecureStorageError extends Error {
@@ -113,6 +116,27 @@ function validSnapshot(value: unknown): value is { readonly bytes: Buffer; reado
   );
 }
 
+function validReadiness(value: unknown): value is {
+  readonly registry: 'ready' | 'unavailable';
+  readonly filesystem: 'ready' | 'unavailable' | 'not-checked';
+  readonly configuration: 'ready' | 'unavailable' | 'not-checked';
+} {
+  if (typeof value !== 'object' || value === null || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype) return false;
+  const keys = Reflect.ownKeys(value);
+  const registry = (value as { registry?: unknown }).registry;
+  const filesystem = (value as { filesystem?: unknown }).filesystem;
+  const configuration = (value as { configuration?: unknown }).configuration;
+  return (
+    keys.length === 3 &&
+    keys.includes('registry') &&
+    keys.includes('filesystem') &&
+    keys.includes('configuration') &&
+    (registry === 'ready' || registry === 'unavailable') &&
+    (filesystem === 'ready' || filesystem === 'unavailable' || filesystem === 'not-checked') &&
+    (configuration === 'ready' || configuration === 'unavailable' || configuration === 'not-checked')
+  );
+}
+
 /**
  * Reads only fixed Windows trust anchors through the native boundary. Neither
  * roots nor filenames are accepted from MCP callers or environment variables.
@@ -123,6 +147,26 @@ export class WindowsSecureStorage {
   listProfiles(): readonly ConnectionProfile[] {
     try {
       return parseState(this.binding.readProfileState()).map((profile) => ({ ...profile }));
+    } catch {
+      return unavailable();
+    }
+  }
+
+  /**
+   * Returns only native, bounded prerequisite states. No configured value,
+   * path, profile, key, or credential crosses this diagnostic boundary.
+   */
+  inspectReadiness(): {
+    readonly registry: 'ready' | 'unavailable';
+    readonly filesystem: 'ready' | 'unavailable' | 'not-checked';
+    readonly configuration: 'ready' | 'unavailable' | 'not-checked';
+  } {
+    try {
+      const inspect = this.binding.inspectReadiness;
+      if (typeof inspect !== 'function') return { registry: 'unavailable', filesystem: 'not-checked', configuration: 'not-checked' };
+      const result = inspect.call(this.binding);
+      if (!validReadiness(result)) return unavailable();
+      return { registry: result.registry, filesystem: result.filesystem, configuration: result.configuration };
     } catch {
       return unavailable();
     }
@@ -139,6 +183,24 @@ export class WindowsSecureStorage {
       const value = this.binding.readKnownHosts(profileId);
       if (!Buffer.isBuffer(value) || value.byteLength === 0 || value.byteLength > MAX_STATE_BYTES) return unavailable();
       return Buffer.from(value);
+    } catch {
+      return unavailable();
+    }
+  }
+
+  /**
+   * Checks only whether an approved Windows Generic Credential can be opened.
+   * The native probe immediately frees the record and never routes its blob
+   * through TypeScript.
+   */
+  credentialAvailable(reference: string): boolean {
+    try {
+      const parsed = parseCredentialReference(reference);
+      const probe = this.binding.credentialAvailable;
+      if (parsed.provider !== 'ssh' || typeof probe !== 'function') return unavailable();
+      const available = probe.call(this.binding, parsed.locator);
+      if (typeof available !== 'boolean') return unavailable();
+      return available;
     } catch {
       return unavailable();
     }

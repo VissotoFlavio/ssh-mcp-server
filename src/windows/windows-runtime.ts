@@ -2,12 +2,14 @@ import { APPROVED_PROFILE_CLASSIFICATION, type ApprovedProfileListingProvider } 
 import { validateProfileSelection } from '../profiles/connection-profile.js';
 import type { ConnectionValidationProvider } from '../validation/trusted-connection-validation.js';
 
+import { createWindowsReadinessStatusProvider, type WindowsReadinessStatusProvider } from './windows-readiness-status.js';
 import { WindowsSecureStorage } from './windows-secure-storage.js';
 import { createWindowsValidationSession, WindowsValidationSession } from './windows-validation-session.js';
 
 export interface WindowsRuntimeProviders {
   readonly approvedProfileListingProvider: ApprovedProfileListingProvider;
   readonly connectionValidationProvider?: ConnectionValidationProvider;
+  readonly windowsReadinessStatusProvider: WindowsReadinessStatusProvider;
 }
 
 /**
@@ -15,7 +17,9 @@ export interface WindowsRuntimeProviders {
  */
 export function createWindowsRuntimeProviders(
   storage: Pick<WindowsSecureStorage, 'listProfiles'> &
-    Partial<Pick<WindowsSecureStorage, 'getProfile' | 'readKnownHosts' | 'withKnownHostsSnapshot'>> = new WindowsSecureStorage(),
+    Partial<
+      Pick<WindowsSecureStorage, 'credentialAvailable' | 'getProfile' | 'inspectReadiness' | 'readKnownHosts' | 'withKnownHostsSnapshot'>
+    > = new WindowsSecureStorage(),
   validationSession: Pick<WindowsValidationSession, 'validate'> | undefined = (() => {
     try {
       const profiles = storage.listProfiles();
@@ -37,22 +41,34 @@ export function createWindowsRuntimeProviders(
     }
   })(),
 ): WindowsRuntimeProviders {
+  const validationProvider =
+    validationSession === undefined
+      ? undefined
+      : {
+          async validateConnection(input: unknown, signal?: AbortSignal) {
+            const selection = validateProfileSelection(input);
+            await validationSession.validate(selection, signal);
+            return { profileId: selection.profileId, ready: true as const };
+          },
+        };
+  const readinessStorage =
+    typeof storage.inspectReadiness === 'function' &&
+    typeof storage.readKnownHosts === 'function' &&
+    typeof storage.credentialAvailable === 'function'
+      ? {
+          credentialAvailable: storage.credentialAvailable.bind(storage),
+          inspectReadiness: storage.inspectReadiness.bind(storage),
+          listProfiles: storage.listProfiles.bind(storage),
+          readKnownHosts: storage.readKnownHosts.bind(storage),
+        }
+      : undefined;
   return {
     approvedProfileListingProvider: {
       async listApprovedProfiles() {
         return storage.listProfiles().map(({ profileId }) => ({ profileId, classification: APPROVED_PROFILE_CLASSIFICATION }));
       },
     },
-    ...(validationSession === undefined
-      ? {}
-      : {
-          connectionValidationProvider: {
-            async validateConnection(input: unknown, signal?: AbortSignal) {
-              const selection = validateProfileSelection(input);
-              await validationSession.validate(selection, signal);
-              return { profileId: selection.profileId, ready: true as const };
-            },
-          },
-        }),
+    ...(validationProvider === undefined ? {} : { connectionValidationProvider: validationProvider }),
+    windowsReadinessStatusProvider: createWindowsReadinessStatusProvider(true, readinessStorage, validationProvider !== undefined),
   };
 }
