@@ -11,6 +11,7 @@
 #include <wincred.h>
 #include <wintrust.h>
 #include <winver.h>
+#include <shlobj.h>
 
 #include <string>
 #include <array>
@@ -1056,6 +1057,119 @@ napi_value ToBuffer(napi_env env, const std::vector<BYTE>& data) {
   return result;
 }
 
+// Provisioning is intentionally native: PowerShell never creates trusted
+// state by pathname. Each new object is opened no-follow, retained while its
+// DACL is installed and its bytes are written, and existing state is refused.
+bool NewPrivateDacl(HANDLE handle, PSID sid, bool directory) {
+  EXPLICIT_ACCESSW access{};
+  access.grfAccessPermissions = FILE_ALL_ACCESS;
+  access.grfAccessMode = SET_ACCESS;
+  access.grfInheritance = directory ? SUB_CONTAINERS_AND_OBJECTS_INHERIT : NO_INHERITANCE;
+  access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+  access.Trustee.TrusteeType = TRUSTEE_IS_USER;
+  access.Trustee.ptstrName = static_cast<LPWSTR>(sid);
+  PACL acl = nullptr;
+  const DWORD built = SetEntriesInAclW(1, &access, nullptr, &acl);
+  const DWORD applied = built == ERROR_SUCCESS ? SetSecurityInfo(handle, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, sid, nullptr, acl, nullptr) : ERROR_INVALID_SECURITY_DESCR;
+  if (acl != nullptr) LocalFree(acl);
+  return applied == ERROR_SUCCESS && VerifyFile(handle, sid, directory);
+}
+
+bool NewPrivateRegistryDacl(HKEY key, PSID sid) {
+  EXPLICIT_ACCESSW access{};
+  access.grfAccessPermissions = KEY_ALL_ACCESS;
+  access.grfAccessMode = SET_ACCESS;
+  access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+  access.Trustee.TrusteeType = TRUSTEE_IS_USER;
+  access.Trustee.ptstrName = static_cast<LPWSTR>(sid);
+  PACL acl = nullptr;
+  const DWORD built = SetEntriesInAclW(1, &access, nullptr, &acl);
+  const DWORD applied = built == ERROR_SUCCESS ? SetSecurityInfo(key, SE_REGISTRY_KEY, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, sid, nullptr, acl, nullptr) : ERROR_INVALID_SECURITY_DESCR;
+  if (acl != nullptr) LocalFree(acl);
+  return applied == ERROR_SUCCESS && VerifyRegistryConfiguration(key, sid);
+}
+
+bool NewPrivateDirectory(const std::wstring& path, PSID sid, Handle* retained) {
+  if (CreateDirectoryW(path.c_str(), nullptr) == 0) return false;
+  Handle directory(CreateFileW(path.c_str(), READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY, 0, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+  if (directory.get() == INVALID_HANDLE_VALUE || !NewPrivateDacl(directory.get(), sid, true)) return false;
+  *retained = std::move(directory);
+  return true;
+}
+
+bool NewPrivateFile(const std::wstring& path, const std::string& bytes, PSID sid, Handle* retained) {
+  Handle file(CreateFileW(path.c_str(), GENERIC_WRITE | READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES, 0, nullptr, CREATE_NEW, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH, nullptr));
+  if (file.get() == INVALID_HANDLE_VALUE || !NewPrivateDacl(file.get(), sid, false)) return false;
+  DWORD written = 0;
+  if ((bytes.size() > MAXDWORD) || !WriteFile(file.get(), bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr) || written != bytes.size() || !FlushFileBuffers(file.get()) || !VerifyFile(file.get(), sid, false)) return false;
+  *retained = std::move(file);
+  return true;
+}
+
+bool KnownLocalAppData(std::wstring* path) {
+  PWSTR raw = nullptr;
+  if (SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_DONT_VERIFY, nullptr, &raw) != S_OK || raw == nullptr) return false;
+  path->assign(raw);
+  CoTaskMemFree(raw);
+  return IsLocalNtfsPath(*path);
+}
+
+bool ReadProvisionString(napi_env env, napi_value input, const char* name, std::string* value, size_t maximum) {
+  napi_value property{};
+  size_t size = 0;
+  if (napi_get_named_property(env, input, name, &property) != napi_ok || napi_get_value_string_utf8(env, property, nullptr, 0, &size) != napi_ok || size == 0 || size > maximum) return false;
+  std::vector<char> buffer(size + 1);
+  if (napi_get_value_string_utf8(env, property, buffer.data(), buffer.size(), &size) != napi_ok) return false;
+  value->assign(buffer.data(), size);
+  return value->find('\0') == std::string::npos;
+}
+
+bool IsCanonicalProfileId(const std::string& value) {
+  if (value.empty() || value.size() > 128 || value == "con" || value == "prn" || value == "aux" || value == "nul" || value == "constructor" || value == "prototype" || value == "__proto__") return false;
+  for (size_t index = 0; index < value.size(); ++index) if (!((value[index] >= 'a' && value[index] <= 'z') || (value[index] >= '0' && value[index] <= '9') || (value[index] == '-' && index > 0 && index + 1 < value.size() && value[index - 1] != '-'))) return false;
+  return true;
+}
+
+napi_value ProvisionApprovedProfile(napi_env env, napi_callback_info info) {
+  size_t count = 1;
+  napi_value arguments[1]{};
+  napi_valuetype type{};
+  if (napi_get_cb_info(env, info, &count, arguments, nullptr, nullptr) != napi_ok || count != 1 || napi_typeof(env, arguments[0], &type) != napi_ok || type != napi_object) return Unavailable(env);
+  std::string profile_id, host, user, mode, locator, fingerprint, known_host_line;
+  napi_value port_value{};
+  double port = 0;
+  if (!ReadProvisionString(env, arguments[0], "profileId", &profile_id, 128) || !ReadProvisionString(env, arguments[0], "host", &host, 253) || !ReadProvisionString(env, arguments[0], "user", &user, 64) || !ReadProvisionString(env, arguments[0], "authMode", &mode, 16) || !ReadProvisionString(env, arguments[0], "expectedHostFingerprint", &fingerprint, 64) || !ReadProvisionString(env, arguments[0], "hostKeyLine", &known_host_line, 16384) || !IsCanonicalProfileId(profile_id) || mode != "agent-key" && mode != "password" || napi_get_named_property(env, arguments[0], "port", &port_value) != napi_ok || napi_get_value_double(env, port_value, &port) != napi_ok || !std::isfinite(port) || std::floor(port) != port || port < 1 || port > 65535) return Unavailable(env);
+  if (mode == "password" && (!ReadProvisionString(env, arguments[0], "credentialLocator", &locator, 128) || locator.find("..") != std::string::npos)) return Unavailable(env);
+  std::wstring local_app_data;
+  std::vector<BYTE> sid;
+  if (!KnownLocalAppData(&local_app_data) || !CurrentUserSid(&sid)) return Unavailable(env);
+  const std::wstring vendor = local_app_data + L"\\Vissoto";
+  const std::wstring base = vendor + L"\\ssh-mcp-server";
+  const std::wstring state = base + L"\\state";
+  const std::wstring known = base + L"\\known-hosts";
+  const std::wstring state_file = state + L"\\connection-profiles.json";
+  const std::wstring known_file = known + L"\\" + std::wstring(profile_id.begin(), profile_id.end()) + L".known_hosts";
+  HKEY existing = nullptr;
+  if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Vissoto", 0, KEY_READ, &existing) == ERROR_SUCCESS) { RegCloseKey(existing); return Unavailable(env); }
+  if (GetFileAttributesW(vendor.c_str()) != INVALID_FILE_ATTRIBUTES || GetFileAttributesW(base.c_str()) != INVALID_FILE_ATTRIBUTES || GetFileAttributesW(state.c_str()) != INVALID_FILE_ATTRIBUTES || GetFileAttributesW(known.c_str()) != INVALID_FILE_ATTRIBUTES) return Unavailable(env);
+  Handle vendor_handle, base_handle, state_handle, known_handle, known_file_handle, state_file_handle;
+  if (!NewPrivateDirectory(vendor, sid.data(), &vendor_handle) || !NewPrivateDirectory(base, sid.data(), &base_handle) || !NewPrivateDirectory(state, sid.data(), &state_handle) || !NewPrivateDirectory(known, sid.data(), &known_handle)) return Unavailable(env);
+  const std::string credential = mode == "password" ? ",\n      \"credentialReference\": \"os://ssh/" + locator + "\"" : "";
+  const std::string state_json = "{\n  \"profiles\": [\n    {\n      \"profileId\": \"" + profile_id + "\",\n      \"host\": \"" + host + "\",\n      \"port\": " + std::to_string(static_cast<int>(port)) + ",\n      \"user\": \"" + user + "\",\n      \"expectedHostFingerprint\": \"" + fingerprint + "\",\n      \"authMode\": \"" + mode + "\",\n      \"approvedKnownHostsReference\": \"known-hosts://" + profile_id + "\"" + credential + "\n    }\n  ]\n}\n";
+  if (!NewPrivateFile(known_file, known_host_line + "\n", sid.data(), &known_file_handle) || !NewPrivateFile(state_file, state_json, sid.data(), &state_file_handle)) return Unavailable(env);
+  HKEY vendor_key = nullptr;
+  DWORD disposition = 0;
+  if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Vissoto", 0, nullptr, 0, KEY_READ | KEY_WRITE | READ_CONTROL | WRITE_DAC | WRITE_OWNER, nullptr, &vendor_key, &disposition) != ERROR_SUCCESS || disposition != REG_CREATED_NEW_KEY) return Unavailable(env);
+  RegistryKey vendor_registry(vendor_key);
+  if (!NewPrivateRegistryDacl(vendor_registry.get(), sid.data())) return Unavailable(env);
+  HKEY config_key = nullptr;
+  if (RegCreateKeyExW(vendor_registry.get(), L"ssh-mcp-server", 0, nullptr, 0, KEY_READ | KEY_WRITE | READ_CONTROL | WRITE_DAC | WRITE_OWNER, nullptr, &config_key, &disposition) != ERROR_SUCCESS || disposition != REG_CREATED_NEW_KEY) return Unavailable(env);
+  RegistryKey config(config_key);
+  if (!NewPrivateRegistryDacl(config.get(), sid.data()) || RegSetValueExW(config.get(), L"StateRoot", 0, REG_SZ, reinterpret_cast<const BYTE*>(state.c_str()), static_cast<DWORD>((state.size() + 1) * sizeof(wchar_t))) != ERROR_SUCCESS || RegSetValueExW(config.get(), L"KnownHostsRoot", 0, REG_SZ, reinterpret_cast<const BYTE*>(known.c_str()), static_cast<DWORD>((known.size() + 1) * sizeof(wchar_t))) != ERROR_SUCCESS) return Unavailable(env);
+  napi_value result{};
+  return napi_get_undefined(env, &result) == napi_ok ? result : Unavailable(env);
+}
+
 napi_value ReadProfileState(napi_env env, napi_callback_info) {
   std::wstring state_root;
   std::wstring known_hosts_root;
@@ -1875,6 +1989,7 @@ napi_value TestLaunch(napi_env env, napi_callback_info info) {
 NAPI_MODULE_INIT() {
   napi_property_descriptor properties[] = {
     {"readProfileState", nullptr, ReadProfileState, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"provisionApprovedProfile", nullptr, ProvisionApprovedProfile, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"inspectReadiness", nullptr, InspectReadiness, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"readKnownHosts", nullptr, ReadKnownHosts, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"captureKnownHostsSnapshot", nullptr, CaptureKnownHostsSnapshot, nullptr, nullptr, nullptr, napi_default, nullptr},
