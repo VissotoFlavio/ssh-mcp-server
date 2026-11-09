@@ -19,6 +19,9 @@ publish a release.
 - Windows password-profile setup and troubleshooting now document host-identity
   ordering, Credential Manager target derivation, redacted failure decisions,
   and safe support-record boundaries.
+- A versioned Codex skill now guides Windows SSH MCP discovery, redacted local
+  readiness diagnosis, and approved-profile validation without accepting
+  dynamic connection settings or authorizing remote commands.
 - Backport retries now recognize already merged pull requests and fail closed
   on closed, unmerged matches instead of creating duplicate pull requests.
 

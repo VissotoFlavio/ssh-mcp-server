@@ -301,6 +301,7 @@ audit events and diagnostics are written to standard error; support material
 must omit hosts, usernames, profile IDs, credential references, paths, and
 secrets. For platform-specific troubleshooting, start with:
 
+- [Windows SSH MCP Codex skill](skills/windows-ssh-mcp/SKILL.md)
 - [Windows installation and Codex setup](docs/windows-codex-setup.md)
 - [Windows password-profile troubleshooting](docs/windows/password-profile-troubleshooting.md)
 - [Windows agent-key troubleshooting](docs/windows/agent-key-troubleshooting.md)
