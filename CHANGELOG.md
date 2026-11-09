@@ -7,6 +7,9 @@ publish a release.
 
 ### Added
 
+- A fail-closed Windows operator provisioning helper creates one protected
+  approved profile and verified known-hosts leaf from fixed per-user roots,
+  without accepting secrets or contacting a remote host.
 - A redacted `get_windows_readiness_status` MCP tool reports bounded local
   Windows readiness categories, including local credential availability and
   known-hosts identity compatibility, without returning credential material or

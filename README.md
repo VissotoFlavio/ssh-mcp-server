@@ -164,9 +164,10 @@ HKCU\Software\Vissoto\ssh-mcp-server\StateRoot
 HKCU\Software\Vissoto\ssh-mcp-server\KnownHostsRoot
 ```
 
-The detailed guide creates those per-user protected roots, configures
-`connection-profiles.json`, protects the known-hosts leaves, and explains the
-conditional `agent-key` and `password` paths. Follow
+The detailed guide's provisioning helper creates one protected profile and
+known-hosts leaf, validates the operator-supplied host key against its
+fingerprint before writing, and explains the conditional `agent-key` and
+`password` paths. Follow
 [Windows installation and Codex setup](docs/windows-codex-setup.md) rather
 than substituting environment variables, shared locations, `PATH`, WSL, or
 administrator execution.

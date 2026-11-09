@@ -11,6 +11,7 @@
 #include <wincred.h>
 #include <wintrust.h>
 #include <winver.h>
+#include <shlobj.h>
 
 #include <string>
 #include <array>
@@ -21,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <sstream>
 #include <vector>
 
 namespace {
@@ -522,9 +524,10 @@ bool DedicatedAgentPublicKeyPath(std::wstring* path) {
 
 class PrivateSecurityAttributes final {
  public:
-  explicit PrivateSecurityAttributes(PSID operator_sid) {
+  explicit PrivateSecurityAttributes(PSID operator_sid, ACCESS_MASK rights = FILE_ALL_ACCESS, bool directory = true) {
     if (operator_sid != nullptr) acl_.resize(sizeof(ACL) + sizeof(ACCESS_ALLOWED_ACE) - sizeof(DWORD) + GetLengthSid(operator_sid));
-    valid_ = operator_sid != nullptr && InitializeAcl(reinterpret_cast<PACL>(acl_.data()), static_cast<DWORD>(acl_.size()), ACL_REVISION) && AddAccessAllowedAceEx(reinterpret_cast<PACL>(acl_.data()), ACL_REVISION, OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE, FILE_ALL_ACCESS, operator_sid) && InitializeSecurityDescriptor(&descriptor_, SECURITY_DESCRIPTOR_REVISION) && SetSecurityDescriptorOwner(&descriptor_, operator_sid, FALSE) && SetSecurityDescriptorDacl(&descriptor_, TRUE, reinterpret_cast<PACL>(acl_.data()), FALSE) && SetSecurityDescriptorControl(&descriptor_, SE_DACL_PROTECTED, SE_DACL_PROTECTED);
+    const BYTE inheritance = directory ? OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE : NO_INHERITANCE;
+    valid_ = operator_sid != nullptr && InitializeAcl(reinterpret_cast<PACL>(acl_.data()), static_cast<DWORD>(acl_.size()), ACL_REVISION) && AddAccessAllowedAceEx(reinterpret_cast<PACL>(acl_.data()), ACL_REVISION, inheritance, rights, operator_sid) && InitializeSecurityDescriptor(&descriptor_, SECURITY_DESCRIPTOR_REVISION) && SetSecurityDescriptorOwner(&descriptor_, operator_sid, FALSE) && SetSecurityDescriptorDacl(&descriptor_, TRUE, reinterpret_cast<PACL>(acl_.data()), FALSE) && SetSecurityDescriptorControl(&descriptor_, SE_DACL_PROTECTED, SE_DACL_PROTECTED);
     attributes_.nLength = sizeof(attributes_);
     attributes_.lpSecurityDescriptor = valid_ ? &descriptor_ : nullptr;
     attributes_.bInheritHandle = FALSE;
@@ -600,10 +603,13 @@ bool CreatePrivateRelative(HANDLE root, const std::wstring& leaf, PrivateSecurit
   name.Length = static_cast<USHORT>(leaf.size() * sizeof(wchar_t));
   name.MaximumLength = name.Length;
   OBJECT_ATTRIBUTES attributes{};
-  InitializeObjectAttributes(&attributes, &name, OBJ_CASE_INSENSITIVE, root, security.descriptor());
+  // FILE_OPEN_REPARSE_POINT is not documented as compatible with
+  // FILE_DIRECTORY_FILE. Refuse any reparse point while resolving the single
+  // child name instead; RootDirectory remains the already-verified parent.
+  InitializeObjectAttributes(&attributes, &name, OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE, root, security.descriptor());
   IO_STATUS_BLOCK status{};
   HANDLE raw = INVALID_HANDLE_VALUE;
-  const ACCESS_MASK access = directory ? FILE_READ_ATTRIBUTES | READ_CONTROL | DELETE | SYNCHRONIZE : GENERIC_READ | GENERIC_WRITE | FILE_READ_ATTRIBUTES | READ_CONTROL | DELETE | SYNCHRONIZE;
+  const ACCESS_MASK access = directory ? FILE_READ_ATTRIBUTES | READ_CONTROL | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_TRAVERSE | DELETE | SYNCHRONIZE : GENERIC_READ | GENERIC_WRITE | FILE_READ_ATTRIBUTES | READ_CONTROL | DELETE | SYNCHRONIZE;
   const ULONG options = (directory ? FILE_DIRECTORY_FILE : FILE_NON_DIRECTORY_FILE) | FILE_SYNCHRONOUS_IO_NONALERT;
   // Retain read-only sharing: OpenSSH can read the snapshot, while write,
   // delete, and replacement opens remain blocked until disposal.
@@ -1054,6 +1060,233 @@ napi_value ToBuffer(napi_env env, const std::vector<BYTE>& data) {
   napi_value result{};
   if (napi_create_buffer_copy(env, data.size(), data.data(), &target, &result) != napi_ok) return Unavailable(env);
   return result;
+}
+
+bool KnownLocalAppData(std::wstring* path) {
+  PWSTR raw = nullptr;
+  if (SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_DONT_VERIFY, nullptr, &raw) != S_OK || raw == nullptr) return false;
+  path->assign(raw);
+  CoTaskMemFree(raw);
+  return IsLocalNtfsPath(*path);
+}
+
+bool IsPlainDirectoryHandle(HANDLE handle) {
+  FILE_ATTRIBUTE_TAG_INFO tag{};
+  BY_HANDLE_FILE_INFORMATION info{};
+  return handle != INVALID_HANDLE_VALUE && GetFileInformationByHandleEx(handle, FileAttributeTagInfo, &tag, sizeof(tag)) && (tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0 && GetFileInformationByHandle(handle, &info) && (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+bool OpenVerifiedDirectoryRelative(HANDLE parent, const std::wstring& leaf, bool require_child_creation, Handle* result) {
+  if (parent == INVALID_HANDLE_VALUE || leaf.empty() || leaf.size() > USHRT_MAX / sizeof(wchar_t) || leaf.find_first_of(L"\\/") != std::wstring::npos) return false;
+  NativeCreateFile create = GetNativeCreateFile();
+  if (create == nullptr) return false;
+  UNICODE_STRING name{};
+  name.Buffer = const_cast<wchar_t*>(leaf.data());
+  name.Length = static_cast<USHORT>(leaf.size() * sizeof(wchar_t));
+  name.MaximumLength = name.Length;
+  OBJECT_ATTRIBUTES attributes{};
+  InitializeObjectAttributes(&attributes, &name, OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE, parent, nullptr);
+  IO_STATUS_BLOCK status{};
+  HANDLE raw = INVALID_HANDLE_VALUE;
+  const ACCESS_MASK access = FILE_READ_ATTRIBUTES | FILE_TRAVERSE | SYNCHRONIZE | (require_child_creation ? FILE_ADD_SUBDIRECTORY : 0);
+  const ULONG options = FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT;
+  if (create(&raw, access, &attributes, &status, nullptr, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_OPEN, options, nullptr, 0) < 0 || raw == INVALID_HANDLE_VALUE) return false;
+  Handle child(raw);
+  if (!IsPlainDirectoryHandle(child.get())) return false;
+  *result = std::move(child);
+  return true;
+}
+
+bool OpenVerifiedLocalAppData(const std::wstring& path, Handle* result) {
+  if (!IsLocalNtfsPath(path) || path.size() < 4 || path[1] != L':' || path[2] != L'\\') return false;
+  const std::wstring drive_root = path.substr(0, 3);
+  Handle current(CreateFileW(drive_root.c_str(), FILE_READ_ATTRIBUTES | FILE_TRAVERSE, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+  std::array<wchar_t, MAX_PATH> filesystem{};
+  if (!IsPlainDirectoryHandle(current.get()) || !GetVolumeInformationByHandleW(current.get(), nullptr, 0, nullptr, nullptr, nullptr, filesystem.data(), static_cast<DWORD>(filesystem.size())) || _wcsicmp(filesystem.data(), L"NTFS") != 0) return false;
+  size_t cursor = 3;
+  while (cursor < path.size()) {
+    const size_t next = path.find_first_of(L"\\/", cursor);
+    const size_t length = next == std::wstring::npos ? path.size() : next;
+    if (length == cursor) return false;
+    Handle child;
+    if (!OpenVerifiedDirectoryRelative(current.get(), path.substr(cursor, length - cursor), next == std::wstring::npos, &child)) return false;
+    current = std::move(child);
+    if (next == std::wstring::npos) break;
+    cursor = next + 1;
+  }
+  *result = std::move(current);
+  return true;
+}
+
+bool ReadProvisionValue(napi_env env, napi_value input, const char* name, napi_value* value) {
+  napi_value global{}, object{}, get_own_property_descriptor{}, key{}, descriptor{}, value_key{};
+  bool has_value = false;
+  if (napi_get_global(env, &global) != napi_ok || napi_get_named_property(env, global, "Object", &object) != napi_ok || napi_get_named_property(env, object, "getOwnPropertyDescriptor", &get_own_property_descriptor) != napi_ok || napi_create_string_utf8(env, name, NAPI_AUTO_LENGTH, &key) != napi_ok) return false;
+  napi_value arguments[2]{input, key};
+  if (napi_call_function(env, object, get_own_property_descriptor, 2, arguments, &descriptor) != napi_ok || napi_create_string_utf8(env, "value", NAPI_AUTO_LENGTH, &value_key) != napi_ok || napi_has_own_property(env, descriptor, value_key, &has_value) != napi_ok || !has_value) return false;
+  return napi_get_property(env, descriptor, value_key, value) == napi_ok;
+}
+
+bool ReadProvisionString(napi_env env, napi_value input, const char* name, std::string* value, size_t maximum) {
+  napi_value property{};
+  size_t size = 0;
+  if (!ReadProvisionValue(env, input, name, &property) || napi_get_value_string_utf8(env, property, nullptr, 0, &size) != napi_ok || size == 0 || size > maximum) return false;
+  std::vector<char> buffer(size + 1);
+  if (napi_get_value_string_utf8(env, property, buffer.data(), buffer.size(), &size) != napi_ok) return false;
+  value->assign(buffer.data(), size);
+  return value->find('\0') == std::string::npos;
+}
+
+bool IsDnsHost(const std::string& value) {
+  if (value.empty() || value.size() > 253 || value.back() == '.' || value.front() == '-' || value.front() == '.') return false;
+  for (size_t index = 0; index < value.size(); ++index) {
+    const char c = value[index];
+    if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '-') || (c == '-' && (index == 0 || value[index - 1] == '.')) || (c == '.' && (index == 0 || value[index - 1] == '.'))) return false;
+  }
+  return true;
+}
+
+bool IsCanonicalUser(const std::string& value) {
+  if (value.empty() || value.size() > 64 || value.front() == '-') return false;
+  for (char c : value) if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-')) return false;
+  return true;
+}
+
+bool IsFingerprint(const std::string& value) {
+  if (value.size() != 50 || value.rfind("SHA256:", 0) != 0) return false;
+  for (size_t index = 7; index < value.size(); ++index) if (!((value[index] >= 'A' && value[index] <= 'Z') || (value[index] >= 'a' && value[index] <= 'z') || (value[index] >= '0' && value[index] <= '9') || value[index] == '+' || value[index] == '/')) return false;
+  return true;
+}
+
+bool IsCredentialLocator(const std::string& value) {
+  if (value.empty() || value.size() > 128 || value.front() < 'a' || value.front() > 'z' || value.find("..") != std::string::npos) return false;
+  for (char c : value) if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == ':' || c == '-')) return false;
+  for (const char* prefix : {"password", "passphrase", "private-key", "private_key", "secret", "token"}) {
+    const size_t size = strlen(prefix);
+    if (value.rfind(prefix, 0) == 0 && (value.size() == size || value[size] == '.' || value[size] == '_' || value[size] == ':' || value[size] == '-')) return false;
+  }
+  return true;
+}
+
+bool Base64Sha256(const std::string& encoded, std::string* fingerprint) {
+  DWORD bytes = 0;
+  if (!CryptStringToBinaryA(encoded.c_str(), static_cast<DWORD>(encoded.size()), CRYPT_STRING_BASE64, nullptr, &bytes, nullptr, nullptr) || bytes == 0) return false;
+  std::vector<BYTE> key(bytes);
+  if (!CryptStringToBinaryA(encoded.c_str(), static_cast<DWORD>(encoded.size()), CRYPT_STRING_BASE64, key.data(), &bytes, nullptr, nullptr)) return false;
+  BCRYPT_ALG_HANDLE algorithm = nullptr;
+  DWORD object_bytes = 0, hash_bytes = 0, returned = 0;
+  if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0 || BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&object_bytes), sizeof(object_bytes), &returned, 0) != 0 || BCryptGetProperty(algorithm, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hash_bytes), sizeof(hash_bytes), &returned, 0) != 0) { if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0); return false; }
+  std::vector<BYTE> object(object_bytes), hash(hash_bytes);
+  BCRYPT_HASH_HANDLE handle = nullptr;
+  const bool hashed = BCryptCreateHash(algorithm, &handle, object.data(), object_bytes, nullptr, 0, 0) == 0 && BCryptHashData(handle, key.data(), bytes, 0) == 0 && BCryptFinishHash(handle, hash.data(), hash_bytes, 0) == 0;
+  if (handle) BCryptDestroyHash(handle);
+  BCryptCloseAlgorithmProvider(algorithm, 0);
+  DWORD text = 0;
+  if (!hashed || !CryptBinaryToStringA(hash.data(), hash_bytes, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, nullptr, &text)) return false;
+  std::string output(text, '\0');
+  if (!CryptBinaryToStringA(hash.data(), hash_bytes, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, output.data(), &text)) return false;
+  output.resize(text);
+  if (!output.empty() && output.back() == '\0') output.pop_back();
+  while (!output.empty() && output.back() == '=') output.pop_back();
+  *fingerprint = "SHA256:" + output;
+  return true;
+}
+
+bool VerifyKnownHostLine(const std::string& line, const std::string& host, DWORD port, const std::string& expected) {
+  if (line.empty() || line.size() > 16384 || line.find_first_of("\r\n\0") != std::string::npos) return false;
+  std::istringstream stream(line);
+  std::string endpoint, algorithm, key, extra;
+  if (!(stream >> endpoint >> algorithm >> key) || (stream >> extra)) return false;
+  const std::string expected_endpoint = port == 22 ? host : "[" + host + "]:" + std::to_string(port);
+  if (endpoint != expected_endpoint || (algorithm != "ssh-ed25519" && algorithm != "ssh-rsa" && algorithm != "ssh-dss" && algorithm != "ecdsa-sha2-nistp256" && algorithm != "ecdsa-sha2-nistp384" && algorithm != "ecdsa-sha2-nistp521")) return false;
+  std::string actual;
+  return Base64Sha256(key, &actual) && actual == expected;
+}
+
+bool IsExactProvisionObject(napi_env env, napi_value input, bool password) {
+  napi_value prototype{}, object{}, expected{}, names{};
+  uint32_t length = 0;
+  bool same_prototype = false;
+  if (napi_get_prototype(env, input, &prototype) != napi_ok || napi_get_global(env, &object) != napi_ok || napi_get_named_property(env, object, "Object", &object) != napi_ok || napi_get_named_property(env, object, "prototype", &expected) != napi_ok || napi_strict_equals(env, prototype, expected, &same_prototype) != napi_ok || !same_prototype || napi_get_all_property_names(env, input, napi_key_own_only, napi_key_all_properties, napi_key_numbers_to_strings, &names) != napi_ok || napi_get_array_length(env, names, &length) != napi_ok || length != (password ? 8u : 7u)) return false;
+  const char* allowed[] = {"profileId", "host", "port", "user", "authMode", "expectedHostFingerprint", "hostKeyLine", "credentialLocator"};
+  for (uint32_t index = 0; index < length; ++index) {
+    napi_value name{};
+    size_t bytes = 0;
+    if (napi_get_element(env, names, index, &name) != napi_ok || napi_get_value_string_utf8(env, name, nullptr, 0, &bytes) != napi_ok || bytes > 32) return false;
+    std::vector<char> key(bytes + 1);
+    if (napi_get_value_string_utf8(env, name, key.data(), key.size(), &bytes) != napi_ok) return false;
+    bool recognized = false;
+    for (size_t allowed_index = 0; allowed_index < (password ? 8u : 7u); ++allowed_index) recognized = recognized || strcmp(key.data(), allowed[allowed_index]) == 0;
+    if (!recognized) return false;
+  }
+  return true;
+}
+
+std::string JsonString(const std::string& value) {
+  std::string result = "\"";
+  for (unsigned char c : value) {
+    if (c == '\\') result += "\\\\";
+    else if (c == '\"') result += "\\\"";
+    else if (c < 0x20) result += "\\u00" + std::string(1, "0123456789abcdef"[c >> 4]) + std::string(1, "0123456789abcdef"[c & 15]);
+    else result += static_cast<char>(c);
+  }
+  return result + "\"";
+}
+
+bool IsCanonicalProfileId(const std::string& value) {
+  if (value.empty() || value.size() > 128) return false;
+  for (const char* reserved : {"con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9", "constructor", "prototype", "__proto__"}) if (value == reserved) return false;
+  for (size_t index = 0; index < value.size(); ++index) if (!((value[index] >= 'a' && value[index] <= 'z') || (value[index] >= '0' && value[index] <= '9') || (value[index] == '-' && index > 0 && index + 1 < value.size() && value[index - 1] != '-'))) return false;
+  return true;
+}
+
+napi_value ProvisionApprovedProfile(napi_env env, napi_callback_info info) {
+  size_t count = 1;
+  napi_value arguments[1]{};
+  napi_valuetype type{};
+  if (napi_get_cb_info(env, info, &count, arguments, nullptr, nullptr) != napi_ok || count != 1 || napi_typeof(env, arguments[0], &type) != napi_ok || type != napi_object) return Unavailable(env);
+  std::string profile_id, host, user, mode, locator, fingerprint, known_host_line;
+  napi_value port_value{};
+  double port = 0;
+  if (!ReadProvisionString(env, arguments[0], "authMode", &mode, 16) || (mode != "agent-key" && mode != "password") || !IsExactProvisionObject(env, arguments[0], mode == "password") || !ReadProvisionString(env, arguments[0], "profileId", &profile_id, 128) || !ReadProvisionString(env, arguments[0], "host", &host, 253) || !ReadProvisionString(env, arguments[0], "user", &user, 64) || !ReadProvisionString(env, arguments[0], "expectedHostFingerprint", &fingerprint, 64) || !ReadProvisionString(env, arguments[0], "hostKeyLine", &known_host_line, 16384) || !IsCanonicalProfileId(profile_id) || !IsDnsHost(host) || !IsCanonicalUser(user) || !IsFingerprint(fingerprint) || !ReadProvisionValue(env, arguments[0], "port", &port_value) || napi_get_value_double(env, port_value, &port) != napi_ok || !std::isfinite(port) || std::floor(port) != port || port < 1 || port > 65535) return Unavailable(env);
+  if (mode == "password" && (!ReadProvisionString(env, arguments[0], "credentialLocator", &locator, 128) || !IsCredentialLocator(locator))) return Unavailable(env);
+  if (!VerifyKnownHostLine(known_host_line, host, static_cast<DWORD>(port), fingerprint)) return Unavailable(env);
+  std::wstring local_app_data;
+  std::vector<BYTE> sid;
+  if (!KnownLocalAppData(&local_app_data) || !CurrentUserSid(&sid)) return Unavailable(env);
+  const std::wstring base = local_app_data + L"\\Vissoto\\ssh-mcp-server";
+  const std::wstring state = base + L"\\state";
+  const std::wstring known = base + L"\\known-hosts";
+  const std::wstring state_file = state + L"\\connection-profiles.json";
+  const std::wstring known_file = known + L"\\" + std::wstring(profile_id.begin(), profile_id.end()) + L".known_hosts";
+  HKEY existing = nullptr;
+  if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Vissoto", 0, KEY_READ, &existing) == ERROR_SUCCESS) { RegCloseKey(existing); return Unavailable(env); }
+  Handle local_handle;
+  if (!OpenVerifiedLocalAppData(local_app_data, &local_handle)) return Unavailable(env);
+  PrivateSecurityAttributes file_security(sid.data());
+  if (!file_security.valid()) return Unavailable(env);
+  Handle vendor_handle, base_handle, state_handle, known_handle, known_file_handle, state_file_handle;
+  if (!CreatePrivateRelative(local_handle.get(), L"Vissoto", file_security, true, SnapshotFailure::kNone, &vendor_handle) || !VerifyFile(vendor_handle.get(), sid.data(), true) || !CreatePrivateRelative(vendor_handle.get(), L"ssh-mcp-server", file_security, true, SnapshotFailure::kNone, &base_handle) || !VerifyFile(base_handle.get(), sid.data(), true) || !CreatePrivateRelative(base_handle.get(), L"state", file_security, true, SnapshotFailure::kNone, &state_handle) || !VerifyFile(state_handle.get(), sid.data(), true) || !CreatePrivateRelative(base_handle.get(), L"known-hosts", file_security, true, SnapshotFailure::kNone, &known_handle) || !VerifyFile(known_handle.get(), sid.data(), true)) return Unavailable(env);
+  const std::string credential = mode == "password" ? ",\n      \"credentialReference\": " + JsonString("os://ssh/" + locator) : "";
+  const std::string state_json = "{\n  \"profiles\": [\n    {\n      \"profileId\": " + JsonString(profile_id) + ",\n      \"host\": " + JsonString(host) + ",\n      \"port\": " + std::to_string(static_cast<int>(port)) + ",\n      \"user\": " + JsonString(user) + ",\n      \"expectedHostFingerprint\": " + JsonString(fingerprint) + ",\n      \"authMode\": " + JsonString(mode) + ",\n      \"approvedKnownHostsReference\": " + JsonString("known-hosts://" + profile_id) + credential + "\n    }\n  ]\n}\n";
+  const auto write_new_file = [&](HANDLE parent, const std::wstring& leaf, const std::string& content, Handle* retained) {
+    if (!CreatePrivateRelative(parent, leaf, file_security, false, SnapshotFailure::kNone, retained) || !VerifyFile(retained->get(), sid.data(), false) || content.size() > MAXDWORD) return false;
+    DWORD written = 0;
+    return WriteFile(retained->get(), content.data(), static_cast<DWORD>(content.size()), &written, nullptr) && written == content.size() && FlushFileBuffers(retained->get()) && VerifyFile(retained->get(), sid.data(), false);
+  };
+  if (!write_new_file(known_handle.get(), std::wstring(profile_id.begin(), profile_id.end()) + L".known_hosts", known_host_line + "\n", &known_file_handle) || !write_new_file(state_handle.get(), kStateFile, state_json, &state_file_handle)) return Unavailable(env);
+  HKEY vendor_key = nullptr;
+  DWORD disposition = 0;
+  PrivateSecurityAttributes registry_security(sid.data(), KEY_ALL_ACCESS, false);
+  if (!registry_security.valid() || RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Vissoto", 0, nullptr, 0, KEY_READ | KEY_WRITE | READ_CONTROL | WRITE_DAC | WRITE_OWNER, registry_security.get(), &vendor_key, &disposition) != ERROR_SUCCESS || disposition != REG_CREATED_NEW_KEY) return Unavailable(env);
+  RegistryKey vendor_registry(vendor_key);
+  if (!VerifyRegistryConfiguration(vendor_registry.get(), sid.data())) return Unavailable(env);
+  HKEY config_key = nullptr;
+  if (RegCreateKeyExW(vendor_registry.get(), L"ssh-mcp-server", 0, nullptr, 0, KEY_READ | KEY_WRITE | READ_CONTROL | WRITE_DAC | WRITE_OWNER, registry_security.get(), &config_key, &disposition) != ERROR_SUCCESS || disposition != REG_CREATED_NEW_KEY) return Unavailable(env);
+  RegistryKey config(config_key);
+  if (!VerifyRegistryConfiguration(config.get(), sid.data()) || RegSetValueExW(config.get(), L"StateRoot", 0, REG_SZ, reinterpret_cast<const BYTE*>(state.c_str()), static_cast<DWORD>((state.size() + 1) * sizeof(wchar_t))) != ERROR_SUCCESS || RegSetValueExW(config.get(), L"KnownHostsRoot", 0, REG_SZ, reinterpret_cast<const BYTE*>(known.c_str()), static_cast<DWORD>((known.size() + 1) * sizeof(wchar_t))) != ERROR_SUCCESS) return Unavailable(env);
+  napi_value result{};
+  return napi_get_undefined(env, &result) == napi_ok ? result : Unavailable(env);
 }
 
 napi_value ReadProfileState(napi_env env, napi_callback_info) {
@@ -1875,6 +2108,7 @@ napi_value TestLaunch(napi_env env, napi_callback_info info) {
 NAPI_MODULE_INIT() {
   napi_property_descriptor properties[] = {
     {"readProfileState", nullptr, ReadProfileState, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"provisionApprovedProfile", nullptr, ProvisionApprovedProfile, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"inspectReadiness", nullptr, InspectReadiness, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"readKnownHosts", nullptr, ReadKnownHosts, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"captureKnownHostsSnapshot", nullptr, CaptureKnownHostsSnapshot, nullptr, nullptr, nullptr, napi_default, nullptr},
