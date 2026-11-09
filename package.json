@@ -10,7 +10,7 @@
     "docs",
     "skills"
   ],
-  "description": "Secure MCP server for approved SSH profile discovery and connection readiness checks. No remote command execution or agent-supplied credentials.",
+  "description": "Secure MCP server for approved SSH profile discovery, validation, and bounded remote command execution without agent-supplied credentials.",
   "type": "module",
   "engines": {
     "node": ">=22"

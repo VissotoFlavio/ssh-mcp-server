@@ -161,6 +161,23 @@ test('selects the injected Windows runtime only on a supported host', () => {
   assert.equal(composed, 1);
 });
 
+test('passes the explicit human sudo approval boundary through production composition', () => {
+  let received: unknown;
+  const approval = { approve: async () => true };
+  const expected = createWindowsRuntimeProviders({ listProfiles: () => [] });
+  const selected = createProductionRuntimeProviders(
+    'win32',
+    true,
+    (injected) => {
+      received = injected;
+      return expected;
+    },
+    approval,
+  );
+  assert.equal(selected, expected);
+  assert.equal(received, approval);
+});
+
 test('does not advertise tools when Windows runtime support is unavailable', async () => {
   const input = new PassThrough();
   const output = new PassThrough();

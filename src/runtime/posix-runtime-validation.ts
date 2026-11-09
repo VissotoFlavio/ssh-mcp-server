@@ -4,6 +4,8 @@ import { createHash } from 'node:crypto';
 import { chmod, lstat, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { posix as posixPath } from 'node:path';
 
+import { createPlatformCredentialStoreResolver } from '../credentials/credential-store.js';
+import { RemoteCommandExecutionProvider, Ssh2RemoteCommandTransport, type HumanSudoApprovalProvider } from '../execution/remote-command-execution.js';
 import { HostIdentityCredentialPolicy, type AuthorizedConnection, type ConnectionProfile } from '../policy/host-identity-credential-policy.js';
 import { LocalConnectionProfileRegistry, type LocalProfileRegistry } from '../profiles/local-profile-registry.js';
 import {
@@ -40,7 +42,7 @@ export interface BoundedCommandRunner {
 
 /** Test seam for ControlMaster lifecycle; native implementation is the default. */
 export interface PosixControlMaster {
-  validate(authorized: AuthorizedConnection, knownHostsPath: string, timeoutMs: number): Promise<void>;
+  validate(authorized: AuthorizedConnection, knownHostsPath: string, timeoutMs: number, signal?: AbortSignal): Promise<void>;
 }
 
 /** Minimal child seam used only to prove native master cleanup behavior. */
@@ -61,6 +63,7 @@ export interface PosixRuntimeValidationDependencies {
   readonly controlMaster?: PosixControlMaster;
   readonly profileRegistry?: Pick<LocalProfileRegistry, 'getProfile'>;
   readonly timeoutMs?: number;
+  readonly connectionValidationProvider?: ConnectionValidationProvider;
 }
 
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -319,7 +322,7 @@ export class NativePosixControlMaster implements PosixControlMaster {
     private readonly spawnMaster: PosixControlMasterSpawner = nativeControlMasterSpawner,
   ) {}
 
-  async validate(authorized: AuthorizedConnection, knownHostsPath: string, timeoutMs: number): Promise<void> {
+  async validate(authorized: AuthorizedConnection, knownHostsPath: string, timeoutMs: number, signal?: AbortSignal): Promise<void> {
     const started = Date.now();
     const remaining = (): number => Math.max(0, timeoutMs - (Date.now() - started));
     const socketPath = posixPath.join(posixPath.dirname(knownHostsPath), 'control.sock');
@@ -333,7 +336,7 @@ export class NativePosixControlMaster implements PosixControlMaster {
       failed = true;
     });
     try {
-      while (!closed && !failed && remaining() > 0) {
+      while (!closed && !failed && !signal?.aborted && remaining() > 0) {
         try {
           const status = await this.commands.run(
             '/usr/bin/ssh',
@@ -345,6 +348,7 @@ export class NativePosixControlMaster implements PosixControlMaster {
           // The master may still be negotiating; its deadline remains authoritative.
         }
       }
+      if (signal?.aborted) unavailable();
       unavailable();
     } finally {
       const cleanup = Math.max(1, remaining());
@@ -388,14 +392,15 @@ class RuntimeReadinessAdapter implements ConnectionReadinessAdapter {
     private readonly timeoutMs: number,
   ) {}
 
-  async connect(authorized: AuthorizedConnection): Promise<void> {
+  async connect(authorized: AuthorizedConnection, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) unavailable();
     if (authorized.authentication.mode !== 'agent-key') unavailable();
     await this.knownHosts.withSnapshot(
       authorized.knownHostsReference,
       async (snapshot, remainingMs) => {
         const remaining = remainingMs();
         if (remaining <= 0) unavailable();
-        await this.controlMaster.validate(authorized, snapshot, remaining);
+        await this.controlMaster.validate(authorized, snapshot, remaining, signal);
       },
       remainingBudget(this.timeoutMs),
     );
@@ -441,10 +446,44 @@ export function createRuntimeConnectionValidationProvider(dependencies: PosixRun
     readinessAdapter: new RuntimeReadinessAdapter(knownHosts, dependencies.controlMaster ?? new NativePosixControlMaster(commands), duration),
   });
   return {
-    validateConnection: async (input) =>
+    validateConnection: async (input, signal) =>
       validationDeadline.run(Date.now() + duration, async () => {
-        if (remainingBudget(duration) <= 0) unavailable();
-        return provider.validateConnection(input);
+        if (remainingBudget(duration) <= 0 || signal?.aborted) unavailable();
+        const result = await provider.validateConnection(input, signal);
+        if (signal?.aborted) unavailable();
+        return result;
       }),
   };
+}
+
+/**
+ * Production remote execution composition for POSIX. It reuses the same
+ * profile registry and validation boundary as readiness checks; the SSH2
+ * transport receives only the validated profile and never local shell input.
+ */
+export function createRuntimeRemoteCommandExecutionProvider(
+  dependencies: PosixRuntimeValidationDependencies = {},
+  humanApproval?: HumanSudoApprovalProvider,
+): RemoteCommandExecutionProvider {
+  const environment = dependencies.environment ?? process.env;
+  const platform = dependencies.platform ?? process.platform;
+  const uid = dependencies.uid ?? process.getuid?.();
+  if ((platform !== 'linux' && platform !== 'darwin') || uid === undefined) unavailable();
+  const stateRoot = environment.SSH_MCP_STATE_ROOT;
+  if (stateRoot === undefined) unavailable();
+  const registry = dependencies.profileRegistry ?? new LocalConnectionProfileRegistry({ stateRoot, operatorUid: uid });
+  const validationProvider = dependencies.connectionValidationProvider ?? createRuntimeConnectionValidationProvider(dependencies);
+  const credentials = {
+    async getPassword(reference: string) {
+      const resolver = createPlatformCredentialStoreResolver({ platform, approvedReferences: [reference] });
+      const store = resolver.resolve(reference);
+      return store.getPassword(reference as Parameters<typeof store.getPassword>[0]);
+    },
+  };
+  return new RemoteCommandExecutionProvider({
+    profiles: registry,
+    connectionValidation: validationProvider,
+    transport: new Ssh2RemoteCommandTransport(credentials, environment.SSH_AUTH_SOCK),
+    humanApproval,
+  });
 }

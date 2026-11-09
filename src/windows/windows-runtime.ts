@@ -1,7 +1,14 @@
+import {
+  RemoteCommandExecutionProvider,
+  Ssh2RemoteCommandTransport,
+  WindowsRemoteCommandTransport,
+  type HumanSudoApprovalProvider,
+} from '../execution/remote-command-execution.js';
 import { APPROVED_PROFILE_CLASSIFICATION, type ApprovedProfileListingProvider } from '../profiles/approved-profile-listing.js';
 import { validateProfileSelection } from '../profiles/connection-profile.js';
 import type { ConnectionValidationProvider } from '../validation/trusted-connection-validation.js';
 
+import { WindowsCredentialManager } from './windows-credential-manager.js';
 import { createWindowsReadinessStatusProvider, type WindowsReadinessStatusProvider } from './windows-readiness-status.js';
 import { WindowsSecureStorage } from './windows-secure-storage.js';
 import { createWindowsValidationSession, WindowsValidationSession } from './windows-validation-session.js';
@@ -10,6 +17,7 @@ export interface WindowsRuntimeProviders {
   readonly approvedProfileListingProvider: ApprovedProfileListingProvider;
   readonly connectionValidationProvider?: ConnectionValidationProvider;
   readonly windowsReadinessStatusProvider: WindowsReadinessStatusProvider;
+  readonly remoteCommandExecutionProvider?: RemoteCommandExecutionProvider;
 }
 
 /**
@@ -40,6 +48,7 @@ export function createWindowsRuntimeProviders(
       return undefined;
     }
   })(),
+  humanApproval?: HumanSudoApprovalProvider,
 ): WindowsRuntimeProviders {
   const validationProvider =
     validationSession === undefined
@@ -51,6 +60,21 @@ export function createWindowsRuntimeProviders(
             return { profileId: selection.profileId, ready: true as const };
           },
         };
+  const remoteCommandExecutionProvider =
+    validationProvider === undefined || typeof storage.getProfile !== 'function'
+      ? undefined
+      : new RemoteCommandExecutionProvider({
+          profiles: { getProfile: storage.getProfile.bind(storage) },
+          connectionValidation: validationProvider,
+          transport: new WindowsRemoteCommandTransport(
+            new Ssh2RemoteCommandTransport({
+              async getPassword(reference: string) {
+                return new WindowsCredentialManager(undefined, [reference]).getPassword(reference);
+              },
+            }),
+          ),
+          humanApproval,
+        });
   const readinessStorage =
     typeof storage.inspectReadiness === 'function' &&
     typeof storage.readKnownHosts === 'function' &&
@@ -69,6 +93,7 @@ export function createWindowsRuntimeProviders(
       },
     },
     ...(validationProvider === undefined ? {} : { connectionValidationProvider: validationProvider }),
+    ...(remoteCommandExecutionProvider === undefined ? {} : { remoteCommandExecutionProvider }),
     windowsReadinessStatusProvider: createWindowsReadinessStatusProvider(true, readinessStorage, validationProvider !== undefined),
   };
 }

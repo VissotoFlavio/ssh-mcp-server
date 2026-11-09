@@ -9,7 +9,7 @@ import { validateProfileSelection } from '../profiles/connection-profile.js';
 
 /** The narrow readiness boundary implemented by a trusted host integration. */
 export interface ConnectionReadinessAdapter {
-  connect(authorized: AuthorizedConnection): Promise<void>;
+  connect(authorized: AuthorizedConnection, signal?: AbortSignal): Promise<void>;
 }
 
 /**
@@ -105,10 +105,12 @@ export function createTrustedConnectionValidationProvider(dependencies: TrustedC
   }
 
   return {
-    async validateConnection(input: unknown, _signal?: AbortSignal): Promise<ConnectionValidationOutcome> {
+    async validateConnection(input: unknown, signal?: AbortSignal): Promise<ConnectionValidationOutcome> {
       const selection = validateProfileSelection(input);
+      if (signal?.aborted) throw new Error('Connection validation cancelled');
       const authorized = bindAuthorizedConnection(await dependencies.policy.authorize(selection), selection.profileId);
-      await dependencies.readinessAdapter.connect(authorized);
+      await dependencies.readinessAdapter.connect(authorized, signal);
+      if (signal?.aborted) throw new Error('Connection validation cancelled');
       return { profileId: selection.profileId, ready: true };
     },
   };

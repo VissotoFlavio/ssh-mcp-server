@@ -7,6 +7,23 @@ publish a release.
 
 ### Added
 
+- The remote execution candidate now accepts an explicit host-injected human
+  approval provider, binds approvals to the complete approved profile identity,
+  fails closed when audit delivery fails, bounds validation as well as transport,
+  rejects shell/interpreter wrappers and control syntax, and structurally
+  redacts sensitive audit values.
+- Windows agent-key command execution now fails closed with an explicit stable
+  outcome instead of using an ambient ssh2 agent; Windows password execution
+  retains the existing Credential Manager and host-verification boundary.
+- Bounded `execute_remote_command` and `request_sudo_approval` MCP tools now
+  execute only through approved SSH profiles, enforce timeout/cancellation and
+  output limits, require request-bound expiring one-time human approval for
+  `sudo`, and emit redacted local command audit records. Interactive persistent
+  shells, file transfer, and port forwarding remain explicitly excluded.
+- POSIX and Windows runtime composition now reuses the existing host-identity,
+  Credential Manager, trusted executable, and approved-profile boundaries for
+  non-interactive SSH execution, with focused unit coverage and operational
+  documentation.
 - A fail-closed Windows operator provisioning helper creates one protected
   approved profile and verified known-hosts leaf from fixed per-user roots,
   without accepting secrets or contacting a remote host.
