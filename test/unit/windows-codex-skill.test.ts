@@ -18,6 +18,10 @@ test('Windows Codex skill keeps discovery and validation inputs bounded', async 
   assert.match(skill, /Credential Manager/u);
   assert.match(skill, /Do not add any other field/u);
   assert.match(skill, /Never send or request a host, port, user, path, command/u);
+  assert.match(skill, /knownHosts.*known-hosts/isu);
+  assert.match(skill, /validationProvider.*provider/isu);
+  assert.match(skill, /remoteAuthentication.*not-checked/isu);
+  assert.match(skill, /ready.*unsupported.*unavailable.*invalid.*not-checked/isu);
 
   for (const category of [
     'unsupported',

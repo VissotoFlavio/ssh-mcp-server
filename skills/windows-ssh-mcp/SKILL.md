@@ -41,6 +41,32 @@ setting. If a caller supplies one, refuse it and continue with no MCP call.
    Report only the redacted success or failure category. Do not repeat secrets
    or connection details from errors.
 
+## Readiness status contract
+
+When `get_windows_readiness_status` is advertised, inspect only this fixed
+schema and its enum values; ignore unknown fields and never print the object
+verbatim:
+
+- `runtime`: `ready` or `unsupported` (`unsupported` maps to the
+  `unsupported` action below).
+- `registry`: `ready`, `unavailable`, `invalid`, or `not-checked` (maps to
+  `registry`).
+- `filesystem`: `ready`, `unavailable`, `invalid`, or `not-checked` (maps to
+  `filesystem`).
+- `configuration`: `ready`, `unavailable`, `invalid`, or `not-checked` (maps
+  to `configuration`).
+- `knownHosts`: `ready`, `unavailable`, `invalid`, or `not-checked` (maps to
+  `known-hosts`).
+- `credentials`: `ready`, `unavailable`, or `not-checked` (maps to
+  `credential`).
+- `validationProvider`: `ready`, `unavailable`, `invalid`, or `not-checked`
+  (maps to `provider`).
+- `remoteAuthentication`: always `not-checked`; it never authorizes a remote
+  operation.
+
+Do not reinterpret enum values as connection details. A `ready` local field is
+not proof that a remote connection or authentication succeeded.
+
 ## Redacted category actions
 
 Use this table as a local decision path. Actions involving a VPS or network
