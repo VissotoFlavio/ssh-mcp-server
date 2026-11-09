@@ -187,7 +187,7 @@ test('package-gate validates identity, exposes errors, and invokes the trusted h
 });
 
 test('packaging is only the candidate build and pack matrix', () => {
-  assert.match(packaging, /needs:\s+\n\s+- resolve\s+\n\s+- package-gate/u);
+  assert.match(packaging, /needs:\s*-\s+resolve\s*-\s+package-gate/u);
   assert.match(packaging, /if: needs\.package-gate\.result == 'success'/u);
   assert.match(packaging, /runs-on: windows-latest/u);
   assert.match(packaging, /node-major: \[22, 24\]/u);
