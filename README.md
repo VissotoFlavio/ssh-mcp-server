@@ -302,6 +302,7 @@ must omit hosts, usernames, profile IDs, credential references, paths, and
 secrets. For platform-specific troubleshooting, start with:
 
 - [Windows installation and Codex setup](docs/windows-codex-setup.md)
+- [Windows password-profile troubleshooting](docs/windows/password-profile-troubleshooting.md)
 - [Windows agent-key troubleshooting](docs/windows/agent-key-troubleshooting.md)
 - [Windows trust model](docs/windows-trust-model.md)
 

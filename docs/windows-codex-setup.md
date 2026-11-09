@@ -189,6 +189,10 @@ user's Windows Credential Manager with target name
 Manager UI; never use a command line, environment variable, profile JSON, or
 Codex configuration for it.
 
+For the category-by-category recovery path, see the [password-profile
+troubleshooting runbook](windows/password-profile-troubleshooting.md). Host
+identity is verified before the password provider is read.
+
 ## Register the stdio server with Codex
 
 Use absolute, operator-approved executable paths. From a normal,

@@ -16,6 +16,9 @@ publish a release.
   contacting a remote host.
 - Operational documentation and a contract test now cover the repository-scoped
   `BACKPORT_TOKEN` required by automated release and hotfix backports.
+- Windows password-profile setup and troubleshooting now document host-identity
+  ordering, Credential Manager target derivation, redacted failure decisions,
+  and safe support-record boundaries.
 - Backport retries now recognize already merged pull requests and fail closed
   on closed, unmerged matches instead of creating duplicate pull requests.
 
