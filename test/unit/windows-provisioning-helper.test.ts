@@ -41,6 +41,9 @@ test('provisioning helper fails closed for existing state and never re-ACLs it',
   assert.doesNotMatch(native, /CreateFileW\(drive_root[^\n]*FILE_ADD_SUBDIRECTORY/u);
   assert.doesNotMatch(native, /NewPrivateDirectory|NewPrivateFile|NewPrivateDacl|NewPrivateRegistryDacl/u);
   assert.match(native, /napi_get_all_property_names/u);
+  assert.match(native, /napi_key_all_properties/u);
+  assert.match(native, /getOwnPropertyDescriptor/u);
+  assert.doesNotMatch(native, /napi_get_own_property_descriptor|napi_key_include_all/u);
   assert.match(native, /"com9"/u);
   assert.match(native, /"lpt9"/u);
   assert.match(native, /CreatePrivateRelative\(local_handle\.get\(\), L"Vissoto"/u);

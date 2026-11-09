@@ -1119,11 +1119,12 @@ bool OpenVerifiedLocalAppData(const std::wstring& path, Handle* result) {
 }
 
 bool ReadProvisionValue(napi_env env, napi_value input, const char* name, napi_value* value) {
-  napi_value key{};
-  napi_value descriptor{};
+  napi_value global{}, object{}, get_own_property_descriptor{}, key{}, descriptor{}, value_key{};
   bool has_value = false;
-  if (napi_create_string_utf8(env, name, NAPI_AUTO_LENGTH, &key) != napi_ok || napi_get_own_property_descriptor(env, input, key, &descriptor) != napi_ok || napi_has_named_property(env, descriptor, "value", &has_value) != napi_ok || !has_value) return false;
-  return napi_get_named_property(env, descriptor, "value", value) == napi_ok;
+  if (napi_get_global(env, &global) != napi_ok || napi_get_named_property(env, global, "Object", &object) != napi_ok || napi_get_named_property(env, object, "getOwnPropertyDescriptor", &get_own_property_descriptor) != napi_ok || napi_create_string_utf8(env, name, NAPI_AUTO_LENGTH, &key) != napi_ok) return false;
+  napi_value arguments[2]{input, key};
+  if (napi_call_function(env, object, get_own_property_descriptor, 2, arguments, &descriptor) != napi_ok || napi_create_string_utf8(env, "value", NAPI_AUTO_LENGTH, &value_key) != napi_ok || napi_has_own_property(env, descriptor, value_key, &has_value) != napi_ok || !has_value) return false;
+  return napi_get_property(env, descriptor, value_key, value) == napi_ok;
 }
 
 bool ReadProvisionString(napi_env env, napi_value input, const char* name, std::string* value, size_t maximum) {
@@ -1206,7 +1207,7 @@ bool IsExactProvisionObject(napi_env env, napi_value input, bool password) {
   napi_value prototype{}, object{}, expected{}, names{};
   uint32_t length = 0;
   bool same_prototype = false;
-  if (napi_get_prototype(env, input, &prototype) != napi_ok || napi_get_global(env, &object) != napi_ok || napi_get_named_property(env, object, "Object", &object) != napi_ok || napi_get_named_property(env, object, "prototype", &expected) != napi_ok || napi_strict_equals(env, prototype, expected, &same_prototype) != napi_ok || !same_prototype || napi_get_all_property_names(env, input, napi_key_own_only, napi_key_include_all, napi_key_numbers_to_strings, &names) != napi_ok || napi_get_array_length(env, names, &length) != napi_ok || length != (password ? 8u : 7u)) return false;
+  if (napi_get_prototype(env, input, &prototype) != napi_ok || napi_get_global(env, &object) != napi_ok || napi_get_named_property(env, object, "Object", &object) != napi_ok || napi_get_named_property(env, object, "prototype", &expected) != napi_ok || napi_strict_equals(env, prototype, expected, &same_prototype) != napi_ok || !same_prototype || napi_get_all_property_names(env, input, napi_key_own_only, napi_key_all_properties, napi_key_numbers_to_strings, &names) != napi_ok || napi_get_array_length(env, names, &length) != napi_ok || length != (password ? 8u : 7u)) return false;
   const char* allowed[] = {"profileId", "host", "port", "user", "authMode", "expectedHostFingerprint", "hostKeyLine", "credentialLocator"};
   for (uint32_t index = 0; index < length; ++index) {
     napi_value name{};
