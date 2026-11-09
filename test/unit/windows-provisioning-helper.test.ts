@@ -25,11 +25,30 @@ test('provisioning helper fails closed for existing state and never re-ACLs it',
 
   const native = await readFile(join(repositoryRoot, 'native', 'windows_trust.cc'), 'utf8');
   assert.match(native, /napi_value ProvisionApprovedProfile/u);
-  assert.match(native, /CREATE_NEW/u);
-  assert.match(native, /FILE_FLAG_OPEN_REPARSE_POINT/u);
+  assert.match(native, /FILE_CREATE/u);
   assert.match(native, /PROTECTED_DACL_SECURITY_INFORMATION/u);
   assert.match(native, /REG_CREATED_NEW_KEY/u);
   assert.match(native, /KF_FLAG_DONT_VERIFY/u);
+  assert.match(native, /IsExactProvisionObject/u);
+  assert.match(native, /VerifyKnownHostLine/u);
+  assert.match(native, /Base64Sha256/u);
+  assert.match(native, /JsonString/u);
+  assert.match(native, /OpenVerifiedLocalAppData/u);
+  assert.match(native, /OpenVerifiedDirectoryRelative/u);
+  assert.match(native, /CreateFileW\(drive_root\.c_str\(\)/u);
+  assert.match(native, /require_child_creation \? FILE_ADD_SUBDIRECTORY : 0/u);
+  assert.match(native, /next == std::wstring::npos, &child/u);
+  assert.doesNotMatch(native, /CreateFileW\(drive_root[^\n]*FILE_ADD_SUBDIRECTORY/u);
+  assert.doesNotMatch(native, /NewPrivateDirectory|NewPrivateFile|NewPrivateDacl|NewPrivateRegistryDacl/u);
+  assert.match(native, /napi_get_all_property_names/u);
+  assert.match(native, /"com9"/u);
+  assert.match(native, /"lpt9"/u);
+  assert.match(native, /CreatePrivateRelative\(local_handle\.get\(\), L"Vissoto"/u);
+  assert.match(native, /OpenVerifiedLocalAppData\(local_app_data, &local_handle\)/u);
+  assert.doesNotMatch(native, /VerifyNoReparseDirectoryChain|CreateFileW\(local_app_data\.c_str\(\)|GetFileAttributesW/u);
+  assert.match(native, /write_new_file\(state_handle\.get\(\), kStateFile/u);
+  assert.match(native, /OBJ_CASE_INSENSITIVE \| OBJ_DONT_REPARSE/u);
+  assert.doesNotMatch(native, /FILE_DIRECTORY_FILE[^\n]*FILE_OPEN_REPARSE_POINT/u);
   assert.doesNotMatch(script, /Remove-Item|Clear-Content|Set-Content|Add-Content|Out-File/iu);
 });
 
