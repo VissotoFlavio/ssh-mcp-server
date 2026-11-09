@@ -22,6 +22,16 @@ publish a release.
   repository and deterministic branch before treating it as reusable or complete.
 - Package-candidate workflow metadata validation now reads the npm lockfile's
   empty root-package key with Node.js, allowing Windows candidate packaging to proceed.
+- Package-candidate generation now gates packaging on the four exact successful
+  CI check-runs for the immutable pull-request SHA, reports actionable blockers,
+  and avoids repeating general validation while retaining Windows Node.js 22 and
+  24 build, inspection, and packaging.
+- Candidate check selection now requires canonical GitHub Actions workflow
+  provenance, chooses the newest attempt by start time and id, and uses a
+  trusted package gate before Windows packaging plus an immediate publication
+  revalidation. The trusted verifier also requires the canonical workflow blob
+  and content to match the trusted default-branch revision and each workflow run to belong to
+  the exact same-repository pull request.
 - Package-candidate reporting now gates checks and marked PR-comment mutation to
   authorized requests, uses the minimum report permissions, isolates check
   completion failures from comment publication, and fails explicitly with
