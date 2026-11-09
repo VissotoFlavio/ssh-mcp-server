@@ -23,6 +23,7 @@
 #include <cstring>
 #include <memory>
 #include <sstream>
+#include <cwctype>
 #include <vector>
 
 namespace {
@@ -620,8 +621,8 @@ bool CreatePrivateRelative(HANDLE root, const std::wstring& leaf, PrivateSecurit
 
 class SnapshotSession final {
  public:
-  explicit SnapshotSession(PSID operator_sid)
-      : operator_sid_(static_cast<const BYTE*>(operator_sid), static_cast<const BYTE*>(operator_sid) + GetLengthSid(operator_sid)), capability_tag_(&kSnapshotCapabilityTypeTag) {}
+  SnapshotSession(PSID operator_sid, const std::string& profile_id)
+      : operator_sid_(static_cast<const BYTE*>(operator_sid), static_cast<const BYTE*>(operator_sid) + GetLengthSid(operator_sid)), profile_id_(profile_id), capability_tag_(&kSnapshotCapabilityTypeTag) {}
   ~SnapshotSession() {
     if (!disposed_) {
       Rollback();
@@ -667,6 +668,7 @@ class SnapshotSession final {
   HANDLE directory_handle() const { return directory_.get(); }
   bool IsReady() const { return parent_identity_known_ && directory_identity_known_ && file_identity_known_ && parent_.get() != INVALID_HANDLE_VALUE && directory_.get() != INVALID_HANDLE_VALUE && file_.get() != INVALID_HANDLE_VALUE; }
   bool IsValidCapability() const { return !disposed_ && parent_.get() != INVALID_HANDLE_VALUE && directory_.get() != INVALID_HANDLE_VALUE && capability_tag_ == &kSnapshotCapabilityTypeTag; }
+  bool MatchesProfile(const std::string& profile_id) const { return profile_id_ == profile_id; }
 
   bool Acquire() {
     bool expected = false;
@@ -764,6 +766,7 @@ class SnapshotSession final {
   PSID operator_sid() const { return static_cast<PSID>(const_cast<BYTE*>(operator_sid_.data())); }
 
   std::vector<BYTE> operator_sid_;
+  std::string profile_id_;
   const void* capability_tag_;
   Handle parent_;
   Handle directory_;
@@ -783,13 +786,13 @@ class SnapshotSession final {
 
 LONG g_snapshot_counter = 0;
 
-bool CreateKnownHostsSnapshot(const std::wstring& state_root, PSID operator_sid, const std::vector<BYTE>& data, std::unique_ptr<SnapshotSession>* snapshot) {
+bool CreateKnownHostsSnapshot(const std::wstring& state_root, PSID operator_sid, const std::string& profile_id, const std::vector<BYTE>& data, std::unique_ptr<SnapshotSession>* snapshot) {
   if (data.empty() || data.size() > kMaxFileBytes || !VerifyDirectoryChain(state_root, operator_sid)) return false;
   Handle parent(CreateFileW(state_root.c_str(), FILE_READ_ATTRIBUTES | READ_CONTROL | FILE_ADD_SUBDIRECTORY | FILE_TRAVERSE, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
   if (parent.get() == INVALID_HANDLE_VALUE || !VerifyFile(parent.get(), operator_sid, true)) return false;
   PrivateSecurityAttributes security(operator_sid);
   if (!security.valid()) return false;
-  std::unique_ptr<SnapshotSession> candidate(new SnapshotSession(operator_sid));
+  std::unique_ptr<SnapshotSession> candidate(new SnapshotSession(operator_sid, profile_id));
   if (!candidate->AdoptParent(std::move(parent))) return false;
   for (DWORD attempt = 0; attempt != 16; ++attempt) {
     unsigned int random_value = 0;
@@ -906,6 +909,16 @@ std::wstring FixedCommandLine(const std::wstring& application, const std::vector
   AppendQuotedArgument(&command, application);
   for (const auto& argument : arguments) AppendQuotedArgument(&command, argument);
   return command;
+}
+
+std::wstring PosixShellQuote(const std::wstring& value) {
+  std::wstring quoted = L"'";
+  for (wchar_t character : value) {
+    if (character == L'\'') quoted.append(L"'\\''");
+    else quoted.push_back(character);
+  }
+  quoted.push_back(L'\'');
+  return quoted;
 }
 
 bool IsSafeReadinessHost(const std::wstring& host) {
@@ -1388,7 +1401,7 @@ napi_value CaptureKnownHostsSnapshot(napi_env env, napi_callback_info info) {
   if (!ReadArgumentString(env, info, &profile_id) || !LoadConfiguration(&state_root, &known_hosts_root, &operator_sid)) return Unavailable(env);
   std::wstring leaf(profile_id.begin(), profile_id.end());
   leaf += L".known_hosts";
-  if (!ReadProtectedFile(known_hosts_root, leaf, operator_sid.data(), &data) || !CreateKnownHostsSnapshot(state_root, operator_sid.data(), data, &snapshot)) return Unavailable(env);
+  if (!ReadProtectedFile(known_hosts_root, leaf, operator_sid.data(), &data) || !CreateKnownHostsSnapshot(state_root, operator_sid.data(), profile_id, data, &snapshot)) return Unavailable(env);
 
   napi_value result{};
   napi_value bytes{};
@@ -1502,8 +1515,6 @@ VOID CALLBACK DeferredReaperWaitCallback(PVOID data, BOOLEAN) {
 #ifdef SSH_MCP_NATIVE_TEST
   if (g_test_deferred_reaper_gate != nullptr) WaitForSingleObject(g_test_deferred_reaper_gate, INFINITE);
 #endif
-  // A failed queue must retain the busy lease and reference for process
-  // lifetime: releasing a snapshot before this child is known dead is unsafe.
   napi_call_threadsafe_function(reaper->completion, nullptr, napi_tsfn_nonblocking);
 }
 
@@ -1513,13 +1524,12 @@ void CompleteDeferredReaper(napi_env env, napi_value, void* data, void*) {
   // The surrounding TypeScript finally deliberately left this capability busy.
   // Its native owner must now complete its deterministic cleanup itself.
   if (!reaper->snapshot->Dispose()) {
-    // Cleanup uncertainty is fail-closed: retain the capability reference and
-    // reacquire its lease for process lifetime rather than allow finalization
-    // to race an unverified retry.
-    reaper->snapshot->Acquire();
-    if (reaper->completion != nullptr) napi_release_threadsafe_function(reaper->completion, napi_tsfn_release);
-    reaper.release();
-    return;
+    // The child has already exited. A second dispose is safe and prevents a
+    // failed first native release from leaking the opaque capability.
+    if (!reaper->snapshot->Dispose()) {
+      Sleep(1);
+      reaper->snapshot->Dispose();
+    }
   }
   if (reaper->snapshot_reference != nullptr) napi_delete_reference(env, reaper->snapshot_reference);
 #ifdef SSH_MCP_NATIVE_TEST
@@ -1556,6 +1566,16 @@ bool ScheduleDeferredReaper(napi_env env, std::unique_ptr<DeferredReaperWork>& r
   return true;
 }
 
+void ReapDeferredSynchronously(napi_env env, std::unique_ptr<DeferredReaperWork>& reaper) {
+  if (reaper->child.get() != INVALID_HANDLE_VALUE) WaitForSingleObject(reaper->child.get(), INFINITE);
+  reaper->snapshot->Release();
+  reaper->snapshot->Dispose();
+  if (reaper->snapshot_reference != nullptr) napi_delete_reference(env, reaper->snapshot_reference);
+  reaper->snapshot_reference = nullptr;
+  if (reaper->completion != nullptr) napi_release_threadsafe_function(reaper->completion, napi_tsfn_release);
+  reaper->completion = nullptr;
+}
+
 void CompleteAgentReadiness(napi_env env, napi_status, void* data) {
   std::unique_ptr<AgentReadinessWork> job(static_cast<AgentReadinessWork*>(data));
   bool deferred = false;
@@ -1568,13 +1588,7 @@ void CompleteAgentReadiness(napi_env env, napi_status, void* data) {
       job->snapshot_reference = nullptr;
       deferred = true;
     } else {
-      // Preserve the busy lease and reference for process lifetime rather than
-      // releasing a snapshot which an unreaped child can still read.
-      // ScheduleDeferredReaper leaves its input intact on failure. Retain the
-      // child, reference and busy lease for process lifetime rather than
-      // risking early snapshot release.
-      reaper.release();
-      job->snapshot_reference = nullptr;
+      ReapDeferredSynchronously(env, reaper);
       deferred = true;
     }
   }
@@ -1605,6 +1619,618 @@ napi_value CancelAgentReadiness(napi_env env, napi_callback_info info) {
   static_cast<std::shared_ptr<NativeCancellation>*>(data)->get()->requested.store(true);
   napi_value result{};
   return napi_get_undefined(env, &result) == napi_ok ? result : Unavailable(env);
+}
+
+constexpr DWORD kNativeCommandMaxTimeout = 60'000;
+constexpr size_t kNativeCommandMaxOutput = 1024 * 1024;
+constexpr size_t kNativeCommandMaxArguments = 128;
+constexpr size_t kNativeCommandMaxCommandBytes = 256;
+constexpr size_t kNativeCommandMaxArgumentBytes = 4096;
+
+struct NativeAgentCommandRequest final {
+  std::string profile_id;
+  std::wstring host;
+  DWORD port = 0;
+  std::wstring user;
+  std::string expected_fingerprint;
+  std::wstring command;
+  std::vector<std::wstring> arguments;
+  DWORD timeout = 0;
+  size_t output_limit = 0;
+};
+
+struct NativeAgentCommandProcess final {
+  Handle job;
+  Handle process;
+  Handle stdout_read;
+  Handle stderr_read;
+};
+
+struct NativeAgentCommandRunResult final {
+  bool launched = false;
+  bool failed = false;
+  bool timed_out = false;
+  bool output_limited = false;
+  DWORD exit_code = 1;
+  std::string stdout_data;
+  std::string stderr_data;
+  Handle unreaped_job;
+};
+
+struct NativeAgentCommandWork final {
+  napi_env env;
+  napi_async_work work = nullptr;
+  napi_deferred deferred = nullptr;
+  napi_ref snapshot_reference = nullptr;
+  napi_ref abort_signal_reference = nullptr;
+  napi_ref abort_listener_reference = nullptr;
+  SnapshotSession* snapshot = nullptr;
+  NativeAgentCommandRequest request;
+  std::shared_ptr<NativeCancellation> cancellation;
+  NativeAgentCommandRunResult result;
+};
+
+bool Utf8ToWide(const std::string& value, std::wstring* output) {
+  if (value.empty() || value.size() > INT_MAX) return false;
+  const int required = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), static_cast<int>(value.size()), nullptr, 0);
+  if (required <= 0) return false;
+  std::vector<wchar_t> buffer(static_cast<size_t>(required));
+  if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), static_cast<int>(value.size()), buffer.data(), required) != required) return false;
+  output->assign(buffer.data(), buffer.size());
+  return output->find(L'\0') == std::wstring::npos;
+}
+
+bool WideToUtf8(const std::wstring& value, std::string* output) {
+  if (value.empty() || value.size() > INT_MAX) return false;
+  const int required = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.data(), static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
+  if (required <= 0) return false;
+  std::vector<char> buffer(static_cast<size_t>(required));
+  if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.data(), static_cast<int>(value.size()), buffer.data(), required, nullptr, nullptr) != required) return false;
+  output->assign(buffer.data(), buffer.size());
+  return true;
+}
+
+void RedactNativePath(std::string* output, const std::wstring& path) {
+  std::string encoded;
+  if (!WideToUtf8(path, &encoded) || encoded.empty()) return;
+  size_t position = output->find(encoded);
+  while (position != std::string::npos) {
+    output->replace(position, encoded.size(), "[REDACTED_PATH]");
+    position = output->find(encoded, position + sizeof("[REDACTED_PATH]") - 1);
+  }
+}
+
+bool HasUnsafeCommandText(const std::wstring& value) {
+  for (wchar_t character : value) {
+    if (character < 0x20 || character == 0x7f || iswspace(character) != 0 || character == L';' || character == L'&' || character == L'|' ||
+        character == L'<' || character == L'>' || character == L'`' || character == L'$' || character == L'(' || character == L')' ||
+        character == L'{' || character == L'}') {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool HasUnsafeArgumentText(const std::wstring& value) {
+  for (wchar_t character : value) {
+    if (character < 0x20 || character == 0x7f || character == L';' || character == L'&' || character == L'|' || character == L'<' ||
+        character == L'>' || character == L'`' || character == L'$' || character == L'(' || character == L')' || character == L'{' ||
+        character == L'}') {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::wstring LowerAscii(const std::wstring& value) {
+  std::wstring lowered = value;
+  for (wchar_t& character : lowered) {
+    if (character >= L'A' && character <= L'Z') character = static_cast<wchar_t>(character - L'A' + L'a');
+  }
+  return lowered;
+}
+
+bool IsRejectedRemoteExecutable(const std::wstring& command) {
+  const size_t separator = command.find_last_of(L"/\\");
+  const std::wstring executable = LowerAscii(command.substr(separator == std::wstring::npos ? 0 : separator + 1));
+  static constexpr const wchar_t* rejected[] = {L"sh", L"bash", L"dash", L"zsh", L"ksh", L"csh", L"tcsh", L"fish", L"cmd", L"cmd.exe",
+                                                 L"powershell", L"powershell.exe", L"pwsh", L"pwsh.exe", L"python", L"python3", L"python.exe",
+                                                 L"perl", L"ruby", L"node"};
+  for (const wchar_t* candidate : rejected) if (executable == candidate) return true;
+  return false;
+}
+
+bool IsRejectedShellFlag(const std::wstring& value) {
+  const std::wstring lowered = LowerAscii(value);
+  static constexpr const wchar_t* rejected[] = {L"-c", L"-ccommand", L"--command", L"-command", L"-encodedcommand", L"--eval", L"-e", L"/c", L"/k"};
+  for (const wchar_t* candidate : rejected) if (lowered == candidate) return true;
+  return false;
+}
+
+bool ReadCommandString(napi_env env, napi_value object, const char* name, size_t maximum, std::string* value) {
+  napi_value property{};
+  size_t bytes = 0;
+  if (!ReadProvisionValue(env, object, name, &property) || napi_get_value_string_utf8(env, property, nullptr, 0, &bytes) != napi_ok || bytes == 0 || bytes > maximum) return false;
+  std::vector<char> buffer(bytes + 1);
+  if (napi_get_value_string_utf8(env, property, buffer.data(), buffer.size(), &bytes) != napi_ok) return false;
+  value->assign(buffer.data(), bytes);
+  return value->find('\0') == std::string::npos;
+}
+
+bool ReadCommandNumber(napi_env env, napi_value object, const char* name, double* value) {
+  napi_value property{};
+  return ReadProvisionValue(env, object, name, &property) && napi_get_value_double(env, property, value) == napi_ok && std::isfinite(*value) && std::floor(*value) == *value;
+}
+
+bool ReadCommandArguments(napi_env env, napi_value object, std::vector<std::wstring>* arguments) {
+  napi_value property{};
+  napi_valuetype type{};
+  bool is_array = false;
+  uint32_t length = 0;
+  if (!ReadProvisionValue(env, object, "args", &property) || napi_typeof(env, property, &type) != napi_ok || type != napi_object || napi_is_array(env, property, &is_array) != napi_ok || !is_array ||
+      napi_get_array_length(env, property, &length) != napi_ok || length > kNativeCommandMaxArguments) return false;
+  napi_value prototype{};
+  napi_value global{};
+  napi_value array_constructor{};
+  napi_value expected{};
+  bool same_prototype = false;
+  if (napi_get_prototype(env, property, &prototype) != napi_ok || napi_get_global(env, &global) != napi_ok || napi_get_named_property(env, global, "Array", &array_constructor) != napi_ok ||
+      napi_get_named_property(env, array_constructor, "prototype", &expected) != napi_ok || napi_strict_equals(env, prototype, expected, &same_prototype) != napi_ok || !same_prototype) return false;
+  napi_value names{};
+  uint32_t name_count = 0;
+  if (napi_get_property_names(env, property, &names) != napi_ok || napi_get_array_length(env, names, &name_count) != napi_ok || name_count != length) return false;
+  arguments->clear();
+  arguments->reserve(length);
+  for (uint32_t index = 0; index < length; ++index) {
+    napi_value name{};
+    size_t name_bytes = 0;
+    if (napi_get_element(env, names, index, &name) != napi_ok || napi_get_value_string_utf8(env, name, nullptr, 0, &name_bytes) != napi_ok) return false;
+    std::vector<char> name_buffer(name_bytes + 1);
+    const std::string expected_name = std::to_string(index);
+    if (napi_get_value_string_utf8(env, name, name_buffer.data(), name_buffer.size(), &name_bytes) != napi_ok || std::string(name_buffer.data(), name_bytes) != expected_name) return false;
+    napi_value element{};
+    if (!ReadProvisionValue(env, property, expected_name.c_str(), &element)) return false;
+    size_t bytes = 0;
+    if (napi_get_value_string_utf8(env, element, nullptr, 0, &bytes) != napi_ok || bytes == 0 || bytes > kNativeCommandMaxArgumentBytes) return false;
+    std::vector<char> buffer(bytes + 1);
+    if (napi_get_value_string_utf8(env, element, buffer.data(), buffer.size(), &bytes) != napi_ok) return false;
+    std::string utf8(buffer.data(), bytes);
+    std::wstring wide;
+    if (!Utf8ToWide(utf8, &wide) || HasUnsafeArgumentText(wide) || IsRejectedShellFlag(wide)) return false;
+    arguments->push_back(std::move(wide));
+  }
+  return true;
+}
+
+bool IsPlainCommandObject(napi_env env, napi_value object) {
+  napi_valuetype type{};
+  if (napi_typeof(env, object, &type) != napi_ok || type != napi_object) return false;
+  bool is_array = false;
+  if (napi_is_array(env, object, &is_array) != napi_ok || is_array) return false;
+  napi_value prototype{};
+  if (napi_get_prototype(env, object, &prototype) != napi_ok) return false;
+  napi_valuetype prototype_type{};
+  if (napi_typeof(env, prototype, &prototype_type) != napi_ok) return false;
+  if (prototype_type == napi_null) return true;
+  if (prototype_type != napi_object) return false;
+  napi_value global{};
+  napi_value object_constructor{};
+  napi_value expected{};
+  bool same_prototype = false;
+  return napi_get_global(env, &global) == napi_ok && napi_get_named_property(env, global, "Object", &object_constructor) == napi_ok &&
+         napi_get_named_property(env, object_constructor, "prototype", &expected) == napi_ok && napi_strict_equals(env, prototype, expected, &same_prototype) == napi_ok && same_prototype;
+}
+
+bool ReadNativeAgentCommandRequest(napi_env env, napi_value input, NativeAgentCommandRequest* request) {
+  if (!IsPlainCommandObject(env, input)) return false;
+  napi_value names{};
+  uint32_t length = 0;
+  if (napi_get_all_property_names(env, input, napi_key_own_only, napi_key_all_properties, napi_key_numbers_to_strings, &names) != napi_ok || napi_get_array_length(env, names, &length) != napi_ok || length != 9) return false;
+  static constexpr const char* allowed[] = {"profileId", "host", "port", "user", "expectedHostFingerprint", "command", "args", "timeoutMs", "maxOutputBytes"};
+  for (uint32_t index = 0; index < length; ++index) {
+    napi_value name{};
+    size_t bytes = 0;
+    if (napi_get_element(env, names, index, &name) != napi_ok || napi_get_value_string_utf8(env, name, nullptr, 0, &bytes) != napi_ok || bytes > 64) return false;
+    std::vector<char> buffer(bytes + 1);
+    if (napi_get_value_string_utf8(env, name, buffer.data(), buffer.size(), &bytes) != napi_ok) return false;
+    bool recognized = false;
+    for (const char* candidate : allowed) recognized = recognized || strcmp(buffer.data(), candidate) == 0;
+    if (!recognized) return false;
+  }
+  std::string host_utf8;
+  std::string user_utf8;
+  std::string command_utf8;
+  if (!ReadCommandString(env, input, "profileId", 128, &request->profile_id) || !IsCanonicalProfileId(request->profile_id) ||
+      !ReadCommandString(env, input, "host", 253, &host_utf8) || !ReadCommandString(env, input, "user", 64, &user_utf8) ||
+      !ReadCommandString(env, input, "expectedHostFingerprint", 64, &request->expected_fingerprint) || !IsFingerprint(request->expected_fingerprint) ||
+      !ReadCommandString(env, input, "command", kNativeCommandMaxCommandBytes, &command_utf8) || !ReadCommandArguments(env, input, &request->arguments)) return false;
+  if (!Utf8ToWide(host_utf8, &request->host) || !Utf8ToWide(user_utf8, &request->user) || !Utf8ToWide(command_utf8, &request->command) ||
+      !IsSafeReadinessHost(request->host) || !IsSafeReadinessUser(request->user) || HasUnsafeCommandText(request->command) ||
+      IsRejectedRemoteExecutable(request->command)) return false;
+  double port = 0;
+  double timeout = 0;
+  double output_limit = 0;
+  if (!ReadCommandNumber(env, input, "port", &port) || port < 1 || port > 65535 || !ReadCommandNumber(env, input, "timeoutMs", &timeout) || timeout < 1 || timeout > kNativeCommandMaxTimeout ||
+      !ReadCommandNumber(env, input, "maxOutputBytes", &output_limit) || output_limit < 1 || output_limit > kNativeCommandMaxOutput) return false;
+  request->port = static_cast<DWORD>(port);
+  request->timeout = static_cast<DWORD>(timeout);
+  request->output_limit = static_cast<size_t>(output_limit);
+  return true;
+}
+
+bool StartNativeAgentCommandProcess(const std::wstring& application, const std::wstring& command_line, NativeAgentCommandProcess* process) {
+  SECURITY_ATTRIBUTES inheritable{};
+  inheritable.nLength = sizeof(inheritable);
+  inheritable.bInheritHandle = TRUE;
+  Handle input(CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &inheritable, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+  if (input.get() == INVALID_HANDLE_VALUE) return false;
+  HANDLE stdout_read = INVALID_HANDLE_VALUE;
+  HANDLE stdout_write = INVALID_HANDLE_VALUE;
+  HANDLE stderr_read = INVALID_HANDLE_VALUE;
+  HANDLE stderr_write = INVALID_HANDLE_VALUE;
+  if (!CreatePipe(&stdout_read, &stdout_write, &inheritable, 0) || !CreatePipe(&stderr_read, &stderr_write, &inheritable, 0)) {
+    if (stdout_read != INVALID_HANDLE_VALUE) CloseHandle(stdout_read);
+    if (stdout_write != INVALID_HANDLE_VALUE) CloseHandle(stdout_write);
+    if (stderr_read != INVALID_HANDLE_VALUE) CloseHandle(stderr_read);
+    if (stderr_write != INVALID_HANDLE_VALUE) CloseHandle(stderr_write);
+    return false;
+  }
+  Handle stdout_read_handle(stdout_read);
+  Handle stdout_write_handle(stdout_write);
+  Handle stderr_read_handle(stderr_read);
+  Handle stderr_write_handle(stderr_write);
+  if (!SetHandleInformation(stdout_read_handle.get(), HANDLE_FLAG_INHERIT, 0) || !SetHandleInformation(stderr_read_handle.get(), HANDLE_FLAG_INHERIT, 0)) return false;
+  Handle job(CreateJobObjectW(nullptr, nullptr));
+  if (job.get() == nullptr || job.get() == INVALID_HANDLE_VALUE) return false;
+  JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+  limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+  if (!SetInformationJobObject(job.get(), JobObjectExtendedLimitInformation, &limits, sizeof(limits))) return false;
+  HANDLE inherited_handles[] = {input.get(), stdout_write_handle.get(), stderr_write_handle.get()};
+  SIZE_T attribute_bytes = 0;
+  InitializeProcThreadAttributeList(nullptr, 1, 0, &attribute_bytes);
+  if (attribute_bytes == 0) return false;
+  std::vector<BYTE> attribute_storage(attribute_bytes);
+  auto* attributes = reinterpret_cast<PPROC_THREAD_ATTRIBUTE_LIST>(attribute_storage.data());
+  if (InitializeProcThreadAttributeList(attributes, 1, 0, &attribute_bytes) == FALSE ||
+      UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited_handles, sizeof(inherited_handles), nullptr, nullptr) == FALSE)
+    return false;
+  STARTUPINFOEXW startup{};
+  startup.StartupInfo.cb = sizeof(startup);
+  startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+  startup.StartupInfo.hStdInput = input.get();
+  startup.StartupInfo.hStdOutput = stdout_write_handle.get();
+  startup.StartupInfo.hStdError = stderr_write_handle.get();
+  PROCESS_INFORMATION information{};
+  std::wstring mutable_command_line = command_line;
+  if (!CreateProcessW(application.c_str(), mutable_command_line.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr,
+                      &startup.StartupInfo, &information)) {
+    DeleteProcThreadAttributeList(attributes);
+    return false;
+  }
+  DeleteProcThreadAttributeList(attributes);
+  Handle child(information.hProcess);
+  Handle thread(information.hThread);
+  if (!AssignProcessToJobObject(job.get(), child.get()) || ResumeThread(thread.get()) == static_cast<DWORD>(-1)) {
+    TerminateProcess(child.get(), 1);
+    WaitForSingleObject(child.get(), 1'000);
+    return false;
+  }
+  stdout_write_handle.reset();
+  stderr_write_handle.reset();
+  process->job = std::move(job);
+  process->process = std::move(child);
+  process->stdout_read = std::move(stdout_read_handle);
+  process->stderr_read = std::move(stderr_read_handle);
+  return true;
+}
+
+bool DrainNativeAgentPipe(Handle* pipe, std::string* output, size_t limit, size_t* combined, bool* output_limited) {
+  while (pipe->get() != INVALID_HANDLE_VALUE) {
+    DWORD available = 0;
+    if (!PeekNamedPipe(pipe->get(), nullptr, 0, nullptr, &available, nullptr)) {
+      pipe->reset();
+      return true;
+    }
+    if (available == 0) return true;
+    BYTE buffer[4096];
+    DWORD to_read = std::min<DWORD>(available, static_cast<DWORD>(sizeof(buffer)));
+    DWORD read = 0;
+    if (!ReadFile(pipe->get(), buffer, to_read, &read, nullptr)) {
+      if (GetLastError() == ERROR_BROKEN_PIPE) {
+        pipe->reset();
+        return true;
+      }
+      return false;
+    }
+    if (read == 0) return true;
+    const size_t remaining = *combined < limit ? limit - *combined : 0;
+    const size_t retained = std::min<size_t>(remaining, read);
+    output->append(reinterpret_cast<const char*>(buffer), retained);
+    *combined += retained;
+    if (retained != read) {
+      *output_limited = true;
+      return true;
+    }
+  }
+  return true;
+}
+
+bool WaitForNativeAgentJob(Handle* job, Handle* unreaped_job) {
+  DWORD wait = WaitForSingleObject(job->get(), 1'000);
+  if (wait != WAIT_OBJECT_0) {
+    TerminateJobObject(job->get(), 1);
+    wait = WaitForSingleObject(job->get(), 1'000);
+  }
+  if (wait == WAIT_OBJECT_0) return true;
+  *unreaped_job = std::move(*job);
+  return false;
+}
+
+NativeAgentCommandRunResult RunNativeAgentCommand(SnapshotSession* snapshot, const NativeAgentCommandRequest& request, const std::shared_ptr<NativeCancellation>& cancellation) {
+  NativeAgentCommandRunResult result;
+  if (cancellation->requested.load() || !snapshot->MatchesProfile(request.profile_id)) return result;
+  std::wstring known_hosts;
+  std::wstring snapshot_directory;
+  std::wstring known_hosts_short;
+  std::wstring identity_file;
+  std::wstring ssh;
+  std::wstring ssh_add;
+  std::array<DWORD, 4> version{};
+  Handle system_handle;
+  Handle openssh_handle;
+  Handle ssh_add_handle;
+  Handle ssh_handle;
+  if (!snapshot->ReadyKnownHostsPath(&known_hosts, &snapshot_directory) || !ShortNtfsPath(known_hosts, &known_hosts_short) || !DedicatedAgentPublicKeyPath(&identity_file) ||
+      !TrustedOpenSsh(&ssh, &ssh_add, &version, &system_handle, &openssh_handle, &ssh_add_handle, &ssh_handle)) return result;
+  const ULONGLONG started = GetTickCount64();
+  const DWORD probe_timeout = request.timeout - static_cast<DWORD>(std::min<ULONGLONG>(request.timeout - 1, GetTickCount64() - started));
+  DWORD probe_exit = 1;
+  const LaunchResult probe = ProbeTrustedOpenSsh(probe_timeout, &probe_exit, &cancellation->requested);
+  if (probe == LaunchResult::kTimedOut) result.timed_out = true;
+  if (probe != LaunchResult::kCompleted || probe_exit != 0) return result;
+  if (cancellation->requested.load()) return result;
+  // Re-resolve and retain the verified executable handles immediately before
+  // the command launch. The earlier probe only establishes the current-user
+  // agent identity gate.
+  system_handle.reset();
+  openssh_handle.reset();
+  ssh_add_handle.reset();
+  ssh_handle.reset();
+  if (!TrustedOpenSsh(&ssh, &ssh_add, &version, &system_handle, &openssh_handle, &ssh_add_handle, &ssh_handle)) return result;
+  const DWORD elapsed = static_cast<DWORD>(std::min<ULONGLONG>(request.timeout, GetTickCount64() - started));
+  if (elapsed >= request.timeout) {
+    result.timed_out = true;
+    return result;
+  }
+  const std::vector<std::wstring> arguments = {
+      L"-F", L"none", L"-T", L"-n", L"-o", L"CanonicalizeHostname=no", L"-o", L"ProxyCommand=none", L"-o", L"ProxyJump=none",
+      L"-o", L"HostName=" + request.host, L"-o", L"BatchMode=yes", L"-o", L"StrictHostKeyChecking=yes", L"-o", L"UserKnownHostsFile=" + known_hosts_short,
+      L"-o", L"GlobalKnownHostsFile=NUL", L"-o", L"PasswordAuthentication=no", L"-o", L"KbdInteractiveAuthentication=no",
+      L"-o", L"NumberOfPasswordPrompts=0", L"-o", L"IdentityFile=" + identity_file, L"-o", L"IdentitiesOnly=yes", L"-p", std::to_wstring(request.port),
+      L"--", request.user + L"@" + request.host};
+  std::vector<std::wstring> fixed_arguments = arguments;
+  std::wstring remote_command = PosixShellQuote(request.command);
+  for (const std::wstring& argument : request.arguments) remote_command.append(L" ").append(PosixShellQuote(argument));
+  fixed_arguments.push_back(remote_command);
+  const std::wstring command_line = FixedCommandLine(ssh, fixed_arguments);
+  if (command_line.size() >= 32767) return result;
+  NativeAgentCommandProcess process;
+  if (!StartNativeAgentCommandProcess(ssh, command_line, &process)) return result;
+  result.launched = true;
+  size_t combined = 0;
+  bool terminate = false;
+  while (true) {
+    if (!DrainNativeAgentPipe(&process.stdout_read, &result.stdout_data, request.output_limit, &combined, &result.output_limited) ||
+        !DrainNativeAgentPipe(&process.stderr_read, &result.stderr_data, request.output_limit, &combined, &result.output_limited)) {
+      result.failed = true;
+      terminate = true;
+    }
+    if (result.output_limited) terminate = true;
+    if (cancellation->requested.load()) {
+      terminate = true;
+    } else if (GetTickCount64() - started >= request.timeout) {
+      result.timed_out = true;
+      terminate = true;
+    }
+    const DWORD process_state = WaitForSingleObject(process.process.get(), 0);
+    if (process_state == WAIT_OBJECT_0) break;
+    if (process_state == WAIT_FAILED) {
+      result.failed = true;
+      terminate = true;
+      break;
+    }
+    if (terminate) break;
+    Sleep(5);
+  }
+  if (terminate && WaitForSingleObject(process.process.get(), 0) != WAIT_OBJECT_0) {
+    if (!TerminateJobObject(process.job.get(), 1)) result.failed = true;
+  }
+  const bool job_reaped = WaitForNativeAgentJob(&process.job, &result.unreaped_job);
+  if (!job_reaped) result.failed = true;
+  if (job_reaped && !result.output_limited) {
+    if (!DrainNativeAgentPipe(&process.stdout_read, &result.stdout_data, request.output_limit, &combined, &result.output_limited) ||
+        !DrainNativeAgentPipe(&process.stderr_read, &result.stderr_data, request.output_limit, &combined, &result.output_limited)) {
+      result.failed = true;
+    }
+  }
+  if (GetExitCodeProcess(process.process.get(), &result.exit_code) == 0) result.failed = true;
+  if (cancellation->requested.load()) result.timed_out = false;
+  for (const std::wstring& sensitive_path : {known_hosts, known_hosts_short, identity_file, ssh, ssh_add}) {
+    RedactNativePath(&result.stdout_data, sensitive_path);
+    RedactNativePath(&result.stderr_data, sensitive_path);
+  }
+  return result;
+}
+
+napi_value NativeAgentCommandError(napi_env env, const char* code) {
+  const char* message = "Windows agent command is unavailable";
+  if (strcmp(code, "timeout") == 0) message = "Windows agent command timed out";
+  else if (strcmp(code, "cancelled") == 0) message = "Windows agent command cancelled";
+  else if (strcmp(code, "output-limit") == 0) message = "Windows agent command output exceeded its limit";
+  napi_value message_value{};
+  napi_value error{};
+  napi_value code_value{};
+  if (napi_create_string_utf8(env, message, NAPI_AUTO_LENGTH, &message_value) != napi_ok || napi_create_error(env, nullptr, message_value, &error) != napi_ok ||
+      napi_create_string_utf8(env, code, NAPI_AUTO_LENGTH, &code_value) != napi_ok || napi_set_named_property(env, error, "code", code_value) != napi_ok) return nullptr;
+  return error;
+}
+
+void RemoveNativeAgentCommandAbortListener(napi_env env, NativeAgentCommandWork* job) {
+  if (job->abort_signal_reference != nullptr && job->abort_listener_reference != nullptr) {
+    napi_value signal{};
+    napi_value listener{};
+    napi_value remove{};
+    napi_value event{};
+    napi_value ignored{};
+    if (napi_get_reference_value(env, job->abort_signal_reference, &signal) == napi_ok && napi_get_reference_value(env, job->abort_listener_reference, &listener) == napi_ok &&
+        napi_get_named_property(env, signal, "removeEventListener", &remove) == napi_ok && napi_create_string_utf8(env, "abort", NAPI_AUTO_LENGTH, &event) == napi_ok) {
+      napi_value arguments[2]{event, listener};
+      if (napi_call_function(env, signal, remove, 2, arguments, &ignored) != napi_ok) napi_get_and_clear_last_exception(env, &ignored);
+    }
+  }
+  if (job->abort_listener_reference != nullptr) napi_delete_reference(env, job->abort_listener_reference);
+  if (job->abort_signal_reference != nullptr) napi_delete_reference(env, job->abort_signal_reference);
+  job->abort_listener_reference = nullptr;
+  job->abort_signal_reference = nullptr;
+}
+
+void ExecuteNativeAgentCommand(napi_env, void* data) {
+  auto* job = static_cast<NativeAgentCommandWork*>(data);
+  job->result = RunNativeAgentCommand(job->snapshot, job->request, job->cancellation);
+}
+
+void CompleteNativeAgentCommand(napi_env env, napi_status, void* data) {
+  std::unique_ptr<NativeAgentCommandWork> job(static_cast<NativeAgentCommandWork*>(data));
+  RemoveNativeAgentCommandAbortListener(env, job.get());
+  bool deferred = false;
+  if (job->result.unreaped_job.get() != INVALID_HANDLE_VALUE) {
+    auto reaper = std::make_unique<DeferredReaperWork>();
+    reaper->snapshot = job->snapshot;
+    reaper->snapshot_reference = job->snapshot_reference;
+    reaper->child = std::move(job->result.unreaped_job);
+    if (ScheduleDeferredReaper(env, reaper)) {
+      job->snapshot_reference = nullptr;
+      deferred = true;
+    } else {
+      ReapDeferredSynchronously(env, reaper);
+      job->snapshot_reference = nullptr;
+      deferred = true;
+    }
+  }
+  if (!deferred) {
+    job->snapshot->Release();
+    if (job->snapshot_reference != nullptr) napi_delete_reference(env, job->snapshot_reference);
+  }
+  if (job->work != nullptr) napi_delete_async_work(env, job->work);
+  const char* error_code = nullptr;
+  if (job->cancellation->requested.load()) error_code = "cancelled";
+  else if (job->result.timed_out) error_code = "timeout";
+  else if (job->result.output_limited) error_code = "output-limit";
+  else if (!job->result.launched || job->result.failed) error_code = "windows-agent-command-unavailable";
+  if (error_code != nullptr) {
+    napi_value error = NativeAgentCommandError(env, error_code);
+    napi_reject_deferred(env, job->deferred, error);
+    return;
+  }
+  napi_value result{};
+  napi_value exit_code{};
+  napi_value stdout_value{};
+  napi_value stderr_value{};
+  napi_value truncated{};
+  if (napi_create_object(env, &result) != napi_ok || napi_create_int32(env, static_cast<int32_t>(job->result.exit_code), &exit_code) != napi_ok ||
+      napi_create_string_utf8(env, job->result.stdout_data.data(), job->result.stdout_data.size(), &stdout_value) != napi_ok ||
+      napi_create_string_utf8(env, job->result.stderr_data.data(), job->result.stderr_data.size(), &stderr_value) != napi_ok ||
+      napi_get_boolean(env, job->result.output_limited, &truncated) != napi_ok || napi_set_named_property(env, result, "exitCode", exit_code) != napi_ok ||
+      napi_set_named_property(env, result, "stdout", stdout_value) != napi_ok || napi_set_named_property(env, result, "stderr", stderr_value) != napi_ok ||
+      napi_set_named_property(env, result, "outputTruncated", truncated) != napi_ok) {
+    napi_reject_deferred(env, job->deferred, NativeAgentCommandError(env, "windows-agent-command-unavailable"));
+    return;
+  }
+  napi_resolve_deferred(env, job->deferred, result);
+}
+
+napi_value StartNativeAgentCommand(napi_env env, napi_callback_info info) {
+  size_t count = 3;
+  napi_value arguments[3]{};
+  if (napi_get_cb_info(env, info, &count, arguments, nullptr, nullptr) != napi_ok || (count != 2 && count != 3)) return Unavailable(env);
+  NativeAgentCommandRequest request;
+  SnapshotSession* snapshot = nullptr;
+  if (!ReadSnapshotCapabilityValue(env, arguments[0], &snapshot) || !ReadNativeAgentCommandRequest(env, arguments[1], &request) || !snapshot->MatchesProfile(request.profile_id) || !snapshot->Acquire()) return Unavailable(env);
+  auto job = std::make_unique<NativeAgentCommandWork>();
+  job->env = env;
+  job->snapshot = snapshot;
+  job->request = std::move(request);
+  job->cancellation = std::make_shared<NativeCancellation>();
+  napi_value promise{};
+  napi_value resource_name{};
+  if (napi_create_promise(env, &job->deferred, &promise) != napi_ok || napi_create_string_utf8(env, "sshMcpAgentCommand", NAPI_AUTO_LENGTH, &resource_name) != napi_ok) {
+    snapshot->Release();
+    return Unavailable(env);
+  }
+  if (count == 3) {
+    napi_valuetype signal_type{};
+    napi_value add{};
+    napi_value remove{};
+    napi_value signal = arguments[2];
+    if (napi_typeof(env, signal, &signal_type) != napi_ok || signal_type != napi_object || napi_get_named_property(env, signal, "addEventListener", &add) != napi_ok ||
+        napi_get_named_property(env, signal, "removeEventListener", &remove) != napi_ok) {
+      snapshot->Release();
+      return Unavailable(env);
+    }
+    napi_valuetype add_type{};
+    napi_valuetype remove_type{};
+    if (napi_typeof(env, add, &add_type) != napi_ok || add_type != napi_function || napi_typeof(env, remove, &remove_type) != napi_ok || remove_type != napi_function) {
+      snapshot->Release();
+      return Unavailable(env);
+    }
+    napi_value aborted{};
+    bool already_aborted = false;
+    if (napi_get_named_property(env, signal, "aborted", &aborted) == napi_ok) napi_get_value_bool(env, aborted, &already_aborted);
+    if (already_aborted) job->cancellation->requested.store(true);
+    auto cancellation_handle = std::make_unique<std::shared_ptr<NativeCancellation>>(job->cancellation);
+    napi_value listener{};
+    if (napi_create_function(env, "abort", NAPI_AUTO_LENGTH, CancelAgentReadiness, cancellation_handle.get(), &listener) != napi_ok ||
+        napi_add_finalizer(env, listener, cancellation_handle.get(), FinalizeAgentReadinessCancellation, nullptr, nullptr) != napi_ok) {
+      snapshot->Release();
+      return Unavailable(env);
+    }
+    cancellation_handle.release();
+    napi_value event{};
+    napi_value options{};
+    napi_value once{};
+    napi_value ignored{};
+    if (napi_create_string_utf8(env, "abort", NAPI_AUTO_LENGTH, &event) != napi_ok || napi_create_object(env, &options) != napi_ok || napi_get_boolean(env, true, &once) != napi_ok ||
+        napi_set_named_property(env, options, "once", once) != napi_ok) {
+      snapshot->Release();
+      return Unavailable(env);
+    }
+    napi_value add_arguments[3]{event, listener, options};
+    if (napi_call_function(env, signal, add, 3, add_arguments, &ignored) != napi_ok) {
+      napi_get_and_clear_last_exception(env, &ignored);
+      snapshot->Release();
+      return Unavailable(env);
+    }
+    if (napi_create_reference(env, signal, 1, &job->abort_signal_reference) != napi_ok || napi_create_reference(env, listener, 1, &job->abort_listener_reference) != napi_ok) {
+      snapshot->Release();
+      return Unavailable(env);
+    }
+  }
+  if (napi_create_reference(env, arguments[0], 1, &job->snapshot_reference) != napi_ok || napi_create_async_work(env, nullptr, resource_name, ExecuteNativeAgentCommand, CompleteNativeAgentCommand, job.get(), &job->work) != napi_ok) {
+    RemoveNativeAgentCommandAbortListener(env, job.get());
+    if (job->snapshot_reference != nullptr) napi_delete_reference(env, job->snapshot_reference);
+    snapshot->Release();
+    return Unavailable(env);
+  }
+  if (napi_queue_async_work(env, job->work) != napi_ok) {
+    napi_delete_async_work(env, job->work);
+    job->work = nullptr;
+    RemoveNativeAgentCommandAbortListener(env, job.get());
+    napi_delete_reference(env, job->snapshot_reference);
+    snapshot->Release();
+    return Unavailable(env);
+  }
+  job.release();
+  return promise;
 }
 
 napi_value StartNativeAgentKeyReadiness(napi_env env, napi_callback_info info) {
@@ -1872,6 +2498,15 @@ napi_value TestReadinessDescriptor(napi_env env, napi_callback_info info) {
   return napi_get_boolean(env, ReadReadinessDescriptor(env, descriptor, &host, &port, &user), &result) == napi_ok ? result : Unavailable(env);
 }
 
+napi_value TestAgentCommandRequest(napi_env env, napi_callback_info info) {
+  size_t count = 1;
+  napi_value request{};
+  if (napi_get_cb_info(env, info, &count, &request, nullptr, nullptr) != napi_ok || count != 1) return Unavailable(env);
+  NativeAgentCommandRequest parsed;
+  napi_value result{};
+  return napi_get_boolean(env, ReadNativeAgentCommandRequest(env, request, &parsed), &result) == napi_ok ? result : Unavailable(env);
+}
+
 napi_value TestBlockDeferredReaper(napi_env env, napi_callback_info info) {
   size_t count = 0;
   if (napi_get_cb_info(env, info, &count, nullptr, nullptr, nullptr) != napi_ok || count != 0) return Unavailable(env);
@@ -2116,6 +2751,7 @@ NAPI_MODULE_INIT() {
     {"isKnownHostsSnapshotBusy", nullptr, IsKnownHostsSnapshotBusy, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"prepareAgentKeyReadiness", nullptr, PrepareAgentKeyReadiness, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"startAgentKeyReadiness", nullptr, StartNativeAgentKeyReadiness, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"execute", nullptr, StartNativeAgentCommand, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"resolveOpenSsh", nullptr, ResolveOpenSsh, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"probeSshAdd", nullptr, ProbeSshAdd, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"startSshAddProbe", nullptr, StartSshAddProbe, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -2134,6 +2770,7 @@ NAPI_MODULE_INIT() {
     {"testSnapshotArtifactCount", nullptr, TestSnapshotArtifactCount, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"testFinalizeSnapshotCapability", nullptr, TestFinalizeSnapshotCapability, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"testReadinessDescriptor", nullptr, TestReadinessDescriptor, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"testAgentCommandRequest", nullptr, TestAgentCommandRequest, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"testBlockDeferredReaper", nullptr, TestBlockDeferredReaper, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"testReleaseDeferredReaper", nullptr, TestReleaseDeferredReaper, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"testWaitForMasterStarted", nullptr, TestWaitForMasterStarted, nullptr, nullptr, nullptr, napi_default, nullptr},

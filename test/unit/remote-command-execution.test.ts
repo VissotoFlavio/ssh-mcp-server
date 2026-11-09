@@ -42,6 +42,7 @@ function createProvider(transport = new FakeTransport(), options: { now?: () => 
       profiles: { getProfile: async (profileId: string) => (profileId === profile.profileId ? profile : undefined) },
       connectionValidation: {
         validateConnection: async (input: unknown) => ({ profileId: (input as { profileId: string }).profileId, ready: true as const }),
+        authorizeExecution: async () => ({ profile }),
       },
       transport,
       sudoApprovals: options.approvals,
@@ -165,18 +166,23 @@ test('enforces the output limit and transport deadline at the provider boundary'
   assert.equal(cancelled.code, 'cancelled');
 });
 
-test('rejects shell wrappers, control flags, metacharacters, and background helpers', async () => {
+test('rejects shell interpreters and control syntax but leaves remote wrappers to the target', async () => {
   const { provider, transport } = createProvider();
   for (const request of [
     { ...command, command: 'sh', args: ['-c', 'sudo id'] },
     { ...command, command: 'env', args: ['sudo', 'id'] },
     { ...command, command: 'nohup', args: ['sudo', 'id'] },
+    { ...command, command: 'sudoedit', args: ['id'] },
+    { ...command, command: '/usr/bin/sudoedit', args: ['id'] },
     { ...command, command: 'echo', args: ['ok; sudo id'] },
     { ...command, command: 'echo', args: ['ok &'] },
     { ...command, command: 'bash', args: ['-c', 'id'] },
   ]) {
     const result = await provider.execute(request);
-    assert.equal(result.code, 'invalid-input');
+    assert.equal(
+      result.code,
+      ['nohup', 'env'].includes(request.command) || request.command.includes('sudoedit') ? 'approval-required' : 'invalid-input',
+    );
   }
   assert.equal(transport.calls.length, 0);
 });
@@ -199,12 +205,18 @@ test('redacts separated flags, headers, URL credentials, and shell assignments i
     exitCode: 0,
     outcome: 'success',
     code: 'success',
+    argsHmac: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
   });
   assert.equal(serialized.includes('super-secret'), false);
   assert.equal(serialized.includes('bearer-secret'), false);
   assert.equal(serialized.includes('password@example.invalid'), false);
   assert.equal(serialized.includes('assignment-secret'), false);
   assert.equal(serialized.includes('secret-cookie'), false);
+  assert.equal(serialized.includes('"argsHmac"'), true);
+  assert.equal(
+    JSON.parse(serialized).args.every((value: string) => value === '[ARG]' || value.startsWith('-')),
+    true,
+  );
 });
 
 test('times out a hung profile validation and records audit failure if the sink fails', async () => {
@@ -212,7 +224,10 @@ test('times out a hung profile validation and records audit failure if the sink 
   const transport = new FakeTransport();
   const provider = new RemoteCommandExecutionProvider({
     profiles: { getProfile: async () => profile },
-    connectionValidation: { validateConnection: async () => new Promise(() => undefined) },
+    connectionValidation: {
+      validateConnection: async () => new Promise(() => undefined),
+      authorizeExecution: async () => new Promise(() => undefined),
+    },
     transport,
     auditSink: (event) => audit.push(event),
   });
@@ -224,7 +239,10 @@ test('times out a hung profile validation and records audit failure if the sink 
   const sinkFailure = createProvider(new FakeTransport());
   const audited = new RemoteCommandExecutionProvider({
     profiles: { getProfile: async () => profile },
-    connectionValidation: { validateConnection: async () => ({ profileId: profile.profileId, ready: true as const }) },
+    connectionValidation: {
+      validateConnection: async () => ({ profileId: profile.profileId, ready: true as const }),
+      authorizeExecution: async () => ({ profile }),
+    },
     transport: sinkFailure.transport,
     auditSink: () => {
       throw new Error('sink unavailable');
@@ -234,12 +252,48 @@ test('times out a hung profile validation and records audit failure if the sink 
   assert.equal(result.code, 'provider-failure');
 });
 
+test('preserves outcome-unknown when journal finalization and secondary audit both fail', async () => {
+  const provider = new RemoteCommandExecutionProvider({
+    profiles: { getProfile: async () => profile },
+    connectionValidation: {
+      authorizeExecution: async () => ({ profile }),
+      validateConnection: async () => ({ profileId: profile.profileId, ready: true as const }),
+    },
+    transport: new FakeTransport(),
+    auditSink: () => {
+      throw new Error('sink unavailable');
+    },
+    auditJournal: {
+      async digestArguments() {
+        return '0000000000000000000000000000000000000000000000000000000000000000';
+      },
+      async begin() {
+        return {
+          operationId: '0123456789abcdef0123456789abcdef',
+          finish: async () => {
+            throw new Error('journal unavailable');
+          },
+        };
+      },
+    },
+  });
+  const result = await provider.execute(command);
+  assert.equal(result.outcome, 'unknown');
+  assert.equal(result.code, 'outcome-unknown');
+  assert.equal(result.exitCode, null);
+  assert.equal(result.stdout, '');
+  assert.equal(result.stderr, '');
+});
+
 test('rejects a sudo approval when the approved profile identity changes', async () => {
   const changed = { ...profile, host: 'changed.internal.example' };
   let current = profile;
   const provider = new RemoteCommandExecutionProvider({
     profiles: { getProfile: async () => current },
-    connectionValidation: { validateConnection: async () => ({ profileId: profile.profileId, ready: true as const }) },
+    connectionValidation: {
+      validateConnection: async () => ({ profileId: profile.profileId, ready: true as const }),
+      authorizeExecution: async () => ({ profile: current }),
+    },
     transport: new FakeTransport(),
     humanApproval: { approve: async () => true },
   });

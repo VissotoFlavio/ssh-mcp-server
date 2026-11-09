@@ -3,6 +3,7 @@ import {
   HostIdentityCredentialPolicyError,
   validatePolicyProfile,
   type AuthorizedConnection,
+  type ConnectionProfile,
   type HostIdentityCredentialPolicy,
 } from '../policy/host-identity-credential-policy.js';
 import { validateProfileSelection } from '../profiles/connection-profile.js';
@@ -10,6 +11,7 @@ import { validateProfileSelection } from '../profiles/connection-profile.js';
 /** The narrow readiness boundary implemented by a trusted host integration. */
 export interface ConnectionReadinessAdapter {
   connect(authorized: AuthorizedConnection, signal?: AbortSignal): Promise<void>;
+  authorize?(authorized: AuthorizedConnection, signal?: AbortSignal): Promise<ValidatedConnectionAuthorization>;
 }
 
 /**
@@ -18,6 +20,14 @@ export interface ConnectionReadinessAdapter {
  */
 export interface ConnectionValidationProvider {
   validateConnection(input: unknown, signal?: AbortSignal): Promise<ConnectionValidationOutcome>;
+  /** Internal execution lease; never exposed by the MCP response projection. */
+  authorizeExecution?(input: unknown, signal?: AbortSignal): Promise<ValidatedConnectionAuthorization>;
+}
+
+export interface ValidatedConnectionAuthorization {
+  readonly profile: ConnectionProfile;
+  readonly withTransportContext?: <T>(work: (context: object) => Promise<T>) => Promise<T>;
+  readonly release?: () => Promise<void>;
 }
 
 /** Deliberately small, non-secret result that can cross the MCP boundary. */
@@ -104,15 +114,23 @@ export function createTrustedConnectionValidationProvider(dependencies: TrustedC
     return invalidDependencies();
   }
 
+  const authorizeExecution = async (input: unknown, signal?: AbortSignal): Promise<ValidatedConnectionAuthorization> => {
+    const selection = validateProfileSelection(input);
+    if (signal?.aborted) throw new Error('Connection validation cancelled');
+    const authorized = bindAuthorizedConnection(await dependencies.policy.authorize(selection), selection.profileId);
+    if (dependencies.readinessAdapter.authorize !== undefined) return dependencies.readinessAdapter.authorize(authorized, signal);
+    await dependencies.readinessAdapter.connect(authorized, signal);
+    if (signal?.aborted) throw new Error('Connection validation cancelled');
+    return { profile: authorized.profile };
+  };
+
   return {
     async validateConnection(input: unknown, signal?: AbortSignal): Promise<ConnectionValidationOutcome> {
-      const selection = validateProfileSelection(input);
-      if (signal?.aborted) throw new Error('Connection validation cancelled');
-      const authorized = bindAuthorizedConnection(await dependencies.policy.authorize(selection), selection.profileId);
-      await dependencies.readinessAdapter.connect(authorized, signal);
-      if (signal?.aborted) throw new Error('Connection validation cancelled');
-      return { profileId: selection.profileId, ready: true };
+      const authorization = await authorizeExecution(input, signal);
+      await authorization.release?.();
+      return { profileId: authorization.profile.profileId, ready: true };
     },
+    authorizeExecution,
   };
 }
 

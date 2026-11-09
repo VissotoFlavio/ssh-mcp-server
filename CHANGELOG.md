@@ -7,14 +7,32 @@ publish a release.
 
 ### Added
 
+- Added the separate POSIX `ExecutionAuditJournal` with explicit versioned
+  256-bit HMAC key handling, durable intent/finished JSONL events, chained
+  integrity checks, and fail-closed behavior for missing, rotated, or invalid
+  audit state. Remote results now carry opaque operation IDs and expose
+  `outcome-unknown` without automatic retry.
+- Added the typed `ssh-mcp-approver` IPC contract for request-bound human sudo
+  approval (Unix socket on POSIX or SID-protected named pipe on Windows). A
+  real authenticated host component is still required; the server remains fail
+  closed when no trusted callback is present.
+- Documented that timeout/cancellation closes the server-controlled SSH
+  session without promising termination of detached remote processes; the
+  first delivery targets POSIX hosts from POSIX or Windows clients, excludes
+  remote Windows-host quoting, shells/scripts/redirection/pipes, file transfer,
+  and port forwarding, and leaves file transfer to issue #94.
+
 - The remote execution candidate now accepts an explicit host-injected human
   approval provider, binds approvals to the complete approved profile identity,
-  fails closed when audit delivery fails, bounds validation as well as transport,
-  rejects shell/interpreter wrappers and control syntax, and structurally
-  redacts sensitive audit values.
-- Windows agent-key command execution now fails closed with an explicit stable
-  outcome instead of using an ambient ssh2 agent; Windows password execution
-  retains the existing Credential Manager and host-verification boundary.
+  fails closed when durable audit state is unavailable, bounds validation as
+  well as transport, rejects shell/script interpreters and control syntax, and
+  records only allowlisted argument shapes plus an HMAC digest of the original
+  vector.
+- Windows agent-key command execution now uses the exported native OpenSSH
+  command boundary with an opaque approved known-hosts snapshot, bounded
+  output, cancellation, and process-tree cleanup; it never uses an ambient
+  ssh2 agent. Windows password execution retains the existing Credential
+  Manager and host-verification boundary.
 - Bounded `execute_remote_command` and `request_sudo_approval` MCP tools now
   execute only through approved SSH profiles, enforce timeout/cancellation and
   output limits, require request-bound expiring one-time human approval for

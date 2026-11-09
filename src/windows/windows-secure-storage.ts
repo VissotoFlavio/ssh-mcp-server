@@ -1,8 +1,10 @@
 import { createRequire } from 'node:module';
 
 import { parseCredentialReference } from '../credentials/credential-store.js';
+import type { RemoteCommandTransportResult } from '../execution/remote-command-execution.js';
 import { validateConnectionProfile, validateProfileSelection, type ConnectionProfile } from '../profiles/connection-profile.js';
 
+import type { WindowsNativeAgentCommandRequest } from './windows-native-command.js';
 import { supportsWindowsAlphaRuntime } from './windows-runtime-support.js';
 
 const require = createRequire(import.meta.url);
@@ -17,6 +19,7 @@ export interface WindowsTrustBinding {
   captureKnownHostsSnapshot(profileId: string): { readonly bytes: Buffer; readonly capability: object };
   disposeKnownHostsSnapshot(capability: object): void;
   isKnownHostsSnapshotBusy(capability: object): boolean;
+  execute?(capability: object, request: WindowsNativeAgentCommandRequest, signal?: AbortSignal): Promise<RemoteCommandTransportResult>;
   readCredential(locator: string): string;
   credentialAvailable?(locator: string): boolean;
 }
@@ -51,6 +54,7 @@ function loadNativeBinding(): WindowsTrustBinding {
     typeof (candidate as { captureKnownHostsSnapshot?: unknown }).captureKnownHostsSnapshot !== 'function' ||
     typeof (candidate as { disposeKnownHostsSnapshot?: unknown }).disposeKnownHostsSnapshot !== 'function' ||
     typeof (candidate as { isKnownHostsSnapshotBusy?: unknown }).isKnownHostsSnapshotBusy !== 'function' ||
+    typeof (candidate as { execute?: unknown }).execute !== 'function' ||
     typeof (candidate as { readCredential?: unknown }).readCredential !== 'function'
   ) {
     return unavailable();
@@ -177,6 +181,15 @@ export class WindowsSecureStorage {
     return this.listProfiles().find((profile) => profile.profileId === selection.profileId);
   }
 
+  executeNativeAgentCommand(
+    capability: object,
+    request: WindowsNativeAgentCommandRequest,
+    signal?: AbortSignal,
+  ): Promise<RemoteCommandTransportResult> {
+    if (this.binding.execute === undefined) return Promise.reject(new WindowsSecureStorageError());
+    return this.binding.execute(capability, request, signal);
+  }
+
   readKnownHosts(reference: string): Buffer {
     const profileId = snapshotProfileId(reference);
     try {
@@ -212,29 +225,36 @@ export class WindowsSecureStorage {
    * TypeScript or an SSH child command.
    */
   async withKnownHostsSnapshot<T>(reference: string, work: (bytes: Buffer, capability: object) => Promise<T>): Promise<T> {
-    const profileId = snapshotProfileId(reference);
-    let snapshot: { readonly bytes: Buffer; readonly capability: object };
-    try {
-      const captured = this.binding.captureKnownHostsSnapshot(profileId);
-      if (!validSnapshot(captured)) return unavailable();
-      snapshot = captured;
-    } catch {
-      return unavailable();
-    }
+    const snapshot = this.captureKnownHostsSnapshot(reference);
     try {
       return await work(Buffer.from(snapshot.bytes), snapshot.capability);
     } finally {
+      this.disposeKnownHostsSnapshot(snapshot.capability);
+    }
+  }
+
+  captureKnownHostsSnapshot(reference: string): { readonly bytes: Buffer; readonly capability: object } {
+    const profileId = snapshotProfileId(reference);
+    try {
+      const captured = this.binding.captureKnownHostsSnapshot(profileId);
+      if (!validSnapshot(captured)) return unavailable();
+      return { bytes: Buffer.from(captured.bytes), capability: captured.capability };
+    } catch {
+      return unavailable();
+    }
+  }
+
+  disposeKnownHostsSnapshot(capability: object): void {
+    try {
+      this.binding.disposeKnownHostsSnapshot(capability);
+    } catch {
+      let busy = false;
       try {
-        this.binding.disposeKnownHostsSnapshot(snapshot.capability);
+        busy = this.binding.isKnownHostsSnapshotBusy(capability) === true;
       } catch {
-        let busy = false;
-        try {
-          busy = this.binding.isKnownHostsSnapshotBusy(snapshot.capability) === true;
-        } catch {
-          // A failed busy check is not an ownership transfer.
-        }
-        if (!busy) unavailable();
+        // A failed busy check is not an ownership transfer.
       }
+      if (!busy) unavailable();
     }
   }
 }

@@ -80,11 +80,11 @@ behind the trusted boundary. Failures are fail-closed.
 
 ## Platform support
 
-| Platform                                            | Discovery                                         | `validate_connection`                                                                                                                      | Authentication readiness                                                                                                                                                                                                                                 |
-| --------------------------------------------------- | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Linux and macOS                                     | Available when the POSIX state root is configured | Available when the POSIX runtime is composed; unsafe or incomplete state fails closed at call time                                         | `agent-key` only, using a private known-hosts snapshot and a bounded OpenSSH ControlMaster check                                                                                                                                                         |
-| Native Windows alpha                                | Available only on the supported native envelope   | Advertised only when the required native runtime and provider-composition boundaries are available; individual calls can still fail closed | `password` execution uses the in-memory transport and Windows Credential Manager after host verification; `agent-key` readiness uses native trust preparation, while command execution fails closed until a command-capable native boundary is available |
-| Other platforms or unsupported Windows environments | Not advertised                                    | Not advertised                                                                                                                             | Not supported                                                                                                                                                                                                                                            |
+| Platform                                            | Discovery                                         | `validate_connection`                                                                                                                      | Authentication readiness                                                                                                                                                                                                  |
+| --------------------------------------------------- | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Linux and macOS                                     | Available when the POSIX state root is configured | Available when the POSIX runtime is composed; unsafe or incomplete state fails closed at call time                                         | `agent-key` only, using a private known-hosts snapshot and a bounded OpenSSH ControlMaster check                                                                                                                          |
+| Native Windows alpha                                | Available only on the supported native envelope   | Advertised only when the required native runtime and provider-composition boundaries are available; individual calls can still fail closed | Password profiles retain host verification and Credential Manager ordering; agent-key commands use the native verified OpenSSH/snapshot boundary. Remote execution additionally requires the native trusted audit journal |
+| Other platforms or unsupported Windows environments | Not advertised                                    | Not advertised                                                                                                                             | Not supported                                                                                                                                                                                                             |
 
 The Windows alpha supports only 64-bit Windows 11 23H2 or later, or Windows
 Server 2022 or later, with 64-bit Node.js 22 or later and Microsoft OpenSSH
@@ -125,6 +125,8 @@ Set both absolute roots for the process that starts the MCP server:
 ```sh
 export SSH_MCP_STATE_ROOT="/absolute/path/to/state"
 export SSH_MCP_KNOWN_HOSTS_ROOT="/absolute/path/to/known-hosts"
+export SSH_MCP_AUDIT_ROOT="/absolute/path/to/audit"
+export SSH_MCP_AUDIT_KEY_FILE="/absolute/path/to/private/audit-key"
 ```
 
 `SSH_MCP_STATE_ROOT` contains the fixed `connection-profiles.json` file.
@@ -133,6 +135,12 @@ each `known-hosts://<profile-id>` reference. Both roots and their files must be
 owned by the MCP process user, must not be group- or world-writable, and must
 not contain symbolic links. An unsafe or incomplete configuration fails
 closed.
+
+`SSH_MCP_AUDIT_ROOT` must be a separate operator-owned absolute directory with
+no group/other write permission. `SSH_MCP_AUDIT_KEY_FILE` must be a separate
+operator-owned `0600` file containing exactly `v1:` followed by 64 lowercase
+hexadecimal characters. The server never generates this key; missing, invalid,
+rotated, or chain-invalid audit state fails closed before an SSH connection.
 
 This illustrative `connection-profiles.json` entry is suitable for the POSIX
 `agent-key` flow; it does not name a real host or credential:
@@ -259,18 +267,23 @@ limit. The response contains `stdout` and `stderr` only up to `maxOutputBytes`.
 
 The bounded defaults are 30 seconds and 64 KiB; the maximums are 60 seconds
 and 1 MiB. A command that uses `sudo` returns `approval-required` until the
-host-injected `HumanSudoApprovalProvider` issues a token through
-`request_sudo_approval`. The token expires after one minute, cannot be reused,
-and fails if the command or the approved profile identity changes. A boolean
-such as `approved: true` is not accepted as authorization. A standalone CLI
-without a host approval callback fails closed.
+host-injected `HumanSudoApprovalProvider` issues an opaque one-use capability
+through `request_sudo_approval`. The capability expires after one minute,
+cannot be reused, and fails if the command or the immutable approved profile
+identity changes. A boolean such as `approved: true` is not accepted as
+authorization. A standalone CLI without a host approval callback returns
+`approval-unavailable`. Production hosts may connect the typed
+`ssh-mcp-approver` boundary: Unix socket on POSIX or SID-protected named pipe
+on Windows. Destination, verified identity, and canonical command remain local
+to that approver.
 
 ### `request_sudo_approval`
 
 Requests human confirmation for one exact `sudo` command. The tool is state
-changing and requires confirmation. It returns a short-lived `token` only when
-the configured trusted approval boundary confirms the request. It accepts no
-token or boolean from the caller. The token must be sent back only as
+changing and requires confirmation. It returns only `approved`, a stable
+`code`, an opaque `operationId`, and an opaque one-use `capability` when the
+configured trusted approval boundary confirms the request. It accepts no
+caller token or boolean. The capability must be sent back only as
 `approvalToken` on the exact matching
 `execute_remote_command` request.
 
@@ -336,11 +349,23 @@ with weaker settings.
 ## Security, diagnostics, and troubleshooting
 
 The server is fail-closed and sends only JSON-RPC on standard output. Redacted
-audit events and diagnostics are written to standard error. Command and
-argument text in the local audit record is bounded and redacts secret-like
-key/value material, separated sensitive flag values, headers, URL credentials,
-and shell assignments; stdout and stderr are never written to audit. If the
-audit sink fails, the remote result is returned as `provider-failure`. Support
+Every attempt first writes a durable versioned intent/finished event to the
+separate HMAC-chained audit journal, then emits redacted audit events and
+diagnostics to standard error. The local audit record contains the command,
+allowlisted argument shapes, and an HMAC digest of the original argument
+vector; raw positional values, flag values, headers, URL credentials, shell
+assignments, stdout, and stderr are never written to audit. If the durable
+journal is unavailable, the remote result is returned as
+`execution-audit-unavailable`. A secondary audit sink failure returns
+`provider-failure` only when the result is not already `outcome-unknown`. An
+interrupted or missing finished event is exposed as `outcome-unknown` with a
+null exit code and empty output; clients must not retry automatically. Timeout
+or cancellation closes the server-controlled SSH channel/session but does not
+promise to kill an already detached remote process. The first delivery targets
+POSIX VPS hosts from POSIX or Windows clients; remote Windows-host quoting is
+future work. Interactive persistent shells, scripts, free-form redirection or
+pipes, file transfer, and port forwarding are excluded; file transfer belongs
+to issue #94. Support
 material must omit hosts, usernames, profile IDs, credential references, paths,
 and secrets. For platform-specific troubleshooting, start with:
 

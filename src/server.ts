@@ -199,7 +199,7 @@ function validationResult(outcome: unknown, isError = false): ReturnType<typeof 
 }
 
 function remoteResult(result: RemoteCommandResult): ReturnType<typeof textToolResult> {
-  return textToolResult(JSON.stringify(result), result.outcome !== 'success');
+  return textToolResult(JSON.stringify(result), result.outcome !== 'success' && result.outcome !== 'approval-required');
 }
 
 function unavailableConnectionValidationResult(): ReturnType<typeof textToolResult> {
@@ -451,6 +451,7 @@ function registerTools(
     if (request.params.name === remoteCommandToolName) {
       if (configuredRemoteCommandExecutionProvider === undefined) {
         return remoteResult({
+          operationId: '00000000000000000000000000000000',
           profileId: 'unknown',
           outcome: 'failure',
           code: 'provider-failure',

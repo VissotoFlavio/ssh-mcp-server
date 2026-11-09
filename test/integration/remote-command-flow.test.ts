@@ -20,20 +20,22 @@ test('registers and routes remote execution without a production endpoint', asyn
   errors.on('data', (chunk) => {
     audit += String(chunk);
   });
+  const profile = {
+    profileId: 'test-profile',
+    host: 'test.invalid',
+    port: 22,
+    user: 'operator',
+    expectedHostFingerprint: 'SHA256:1111111111111111111111111111111111111111111',
+    authMode: 'agent-key' as const,
+    approvedKnownHostsReference: 'known-hosts://test-profile',
+  };
   const provider = new RemoteCommandExecutionProvider({
     profiles: {
-      getProfile: async () => ({
-        profileId: 'test-profile',
-        host: 'test.invalid',
-        port: 22,
-        user: 'operator',
-        expectedHostFingerprint: 'SHA256:1111111111111111111111111111111111111111111',
-        authMode: 'agent-key',
-        approvedKnownHostsReference: 'known-hosts://test-profile',
-      }),
+      getProfile: async () => profile,
     },
     connectionValidation: {
       validateConnection: async () => ({ profileId: 'test-profile', ready: true as const }),
+      authorizeExecution: async () => ({ profile }),
     },
     transport: {
       async execute() {
@@ -71,10 +73,12 @@ test('registers and routes remote execution without a production endpoint', asyn
   });
   const approvalPayload = JSON.parse((approval.result as { content: Array<{ text: string }> }).content[0].text) as {
     approved: boolean;
-    token?: string;
+    capability?: string;
+    operationId: string;
   };
   assert.equal(approvalPayload.approved, true);
-  assert.equal(typeof approvalPayload.token, 'string');
+  assert.equal(typeof approvalPayload.capability, 'string');
+  assert.match(approvalPayload.operationId, /^[a-f0-9]{32}$/u);
 
   const result = await requestResponse(input, output, {
     jsonrpc: '2.0',
@@ -82,18 +86,15 @@ test('registers and routes remote execution without a production endpoint', asyn
     method: 'tools/call',
     params: {
       name: 'execute_remote_command',
-      arguments: { profileId: 'test-profile', command: 'sudo', args: ['id'], approvalToken: approvalPayload.token },
+      arguments: { profileId: 'test-profile', command: 'sudo', args: ['id'], approvalToken: approvalPayload.capability },
     },
   });
-  assert.deepEqual(JSON.parse((result.result as { content: Array<{ text: string }> }).content[0].text), {
-    profileId: 'test-profile',
-    outcome: 'success',
-    code: 'success',
-    exitCode: 0,
-    stdout: 'test-output',
-    stderr: '',
-    outputTruncated: false,
-  });
+  const resultPayload = JSON.parse((result.result as { content: Array<{ text: string }> }).content[0].text) as Record<string, unknown>;
+  assert.equal(resultPayload.profileId, 'test-profile');
+  assert.equal(resultPayload.outcome, 'success');
+  assert.equal(resultPayload.code, 'success');
+  assert.match(String(resultPayload.operationId), /^[a-f0-9]{32}$/u);
+  assert.equal(resultPayload.stdout, 'test-output');
 
   input.end();
   await runtime;

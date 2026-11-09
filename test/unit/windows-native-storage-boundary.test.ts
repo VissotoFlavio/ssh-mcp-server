@@ -26,6 +26,7 @@ const testOnlyHookNames = [
   'testSnapshotArtifactCount',
   'testFinalizeSnapshotCapability',
   'testReadinessDescriptor',
+  'testAgentCommandRequest',
   'testBlockDeferredReaper',
   'testReleaseDeferredReaper',
   'testWaitForMasterStarted',
@@ -89,6 +90,7 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
     resolveOpenSsh(): { ssh: string; sshAdd: string; version: string };
     probeSshAdd(timeoutMs: unknown): number;
     startSshAddProbe(timeoutMs: unknown): { readonly promise: Promise<boolean>; readonly cancel: () => void };
+    execute(capability: object, request: object, signal?: AbortSignal): Promise<unknown>;
   };
   const testBinding = nativeRequire(testAddonPath) as {
     captureKnownHostsSnapshot(profileId: string): { bytes: Buffer; capability: object };
@@ -131,6 +133,7 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
     testSnapshotArtifactCount(): number;
     testFinalizeSnapshotCapability(capability: object): void;
     testReadinessDescriptor(descriptor: unknown): boolean;
+    testAgentCommandRequest(request: unknown): boolean;
     testBlockDeferredReaper(): void;
     testReleaseDeferredReaper(): void;
     testWaitForMasterStarted(timeoutMs: number): boolean;
@@ -152,6 +155,25 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
     assert.equal(testBinding.testReadinessDescriptor({ host: 'api.internal.example', port: 0, user: 'deploy' }), false);
   });
 
+  test('accepts only bounded native agent-command request data', () => {
+    const valid = {
+      profileId: 'production-api',
+      host: 'api.internal.example',
+      port: 22,
+      user: 'deploy',
+      expectedHostFingerprint: `SHA256:${'a'.repeat(43)}`,
+      command: 'id',
+      args: ['--version'],
+      timeoutMs: 1_000,
+      maxOutputBytes: 1_024,
+    };
+    assert.equal(testBinding.testAgentCommandRequest(valid), true);
+    assert.equal(testBinding.testAgentCommandRequest({ ...valid, command: 'sh' }), false);
+    assert.equal(testBinding.testAgentCommandRequest({ ...valid, args: ['-c'] }), false);
+    assert.equal(testBinding.testAgentCommandRequest({ ...valid, args: ['echo;whoami'] }), false);
+    assert.equal(testBinding.testAgentCommandRequest({ ...valid, extra: 'rejected' }), false);
+  });
+
   test('accepts only an isolated private per-user configuration and verified Windows OpenSSH', () => {
     const root = uniqueRoot('safe');
     let configured = false;
@@ -170,6 +192,7 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
       assert.equal(typeof binding.probeSshAdd, 'function');
       assert.equal('validateAgentKeyReadiness' in binding, false);
       assert.equal(typeof binding.startSshAddProbe, 'function');
+      assert.equal(typeof binding.execute, 'function');
     } finally {
       if (configured) runFixture('cleanup', root);
     }
