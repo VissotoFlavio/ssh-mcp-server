@@ -258,7 +258,9 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
       maxOutputBytes: 1_024,
     };
     assert.equal(testBinding.testAgentCommandRequest(valid), true);
-    assert.equal(testBinding.testAgentCommandRequest({ ...valid, command: 'sh' }), false);
+    for (const command of ['sh', 'sh.exe', 'bash.exe', 'busybox.exe', 'env.exe', 'ssh.exe']) {
+      assert.equal(testBinding.testAgentCommandRequest({ ...valid, command }), false);
+    }
     assert.equal(testBinding.testAgentCommandRequest({ ...valid, args: ['-c'] }), false);
     assert.equal(testBinding.testAgentCommandRequest({ ...valid, args: ['echo;whoami'] }), false);
     assert.equal(testBinding.testAgentCommandRequest({ ...valid, extra: 'rejected' }), false);
@@ -742,7 +744,7 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
       const hostPublic = publicKeyParts(`${privateHostKey}.pub`);
       const fixture = await listenLocalSshFixture(privateHostKey, agentPublic.data);
       server = fixture.server;
-      const host = '127.0.0.1';
+      const host = 'localhost';
       const hostFingerprint = fingerprint(`${privateHostKey}.pub`);
       writeFileSync(
         join(root, 'known-hosts', 'production-api.known_hosts'),

@@ -35,25 +35,18 @@ const REJECTED_EXECUTABLES = new Set([
   'tcsh',
   'fish',
   'cmd',
-  'cmd.exe',
   'powershell',
-  'powershell.exe',
   'pwsh',
-  'pwsh.exe',
   'python',
   'python3',
-  'python.exe',
   'perl',
   'ruby',
   'node',
   'ssh',
-  'ssh.exe',
   'scp',
-  'scp.exe',
+  'scp',
   'sftp',
-  'sftp.exe',
   'rsync',
-  'rsync.exe',
   'env',
   'nohup',
   'setsid',
@@ -246,7 +239,10 @@ function validateText(value: unknown, maxLength: number): string {
 function validateCommand(value: unknown): string {
   const command = validateText(value, MAX_COMMAND_LENGTH);
   if (COMMAND_DELIMITERS.test(command)) throw new RemoteExecutionError('invalid-input', 'Remote command input is invalid');
-  const executable = command.slice(Math.max(command.lastIndexOf('/'), command.lastIndexOf('\\')) + 1).toLowerCase();
+  const executable = command
+    .slice(Math.max(command.lastIndexOf('/'), command.lastIndexOf('\\')) + 1)
+    .toLowerCase()
+    .replace(/\.exe$/u, '');
   if (REJECTED_EXECUTABLES.has(executable)) throw new RemoteExecutionError('invalid-input', 'Remote command input is invalid');
   if (SHELL_METACHARACTERS.test(command)) throw new RemoteExecutionError('invalid-input', 'Remote command input is invalid');
   return command;

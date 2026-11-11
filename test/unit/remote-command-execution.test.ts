@@ -344,18 +344,22 @@ test('rejects shell interpreters, remote wrappers, and control syntax', async ()
   const { provider, transport } = createProvider();
   for (const request of [
     { ...command, command: 'sh', args: ['-c', 'sudo id'] },
+    { ...command, command: 'sh.exe', args: ['-c', 'sudo id'] },
     { ...command, command: 'env', args: ['sudo', 'id'] },
+    { ...command, command: 'env.exe', args: ['sudo', 'id'] },
     { ...command, command: 'nohup', args: ['sudo', 'id'] },
     { ...command, command: 'ssh', args: ['-L', '8080:internal:80', 'internal'] },
     { ...command, command: 'scp', args: ['file', 'internal:/tmp/file'] },
     { ...command, command: 'sftp', args: ['internal'] },
     { ...command, command: 'rsync', args: ['-e', 'ssh', 'file', 'internal:/tmp/file'] },
     { ...command, command: 'busybox', args: ['sh', '-c', 'sudo id'] },
+    { ...command, command: 'busybox.exe', args: ['sh', '-c', 'sudo id'] },
     { ...command, command: 'sudoedit', args: ['id'] },
     { ...command, command: '/usr/bin/sudoedit', args: ['id'] },
     { ...command, command: 'echo', args: ['ok; sudo id'] },
     { ...command, command: 'echo', args: ['ok &'] },
     { ...command, command: 'bash', args: ['-c', 'id'] },
+    { ...command, command: 'bash.exe', args: ['-c', 'id'] },
   ]) {
     const result = await provider.execute(request);
     assert.equal(result.code, request.command.includes('sudoedit') ? 'approval-required' : 'invalid-input');

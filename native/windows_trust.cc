@@ -990,8 +990,6 @@ bool IsBracketedIpv6Host(const std::wstring& host) {
   return groups == 8;
 }
 
-constexpr wchar_t kFixedSshTarget[] = L"127.0.0.1";
-
 std::wstring OpenSshHostName(const std::wstring& host) {
   return IsBracketedIpv6Host(host) ? host.substr(1, host.size() - 2) : host;
 }
@@ -1053,7 +1051,8 @@ bool StopMaster(Handle* master, const std::wstring& ssh, const std::wstring& con
                 const std::atomic<bool>* cancelled = nullptr, Handle* unreaped = nullptr) {
   const ULONGLONG deadline = GetTickCount64() + timeout;
   DWORD ignored = 1;
-  const std::vector<std::wstring> exit_arguments = {L"-F", L"none", L"-S", control_path, L"-O", L"exit", L"-l", user, host};
+  const std::wstring target = OpenSshHostName(host);
+  const std::vector<std::wstring> exit_arguments = {L"-F", L"none", L"-S", control_path, L"-O", L"exit", L"-o", L"HostName=" + target, L"-l", user, target};
   if (timeout > 0) LaunchHiddenProcess(ssh, FixedCommandLine(ssh, exit_arguments), timeout, &ignored, cancelled);
   DWORD wait = WAIT_TIMEOUT;
   while (GetTickCount64() < deadline && (cancelled == nullptr || !cancelled->load())) {
@@ -1091,12 +1090,12 @@ NativeReadinessResult ValidateAgentKeyReadiness(SnapshotSession* snapshot, const
   const std::vector<std::wstring> master_arguments = {
       L"-F", L"none", L"-N", L"-T", L"-n", L"-M", L"-S", control_path,
       L"-o", L"ControlPersist=no", L"-o", L"CanonicalizeHostname=no", L"-o", L"ProxyCommand=none", L"-o", L"ProxyJump=none",
-      L"-o", L"HostName=" + OpenSshHostName(host), L"-o", L"BatchMode=yes", L"-o", L"StrictHostKeyChecking=yes", L"-o", L"UserKnownHostsFile=" + known_hosts,
+      L"-o", L"HostName=" + OpenSshHostName(host), L"-o", L"HostKeyAlias=" + OpenSshHostName(host), L"-o", L"BatchMode=yes", L"-o", L"StrictHostKeyChecking=yes", L"-o", L"UserKnownHostsFile=" + known_hosts,
       L"-o", L"GlobalKnownHostsFile=NUL", L"-o", L"PasswordAuthentication=no", L"-o", L"KbdInteractiveAuthentication=no",
       // The approved key is deliberately held only by the current-user agent;
       // no private-key path is available to this native boundary. Restricting
       // identities here would therefore suppress that agent identity.
-      L"-o", L"NumberOfPasswordPrompts=0", L"-o", L"IdentitiesOnly=no", L"-p", std::to_wstring(port), L"-l", user, kFixedSshTarget};
+      L"-o", L"NumberOfPasswordPrompts=0", L"-o", L"IdentitiesOnly=no", L"-p", std::to_wstring(port), L"-l", user, OpenSshHostName(host)};
   Handle master;
   if (!StartHiddenProcess(ssh, FixedCommandLine(ssh, master_arguments), &master)) return result;
   const ULONGLONG started = GetTickCount64();
@@ -1106,7 +1105,8 @@ NativeReadinessResult ValidateAgentKeyReadiness(SnapshotSession* snapshot, const
     if (!GetExitCodeProcess(master.get(), &master_exit) || master_exit != STILL_ACTIVE) break;
     const DWORD remaining = static_cast<DWORD>(timeout - (GetTickCount64() - started));
     DWORD check_exit = 1;
-    const std::vector<std::wstring> check_arguments = {L"-F", L"none", L"-S", control_path, L"-O", L"check", L"-l", user, kFixedSshTarget};
+    const std::vector<std::wstring> check_arguments = {L"-F", L"none", L"-S", control_path, L"-O", L"check", L"-o", L"HostName=" + OpenSshHostName(host), L"-l", user,
+                                                       OpenSshHostName(host)};
     if (LaunchHiddenProcess(ssh, FixedCommandLine(ssh, check_arguments), std::max<DWORD>(1, std::min<DWORD>(remaining, 250)), &check_exit, cancelled) == LaunchResult::kCompleted && check_exit == 0) {
       ready = true;
       break;
@@ -2680,12 +2680,12 @@ std::wstring LowerAscii(const std::wstring& value) {
 
 bool IsRejectedRemoteExecutable(const std::wstring& command) {
   const size_t separator = command.find_last_of(L"/\\");
-  const std::wstring executable = LowerAscii(command.substr(separator == std::wstring::npos ? 0 : separator + 1));
-  static constexpr const wchar_t* rejected[] = {L"sh", L"bash", L"dash", L"zsh", L"ksh", L"csh", L"tcsh", L"fish", L"cmd", L"cmd.exe",
-                                                 L"powershell", L"powershell.exe", L"pwsh", L"pwsh.exe", L"python", L"python3", L"python.exe",
-                                                 L"perl", L"ruby", L"node", L"ssh", L"ssh.exe", L"scp", L"scp.exe", L"sftp", L"sftp.exe",
-                                                 L"rsync", L"rsync.exe", L"env", L"nohup", L"setsid", L"daemonize", L"xargs", L"parallel",
-                                                 L"find", L"timeout", L"watch", L"busybox"};
+  std::wstring executable = LowerAscii(command.substr(separator == std::wstring::npos ? 0 : separator + 1));
+  if (executable.size() > 4 && executable.compare(executable.size() - 4, 4, L".exe") == 0) executable.resize(executable.size() - 4);
+  static constexpr const wchar_t* rejected[] = {L"sh", L"bash", L"dash", L"zsh", L"ksh", L"csh", L"tcsh", L"fish", L"cmd", L"powershell",
+                                                 L"pwsh", L"python", L"python3", L"perl", L"ruby", L"node", L"ssh", L"scp", L"sftp", L"rsync",
+                                                 L"env", L"nohup", L"setsid", L"daemonize", L"xargs", L"parallel", L"find", L"timeout", L"watch",
+                                                 L"busybox"};
   for (const wchar_t* candidate : rejected) if (executable == candidate) return true;
   return false;
 }
@@ -2955,10 +2955,10 @@ NativeAgentCommandRunResult RunNativeAgentCommand(SnapshotSession* snapshot, con
   }
   const std::vector<std::wstring> arguments = {
       L"-F", L"none", L"-T", L"-n", L"-o", L"CanonicalizeHostname=no", L"-o", L"ProxyCommand=none", L"-o", L"ProxyJump=none",
-      L"-o", L"HostName=" + OpenSshHostName(request.host), L"-o", L"BatchMode=yes", L"-o", L"StrictHostKeyChecking=yes", L"-o", L"UserKnownHostsFile=" + known_hosts_short,
+      L"-o", L"HostName=" + OpenSshHostName(request.host), L"-o", L"HostKeyAlias=" + OpenSshHostName(request.host), L"-o", L"BatchMode=yes", L"-o", L"StrictHostKeyChecking=yes", L"-o", L"UserKnownHostsFile=" + known_hosts_short,
       L"-o", L"GlobalKnownHostsFile=NUL", L"-o", L"PasswordAuthentication=no", L"-o", L"KbdInteractiveAuthentication=no",
       L"-o", L"NumberOfPasswordPrompts=0", L"-o", L"IdentityFile=" + identity_file, L"-o", L"IdentitiesOnly=yes", L"-p", std::to_wstring(request.port),
-      L"-l", request.user, kFixedSshTarget};
+      L"-l", request.user, OpenSshHostName(request.host)};
   std::vector<std::wstring> fixed_arguments = arguments;
   std::wstring remote_command = PosixShellQuote(request.command);
   for (const std::wstring& argument : request.arguments) remote_command.append(L" ").append(PosixShellQuote(argument));
