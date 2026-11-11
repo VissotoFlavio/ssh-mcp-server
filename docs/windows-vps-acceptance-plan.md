@@ -125,7 +125,7 @@ configured budget, with redaction, child cleanup, and no-remote-command checks
 confirmed.
 
 On 2026-11-11, the final installed candidate from commit
-`f9f7b5757bd758fb2bab05985a7db7660c3a3aaf` also completed a controlled
+`1c03a9c04a11789fd56100e3e3a497813a051dae` also completed a controlled
 read-only `execute_remote_command` check using `docker ps` against the
 designated VPS. The result was `outcome: "success"`, `code: "success"`, and
 exit code `0`; only bounded structured output was retained as evidence. No
