@@ -2954,6 +2954,9 @@ NativeAgentCommandRunResult RunNativeAgentCommand(SnapshotSession* snapshot, con
     return result;
   }
   const std::vector<std::wstring> arguments = {
+#ifdef SSH_MCP_NATIVE_TEST
+      L"-vvv",
+#endif
       L"-F", L"none", L"-T", L"-n", L"-o", L"CanonicalizeHostname=no", L"-o", L"ProxyCommand=none", L"-o", L"ProxyJump=none",
       L"-o", L"HostName=" + OpenSshHostName(request.host), L"-o", L"BatchMode=yes", L"-o", L"StrictHostKeyChecking=yes", L"-o", L"UserKnownHostsFile=" + known_hosts_short,
       L"-o", L"GlobalKnownHostsFile=NUL", L"-o", L"PasswordAuthentication=no", L"-o", L"KbdInteractiveAuthentication=no",
