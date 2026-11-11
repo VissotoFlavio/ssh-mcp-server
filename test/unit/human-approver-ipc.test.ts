@@ -125,7 +125,7 @@ test('IPC approval fails closed on cancellation', async () => {
 
 test('IPC rejects an unavailable local peer', async () => {
   const provider = new IpcHumanSudoApprovalProvider(new UnixSocketHumanApproverChannel('/tmp/ssh-mcp-approver-does-not-exist'), 'posix');
-  assert.equal(await provider.approve(baseRequest), false);
+  assert.equal(await provider.approve(baseRequest), 'unavailable');
 });
 
 test('IPC rejects an invalid protocol response', async () => {
@@ -133,7 +133,7 @@ test('IPC rejects an invalid protocol response', async () => {
     { approve: async () => ({ version: 1, type: 'approval-response', approved: true }) as never },
     'posix',
   );
-  assert.equal(await provider.approve(baseRequest), false);
+  assert.equal(await provider.approve(baseRequest), 'unavailable');
 });
 
 test('IPC rejects a response for an altered request', async () => {
@@ -143,7 +143,7 @@ test('IPC rejects a response for an altered request', async () => {
     },
     'posix',
   );
-  assert.equal(await provider.approve(baseRequest), false);
+  assert.equal(await provider.approve(baseRequest), 'unavailable');
 });
 
 test('IPC rejects a replayed response nonce', async () => {
@@ -158,7 +158,7 @@ test('IPC rejects a replayed response nonce', async () => {
     'posix',
   );
   assert.equal(await provider.approve(baseRequest), true);
-  assert.equal(await provider.approve(baseRequest), false);
+  assert.equal(await provider.approve(baseRequest), 'unavailable');
 });
 
 test('IPC cancellation is forwarded to the local channel', async () => {

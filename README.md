@@ -361,12 +361,14 @@ with weaker settings.
 ## Security, diagnostics, and troubleshooting
 
 The server is fail-closed and sends only JSON-RPC on standard output. Redacted
-Every attempt first writes a durable versioned intent/finished event to the
-separate HMAC-chained audit journal, then emits redacted audit events and
+Every remote command execution attempt first writes a durable versioned
+intent/finished event to the separate HMAC-chained audit journal, then emits
+redacted audit events and
 diagnostics to standard error. The local audit record contains the command,
 allowlisted argument shapes, and an HMAC digest of the original argument
 vector; raw positional values, flag values, headers, URL credentials, shell
-assignments, stdout, and stderr are never written to audit. If the durable
+assignments, stdout, and stderr are never written to audit. Sudo approval
+requests are audited separately from command execution attempts. If the durable
 journal is unavailable, the remote result is returned as
 `execution-audit-unavailable`. A secondary audit sink failure returns
 `provider-failure` only when the result is not already `outcome-unknown`. An

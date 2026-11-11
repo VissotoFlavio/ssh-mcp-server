@@ -54,3 +54,15 @@ test('Windows native command preserves stable transport classifications', async 
     );
   }
 });
+
+test('Windows native output overflow is an unknown outcome after command handoff', async () => {
+  const authorization = createExecutionAuthorization(request.profile, Date.now() + 60_000, Date.now, async () => {
+    throw Object.assign(new Error('native output limit'), { code: 'output-limit' });
+  });
+  await assert.rejects(
+    new WindowsNativeAgentCommandTransport({
+      execute: async () => ({ exitCode: 0, stdout: '', stderr: '', outputTruncated: true }),
+    }).execute({ ...request, authorization }),
+    (error: unknown) => error instanceof RemoteExecutionError && error.code === 'outcome-unknown',
+  );
+});

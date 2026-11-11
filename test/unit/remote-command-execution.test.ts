@@ -151,6 +151,21 @@ test('requires approval for common privilege-escalation executables', async () =
   }
 });
 
+test('distinguishes an unavailable human approver from an explicit rejection', async () => {
+  const provider = new RemoteCommandExecutionProvider({
+    profiles: { getProfile: async () => profile },
+    connectionValidation: {
+      validateConnection: async () => ({ profileId: profile.profileId, ready: true as const }),
+      authorizeExecution: async () => ({ profile }),
+    },
+    transport: new FakeTransport(),
+    humanApproval: { approve: async () => 'unavailable' },
+  });
+  const result = await provider.requestSudoApproval({ profileId: profile.profileId, command: 'sudo', args: ['id'] });
+  assert.equal(result.approved, false);
+  assert.equal(result.code, 'approval-unavailable');
+});
+
 test('binds sudo approval to exact request, expiry and one-time use', async () => {
   let now = 1_000;
   const approvals = new SudoApprovalStore();
@@ -191,6 +206,9 @@ test('enforces the output limit and transport deadline at the provider boundary'
   transport.result = { exitCode: 0, stdout: '123456', stderr: 'stderr', outputTruncated: false };
   const { provider } = createProvider(transport);
   const limited = await provider.execute({ ...command, maxOutputBytes: 4 });
+  assert.equal(limited.outcome, 'unknown');
+  assert.equal(limited.code, 'outcome-unknown');
+  assert.equal(limited.exitCode, null);
   assert.equal(limited.outputTruncated, true);
   assert.equal(Buffer.byteLength(limited.stdout) + Buffer.byteLength(limited.stderr), 4);
 

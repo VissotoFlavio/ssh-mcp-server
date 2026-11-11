@@ -4,7 +4,12 @@ import { createConnection, type Socket } from 'node:net';
 import { dirname } from 'node:path';
 import process from 'node:process';
 
-import type { ApprovedProfileIdentity, HumanSudoApprovalProvider, SudoApprovalRequest } from './remote-command-execution.js';
+import type {
+  ApprovedProfileIdentity,
+  HumanSudoApprovalDecision,
+  HumanSudoApprovalProvider,
+  SudoApprovalRequest,
+} from './remote-command-execution.js';
 
 export type HumanApproverIpcPlatform = 'posix' | 'windows';
 
@@ -343,7 +348,7 @@ export class IpcHumanSudoApprovalProvider implements HumanSudoApprovalProvider {
     },
   ) {}
 
-  async approve(request: SudoApprovalRequest, signal?: AbortSignal): Promise<boolean> {
+  async approve(request: SudoApprovalRequest, signal?: AbortSignal): Promise<HumanSudoApprovalDecision> {
     if (signal?.aborted || (this.platform !== 'posix' && this.platform !== 'windows')) return false;
     const bound =
       request.operationId !== undefined && request.leaseIdentityDigest !== undefined
@@ -394,9 +399,10 @@ export class IpcHumanSudoApprovalProvider implements HumanSudoApprovalProvider {
     try {
       const response = await this.channel.approve(ipcRequest, signal);
       if (typeof response === 'boolean') return response;
-      return validateResponse(response, ipcRequest)?.approved === true;
+      const validated = validateResponse(response, ipcRequest);
+      return validated === undefined ? 'unavailable' : validated.approved;
     } catch {
-      return false;
+      return signal?.aborted ? false : 'unavailable';
     }
   }
 }

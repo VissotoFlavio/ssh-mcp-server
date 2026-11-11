@@ -124,7 +124,8 @@ current-user agent identity. It returned the fixed success result within the
 configured budget, with redaction, child cleanup, and no-remote-command checks
 confirmed.
 
-On 2026-11-11, the final installed candidate also completed a controlled
+On 2026-11-11, the final installed candidate from commit
+`c77bf0cac2f00f7558ab6fd32bab6c3c757ad7a0` also completed a controlled
 read-only `execute_remote_command` check using `docker ps` against the
 designated VPS. The result was `outcome: "success"`, `code: "success"`, and
 exit code `0`; only bounded structured output was retained as evidence. No

@@ -71,6 +71,8 @@ export type RemoteExecutionCode =
   | 'invalid-input'
   | 'provider-failure';
 
+export type HumanSudoApprovalDecision = boolean | 'unavailable';
+
 export interface RemoteCommandRequest {
   readonly profileId: string;
   readonly command: string;
@@ -131,7 +133,7 @@ export interface SudoApprovalRequest {
 
 export interface HumanSudoApprovalProvider {
   /** This callback is a trusted human/UI boundary, never MCP caller input. */
-  approve(request: SudoApprovalRequest, signal?: AbortSignal): Promise<boolean>;
+  approve(request: SudoApprovalRequest, signal?: AbortSignal): Promise<HumanSudoApprovalDecision>;
 }
 
 export interface ExecutionAuthorization {
@@ -556,6 +558,7 @@ function mapTransportError(error: unknown): RemoteExecutionCode {
   if (code === 'cancelled' || code === 'AbortError') return 'cancelled';
   if (code === 'approval-unavailable') return 'approval-unavailable';
   if (code === 'outcome-unknown') return 'outcome-unknown';
+  if (code === 'output-limit') return 'outcome-unknown';
   if (code === 'execution-audit-unavailable') return 'execution-audit-unavailable';
   if (code === 'provider-failure') return 'provider-failure';
   return 'remote-failure';
@@ -689,12 +692,16 @@ export class RemoteCommandExecutionProvider {
     };
     let approved = false;
     try {
-      approved =
-        (await boundedOperation(
-          (approvalSignal) => this.dependencies.humanApproval!.approve(boundSudoRequest, approvalSignal),
-          Math.min(APPROVAL_TTL_MS, request.timeoutMs!),
-          signal,
-        )) === true;
+      const decision = await boundedOperation(
+        (approvalSignal) => this.dependencies.humanApproval!.approve(boundSudoRequest, approvalSignal),
+        Math.min(APPROVAL_TTL_MS, request.timeoutMs!),
+        signal,
+      );
+      if (decision === 'unavailable') {
+        await authorization?.release?.();
+        return rejected('approval-unavailable');
+      }
+      approved = decision === true;
     } catch (error) {
       const approvalCode = mapTransportError(error);
       if (signal?.aborted || approvalCode === 'cancelled') {
@@ -851,6 +858,9 @@ export class RemoteCommandExecutionProvider {
         ),
         request.maxOutputBytes!,
       );
+      if (result.outputTruncated) {
+        return finish(safeResult(request.profileId, 'unknown', 'outcome-unknown', { ...result, exitCode: null, operationId }));
+      }
       const outcome: RemoteExecutionOutcome = result.exitCode === 0 ? 'success' : 'failure';
       const safe = safeResult(request.profileId, outcome, outcome === 'success' ? 'success' : 'remote-failure', { ...result, operationId });
       return finish(safe);

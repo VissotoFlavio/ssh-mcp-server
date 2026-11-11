@@ -1690,6 +1690,7 @@ bool LoadExecutionAuditState(ExecutionAuditState* state) {
   if (contents.back() != '\n') return false;
   size_t cursor = 0;
   std::string previous;
+  std::string expected_active_key_id;
   while (cursor < contents.size()) {
     const size_t next = contents.find('\n', cursor);
     if (next == std::string::npos || next == cursor) return false;
@@ -1701,6 +1702,11 @@ bool LoadExecutionAuditState(ExecutionAuditState* state) {
     if (!ParseAuditRecord(line, &record) || record.has_previous != !previous.empty() || (record.has_previous && record.previous_event_hmac != previous) ||
         !LoadAuditKey(record.key_id, &key) || !HmacSha256(key, SerializeAuditRecord(record, false), &expected_hmac)) return false;
     if (expected_hmac != record.event_hmac || line != SerializeAuditRecord(record, true)) return false;
+    if (!expected_active_key_id.empty() && record.event != "rotation" && record.key_id != expected_active_key_id) return false;
+    if (record.event == "rotation") {
+      if (!IsLowerHex(record.new_key_id, kExecutionAuditKeyIdBytes * 2)) return false;
+      expected_active_key_id = record.new_key_id;
+    }
     if (record.event == "intent") {
       const auto duplicate = std::find_if(state->unfinished.begin(), state->unfinished.end(), [&record](const ExecutionAuditState::UnfinishedIntent& unfinished) {
         return unfinished.operation_id == record.operation_id;
@@ -1717,6 +1723,7 @@ bool LoadExecutionAuditState(ExecutionAuditState* state) {
     previous = record.event_hmac;
     cursor = next + 1;
   }
+  if (!expected_active_key_id.empty() && state->active_key_id != expected_active_key_id) return false;
   state->head = previous;
   return true;
 }

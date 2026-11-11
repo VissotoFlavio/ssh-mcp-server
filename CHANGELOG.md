@@ -45,7 +45,10 @@ publish a release.
   `outcome-unknown`.
 - Hardened POSIX chain validation against orphaned/unknown events, made
   Windows audit-key replacement atomic, and preserved `outcome-unknown` when
-  the native Windows command process fails after launch.
+  the native Windows command process fails after launch. Output-limit results
+  after command handoff now also fail closed as `outcome-unknown`, and IPC
+  approval transport/protocol failures are distinguished from explicit human
+  rejection as `approval-unavailable`.
 
 - The remote execution candidate now accepts an explicit host-injected human
   approval provider, binds approvals to the complete approved profile identity,
