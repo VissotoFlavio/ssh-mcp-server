@@ -109,10 +109,7 @@ export function createWindowsRuntimeProviders(
             ),
           ),
           auditJournal: storage.executionAuditJournal ?? new UnavailableExecutionAuditJournal(),
-          authorizationProvider:
-            validationProvider === undefined
-              ? undefined
-              : createProfileExecutionAuthorizationProvider({ getProfile: storage.getProfile.bind(storage) }, validationProvider),
+          authorizationProvider: validationProvider === undefined ? undefined : createProfileExecutionAuthorizationProvider(validationProvider),
           humanApproval,
         });
   const readinessStorage =

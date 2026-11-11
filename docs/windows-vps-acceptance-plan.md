@@ -3,10 +3,10 @@
 ## Purpose and boundary
 
 This plan validates the native Windows MCP runtime against a dedicated,
-non-production VPS. It is intentionally limited to SSH readiness validation:
-it does not run a remote command, transfer files, modify the VPS, create
-accounts, alter SSH configuration, or persist credentials outside Windows
-Credential Manager.
+non-production VPS. It covers SSH readiness and one explicitly approved,
+read-only bounded command such as `docker ps`; it does not transfer files,
+modify the VPS, create accounts, alter SSH configuration, or persist
+credentials outside Windows Credential Manager.
 
 Execution requires a separately designated non-production VPS and approved
 operator profiles. Do not record the VPS address, user, profile identifier,
@@ -45,6 +45,7 @@ or pull request.
 | Host-key mismatch      | Local test profile with a deliberately nonmatching approved fingerprint or known-hosts entry | Fixed `host-key-failure` result       | No Credential Manager lookup; no secret, host, user, or key material in MCP/audit output |
 | Unavailable credential | Locally approved password profile whose matching Generic Credential is absent                | Fixed redacted failure                | No password is logged, passed as an argument, or returned by MCP                         |
 | Invalid MCP input      | Extra argument, non-object input, or invalid profile identifier                              | Fixed `invalid-input` result          | No profile lookup, credential access, child process, or network connection               |
+| Read-only command      | Approved profile after `ready: true`; fixed `docker` executable with `args: ["ps"]`          | Success with bounded output           | Read-only VPS evidence; no shell, pipe, redirection, sudo, or resource mutation          |
 
 Do not replace any matrix case with arbitrary caller-supplied connection
 settings. Every destination is selected only by an operator-approved local
@@ -57,24 +58,29 @@ profile.
    standard error separately.
 2. List approved profiles with an empty input object and retain only the
    count and classifications as evidence.
-3. Run each matrix case through `validate_connection` with exactly one
-   approved `profileId` argument, except the invalid-input case.
-4. After every case, verify the MCP response and audit stream contain only
+3. Run each connection matrix case through `validate_connection` with exactly
+   one approved `profileId` argument, except the invalid-input case.
+4. For the read-only command case, call `execute_remote_command` only after
+   validation succeeds, with the approved profile ID, `command: "docker"`,
+   and `args: ["ps"]`. Do not use `sudo`, shell interpreters, pipes, or
+   redirection.
+5. After every case, verify the MCP response and audit stream contain only
    allowlisted fields. Remove identifiers and operational metadata from the
    evidence before it is stored.
-5. Compare the VPS's read-only SSH audit evidence, where available, with the
-   local timestamps. Confirm there was authentication/readiness activity but
-   no remote command execution.
-6. Close Codex and confirm temporary snapshot and native readiness cleanup
+6. Compare the VPS's read-only SSH audit evidence, where available, with the
+   local timestamps. Confirm only the explicitly approved command ran and
+   that no shell, transfer, forwarding, or unrelated mutation occurred.
+7. Close Codex and confirm temporary snapshot and native readiness cleanup
    completed. Do not remove or alter VPS resources as part of cleanup.
 
 ## Sanitized evidence record
 
 Record only the following fields for each case: test date, Windows/Node/OpenSSH
-versions, MCP build commit, authentication mode, expected outcome, observed
-fixed result code, elapsed-time bucket, redaction check, and no-remote-command
-check. Mark unavailable evidence as unavailable rather than substituting
-identifiers or raw logs.
+versions, MCP build commit, authentication mode, command category, expected
+outcome, observed fixed result code, elapsed-time bucket, redaction check, and
+the read-only-command or no-remote-command check that applies. Mark
+unavailable evidence as unavailable rather than substituting identifiers or
+raw logs.
 
 The acceptance report may state whether each case passed, failed, or was not
 run. It must never include raw JSON-RPC transcripts, hostnames, IP addresses,
@@ -117,3 +123,10 @@ The agent-key success path subsequently completed with the approved
 current-user agent identity. It returned the fixed success result within the
 configured budget, with redaction, child cleanup, and no-remote-command checks
 confirmed.
+
+On 2026-11-11, the final installed candidate also completed a controlled
+read-only `execute_remote_command` check using `docker ps` against the
+designated VPS. The result was `outcome: "success"`, `code: "success"`, and
+exit code `0`; only bounded structured output was retained as evidence. No
+shell, privilege escalation, file transfer, forwarding, or VPS mutation was
+requested.

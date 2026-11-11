@@ -262,6 +262,7 @@ export class PosixExecutionAuditJournal implements ExecutionAuditJournal {
       }
       if (
         parsed.version !== JOURNAL_VERSION ||
+        (parsed.event !== 'intent' && parsed.event !== 'finished') ||
         !OPERATION_ID_PATTERN.test(parsed.operationId) ||
         parsed.previousHmac !== previous ||
         (parsed.event === 'intent' && (typeof parsed.argsHmac !== 'string' || !/^[a-f0-9]{64}$/u.test(parsed.argsHmac)))
@@ -273,8 +274,13 @@ export class PosixExecutionAuditJournal implements ExecutionAuditJournal {
       const actual = Buffer.from(hmac, 'hex');
       const expectedBytes = Buffer.from(expected, 'hex');
       if (actual.length !== expectedBytes.length || !timingSafeEqual(actual, expectedBytes)) throw new Error('execution audit chain is invalid');
-      if (parsed.event === 'intent') this.unfinished.set(parsed.operationId, parsed.sessionId);
-      else if (parsed.event === 'finished') this.unfinished.delete(parsed.operationId);
+      if (parsed.event === 'intent') {
+        if (this.unfinished.has(parsed.operationId)) throw new Error('execution audit chain is invalid');
+        this.unfinished.set(parsed.operationId, parsed.sessionId);
+      } else {
+        if (!this.unfinished.has(parsed.operationId)) throw new Error('execution audit chain is invalid');
+        this.unfinished.delete(parsed.operationId);
+      }
       previous = hmac;
     }
     return previous;

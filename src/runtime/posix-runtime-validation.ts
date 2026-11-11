@@ -541,7 +541,7 @@ export function createRuntimeRemoteCommandExecutionProvider(
     connectionValidation: validationProvider,
     transport: new Ssh2RemoteCommandTransport(credentials, environment.SSH_AUTH_SOCK),
     auditJournal,
-    authorizationProvider: createProfileExecutionAuthorizationProvider(registry, validationProvider),
+    authorizationProvider: createProfileExecutionAuthorizationProvider(validationProvider),
     humanApproval,
   });
 }

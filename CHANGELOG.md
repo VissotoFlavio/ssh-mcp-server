@@ -43,6 +43,9 @@ publish a release.
   public host-key/authentication failure classes from authorization, and
   classified timeout or cancellation after command handoff as
   `outcome-unknown`.
+- Hardened POSIX chain validation against orphaned/unknown events, made
+  Windows audit-key replacement atomic, and preserved `outcome-unknown` when
+  the native Windows command process fails after launch.
 
 - The remote execution candidate now accepts an explicit host-injected human
   approval provider, binds approvals to the complete approved profile identity,

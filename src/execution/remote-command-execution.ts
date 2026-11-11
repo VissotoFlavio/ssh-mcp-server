@@ -312,7 +312,6 @@ export function createExecutionAuthorization(
 }
 
 export function createProfileExecutionAuthorizationProvider(
-  profiles: RemoteCommandProfileProvider,
   validation: ConnectionValidationProvider,
   now: () => number = Date.now,
 ): ExecutionAuthorizationProvider {
@@ -817,7 +816,7 @@ export class RemoteCommandExecutionProvider {
             (validationSignal) =>
               (
                 this.dependencies.authorizationProvider ??
-                createProfileExecutionAuthorizationProvider(this.dependencies.profiles, this.dependencies.connectionValidation, this.now)
+                createProfileExecutionAuthorizationProvider(this.dependencies.connectionValidation, this.now)
               ).authorize(request.profileId, validationSignal),
             remainingTimeout(startedAt, request.timeoutMs!),
             signal,
@@ -827,8 +826,7 @@ export class RemoteCommandExecutionProvider {
         authorization = await boundedOperation(
           (validationSignal) =>
             (
-              this.dependencies.authorizationProvider ??
-              createProfileExecutionAuthorizationProvider(this.dependencies.profiles, this.dependencies.connectionValidation, this.now)
+              this.dependencies.authorizationProvider ?? createProfileExecutionAuthorizationProvider(this.dependencies.connectionValidation, this.now)
             ).authorize(request.profileId, validationSignal),
           remainingTimeout(startedAt, request.timeoutMs!),
           signal,

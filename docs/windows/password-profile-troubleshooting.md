@@ -40,9 +40,16 @@ authorized.
 | `connection-failure`     | Check the approved environment's network reachability and SSH service status through the operator's normal, authorized VPS process.                                                     | Do not change the host, port, SSH options, or known-hosts policy in the MCP request.                                  |
 
 The distinction is intentional: host identity and local provider checks are
-performed by the MCP boundary; VPS-side service, firewall, routing, and
-account authorization checks belong to the environment owner. The MCP never
-executes remote commands and readiness validation never authorizes them.
+performed by the MCP boundary; VPS-side service, firewall, routing, account
+authorization, and command permissions belong to the environment owner. The
+MCP can execute only bounded, non-interactive commands from an approved
+profile; `validate_connection` itself never authorizes or runs a command.
+
+For a controlled execution check, validate the approved profile first, then
+use `execute_remote_command` with a fixed executable and argv such as
+`docker` with `args: ["ps"]`. Treat timeout or cancellation after handoff as
+`outcome-unknown` and do not retry automatically. Privilege-escalation
+commands still require the separate trusted `request_sudo_approval` flow.
 
 ## Safe support record
 

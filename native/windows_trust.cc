@@ -1429,15 +1429,32 @@ bool WriteNewAuditFile(const std::wstring& root, const std::wstring& leaf, PSID 
   return content.size() <= MAXDWORD && WriteFile(file.get(), content.data(), static_cast<DWORD>(content.size()), &written, nullptr) && written == content.size() && FlushFileBuffers(file.get()) && VerifyFile(file.get(), operator_sid, false);
 }
 
-bool WriteExistingAuditFile(const std::wstring& root, const std::wstring& leaf, PSID operator_sid, const std::vector<BYTE>& content) {
-  const std::wstring path = root + L"\\" + leaf;
-  Handle file(CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE | FILE_READ_ATTRIBUTES | READ_CONTROL, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
-  if (file.get() == INVALID_HANDLE_VALUE || !VerifyFile(file.get(), operator_sid, false)) return false;
-  FILE_ID_INFO identity{};
-  if (!ReadIdentity(file.get(), &identity)) return false;
-  LARGE_INTEGER zero{};
+bool WriteAtomicAuditFile(const std::wstring& root, const std::wstring& leaf, PSID operator_sid, const std::vector<BYTE>& content) {
+  constexpr wchar_t kTemporaryLeaf[] = L"execution-audit.active.next";
+  if (content.empty() || leaf.empty() || leaf.find_first_of(L"\\/:*") != std::wstring::npos || !VerifyDirectoryChain(root, operator_sid)) return false;
+  const std::wstring temporary_path = root + L"\\" + kTemporaryLeaf;
+  Handle existing_temporary(CreateFileW(temporary_path.c_str(), FILE_READ_ATTRIBUTES | READ_CONTROL, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+  if (existing_temporary.get() != INVALID_HANDLE_VALUE || GetLastError() != ERROR_FILE_NOT_FOUND) return false;
+  Handle root_handle(CreateFileW(root.c_str(), FILE_READ_ATTRIBUTES | READ_CONTROL | FILE_ADD_FILE | FILE_TRAVERSE, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                  FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+  if (root_handle.get() == INVALID_HANDLE_VALUE || !VerifyFile(root_handle.get(), operator_sid, true)) return false;
+  PrivateSecurityAttributes security(operator_sid, FILE_ALL_ACCESS, false);
+  Handle temporary;
+  if (!security.valid() || !CreatePrivateRelative(root_handle.get(), kTemporaryLeaf, security, false, SnapshotFailure::kNone, &temporary) || !VerifyFile(temporary.get(), operator_sid, false)) return false;
   DWORD written = 0;
-  return SetFilePointerEx(file.get(), zero, nullptr, FILE_BEGIN) && SetEndOfFile(file.get()) && content.size() <= MAXDWORD && WriteFile(file.get(), content.data(), static_cast<DWORD>(content.size()), &written, nullptr) && written == content.size() && FlushFileBuffers(file.get()) && HasIdentity(file.get(), identity) && VerifyFile(file.get(), operator_sid, false);
+  if (content.size() > MAXDWORD || !WriteFile(temporary.get(), content.data(), static_cast<DWORD>(content.size()), &written, nullptr) || written != content.size() ||
+      !FlushFileBuffers(temporary.get()) || !VerifyFile(temporary.get(), operator_sid, false)) {
+    DeleteFileW(temporary_path.c_str());
+    return false;
+  }
+  temporary.reset();
+  const std::wstring target_path = root + L"\\" + leaf;
+  if (!ReplaceFileW(target_path.c_str(), temporary_path.c_str(), nullptr, REPLACEFILE_WRITE_THROUGH, nullptr, nullptr)) {
+    DeleteFileW(temporary_path.c_str());
+    return false;
+  }
+  Handle target(CreateFileW(target_path.c_str(), FILE_READ_ATTRIBUTES | READ_CONTROL, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+  return target.get() != INVALID_HANDLE_VALUE && VerifyFile(target.get(), operator_sid, false);
 }
 
 bool AuditLeafExistsOrUnsafe(const std::wstring& root, const wchar_t* leaf) {
@@ -1911,7 +1928,7 @@ napi_value RotateExecutionAuditKey(napi_env env, napi_callback_info info) {
     RemoveAuditKey(key_id);
     return Unavailable(env);
   }
-  if (!WriteExistingAuditFile(state.root, kExecutionAuditActiveLeaf, state.operator_sid.data(), active)) return Unavailable(env);
+  if (!WriteAtomicAuditFile(state.root, kExecutionAuditActiveLeaf, state.operator_sid.data(), active)) return Unavailable(env);
   state.active_key_id = key_id;
   state.active_key = key;
   napi_value result{};
@@ -2793,6 +2810,7 @@ napi_value NativeAgentCommandError(napi_env env, const char* code) {
   const char* message = "Windows agent command is unavailable";
   if (strcmp(code, "timeout") == 0) message = "Windows agent command timed out";
   else if (strcmp(code, "cancelled") == 0) message = "Windows agent command cancelled";
+  else if (strcmp(code, "outcome-unknown") == 0) message = "Windows agent command outcome is unknown";
   else if (strcmp(code, "output-limit") == 0) message = "Windows agent command output exceeded its limit";
   else if (strcmp(code, "host-key-failure") == 0) message = "Windows agent command host verification failed";
   else if (strcmp(code, "authentication-failure") == 0) message = "Windows agent command authentication failed";
@@ -2857,6 +2875,7 @@ void CompleteNativeAgentCommand(napi_env env, napi_status, void* data) {
   else if (job->result.timed_out) error_code = "timeout";
   else if (job->result.output_limited) error_code = "output-limit";
   else if (!job->result.failure_code.empty()) error_code = job->result.failure_code.c_str();
+  else if (job->result.launched && job->result.failed) error_code = "outcome-unknown";
   else if (!job->result.launched || job->result.failed) error_code = "windows-agent-command-unavailable";
   if (error_code != nullptr) {
     napi_value error = NativeAgentCommandError(env, error_code);
