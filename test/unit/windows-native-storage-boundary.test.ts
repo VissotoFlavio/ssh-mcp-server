@@ -742,7 +742,7 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
       const hostPublic = publicKeyParts(`${privateHostKey}.pub`);
       const fixture = await listenLocalSshFixture(privateHostKey, agentPublic.data);
       server = fixture.server;
-      const host = 'localhost';
+      const host = '127.0.0.1';
       const hostFingerprint = fingerprint(`${privateHostKey}.pub`);
       writeFileSync(
         join(root, 'known-hosts', 'production-api.known_hosts'),
