@@ -5,12 +5,14 @@ import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { Server } from 'ssh2';
+
+import type { Server as SshServer } from 'ssh2';
 
 const addonPath = join(process.cwd(), 'build', 'Release', 'windows_trust.node');
 const testAddonPath = join(process.cwd(), 'build', 'Release', 'windows_trust_test.node');
 const fixture = join(process.cwd(), 'test', 'helpers', 'windows-native-storage-fixture.ps1');
 const nativeRequire = createRequire(import.meta.url);
+const { Server } = nativeRequire('ssh2') as { Server: typeof SshServer };
 // Windows PowerShell 5.1 can fail to load ACL type data in isolated child
 // processes, so these Windows-only fixtures require PowerShell 7+.
 const fixtureShell = 'pwsh.exe';
@@ -105,7 +107,7 @@ function fingerprint(publicKeyPath: string): string {
   return match[1];
 }
 
-async function listenLocalSshFixture(hostKeyPath: string, agentPublicKey: Buffer): Promise<{ readonly server: Server; readonly port: number }> {
+async function listenLocalSshFixture(hostKeyPath: string, agentPublicKey: Buffer): Promise<{ readonly server: SshServer; readonly port: number }> {
   const server = new Server({ hostKeys: [readFileSync(hostKeyPath)] });
   server.on('connection', (client) => {
     client.on('authentication', (context) => {
@@ -724,7 +726,7 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
   test('executes the real native binding against a disposable local SSH fixture', { timeout: 120_000 }, async () => {
     const root = uniqueRoot('native-command-e2e');
     let configured = false;
-    let server: Server | undefined;
+    let server: SshServer | undefined;
     const privateAgentKey = join(root, 'state', 'agent-private');
     const privateHostKey = join(root, 'state', 'host-private');
     try {
