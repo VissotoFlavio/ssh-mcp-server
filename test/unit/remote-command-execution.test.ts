@@ -6,6 +6,7 @@ import {
   RemoteExecutionError,
   SudoApprovalStore,
   WindowsRemoteCommandTransport,
+  createExecutionAuthorization,
   serializeRemoteAuditEvent,
   type RemoteCommandTransport,
   type RemoteCommandTransportResult,
@@ -36,7 +37,10 @@ class FakeTransport implements RemoteCommandTransport {
   }
 }
 
-function createProvider(transport = new FakeTransport(), options: { now?: () => number; audit?: string[]; approvals?: SudoApprovalStore } = {}) {
+function createProvider(
+  transport = new FakeTransport(),
+  options: { now?: () => number; audit?: string[]; approvals?: SudoApprovalStore; humanApproval?: boolean } = {},
+) {
   return {
     provider: new RemoteCommandExecutionProvider({
       profiles: { getProfile: async (profileId: string) => (profileId === profile.profileId ? profile : undefined) },
@@ -46,7 +50,7 @@ function createProvider(transport = new FakeTransport(), options: { now?: () => 
       },
       transport,
       sudoApprovals: options.approvals,
-      humanApproval: { approve: async () => true },
+      humanApproval: options.humanApproval === false ? undefined : { approve: async () => true },
       auditSink: options.audit === undefined ? undefined : (event) => options.audit!.push(event),
       now: options.now,
     }),
@@ -106,11 +110,20 @@ test('blocks sudo without a server-issued approval and records a redacted audit 
   const audit: string[] = [];
   const { provider, transport } = createProvider(undefined, { audit });
   const result = await provider.execute({ profileId: profile.profileId, command: 'sudo', args: ['--password=secret'] });
+  assert.equal(result.outcome, 'approval-required');
   assert.equal(result.code, 'approval-required');
   assert.equal(transport.calls.length, 0);
   assert.equal(audit.length, 1);
   assert.equal(audit[0].includes('secret'), false);
   assert.equal(JSON.parse(audit[0]).approvalState, 'blocked');
+});
+
+test('reports unavailable sudo approval as a failure before transport', async () => {
+  const { provider, transport } = createProvider(undefined, { humanApproval: false });
+  const result = await provider.execute({ profileId: profile.profileId, command: 'sudo', args: ['id'] });
+  assert.equal(result.outcome, 'failure');
+  assert.equal(result.code, 'approval-unavailable');
+  assert.equal(transport.calls.length, 0);
 });
 
 test('binds sudo approval to exact request, expiry and one-time use', async () => {
@@ -285,23 +298,28 @@ test('preserves outcome-unknown when journal finalization and secondary audit bo
   assert.equal(result.stderr, '');
 });
 
-test('rejects a sudo approval when the approved profile identity changes', async () => {
+test('uses the approved sudo lease when the profile source changes', async () => {
   const changed = { ...profile, host: 'changed.internal.example' };
   let current = profile;
+  const transport = new FakeTransport();
   const provider = new RemoteCommandExecutionProvider({
     profiles: { getProfile: async () => current },
     connectionValidation: {
       validateConnection: async () => ({ profileId: profile.profileId, ready: true as const }),
       authorizeExecution: async () => ({ profile: current }),
     },
-    transport: new FakeTransport(),
+    transport,
+    authorizationProvider: {
+      authorize: async () => createExecutionAuthorization(current, Date.now() + 60_000),
+    },
     humanApproval: { approve: async () => true },
   });
   const sudo = { profileId: profile.profileId, command: 'sudo', args: ['id'] };
   const approval = await provider.requestSudoApproval(sudo);
   current = changed;
   const result = await provider.execute({ ...sudo, approvalToken: approval.token });
-  assert.equal(result.code, 'approval-altered');
+  assert.equal(result.code, 'success');
+  assert.equal((transport.calls[0] as { profile: ConnectionProfile }).profile.host, profile.host);
 });
 
 test('blocks Windows agent-key execution while retaining the password transport boundary', async () => {

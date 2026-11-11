@@ -1,4 +1,4 @@
-import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import { createConnection, type Socket } from 'node:net';
 import { dirname } from 'node:path';
@@ -13,6 +13,8 @@ const MAX_FRAME_BYTES = 64 * 1024;
 const MAX_UNIX_SOCKET_PATH_BYTES = 107;
 const MAX_IPC_TIMEOUT_MS = 60_000;
 const APPROVER_SOCKET_ENV = 'SSH_MCP_APPROVER_SOCKET';
+const APPROVER_SECRET_FILE_ENV = 'SSH_MCP_APPROVER_SECRET_FILE';
+const APPROVER_SECRET_BYTES = 32;
 const HEX_64 = /^[a-f0-9]{64}$/u;
 
 export interface HumanApproverIpcRequest {
@@ -87,6 +89,40 @@ function equalDigest(left: string, right: string): boolean {
   return timingSafeEqual(Buffer.from(left, 'hex'), Buffer.from(right, 'hex'));
 }
 
+function macPayload(domain: string, fields: readonly unknown[]): string {
+  return `${domain}\0${JSON.stringify(fields)}`;
+}
+
+function mac(secret: Buffer, domain: string, fields: readonly unknown[]): string {
+  return createHmac('sha256', secret).update(macPayload(domain, fields), 'utf8').digest('hex');
+}
+
+function equalMac(left: string, right: string): boolean {
+  return equalDigest(left, right);
+}
+
+function requestMacPayload(request: HumanApproverIpcRequest): readonly unknown[] {
+  return [
+    request.version,
+    request.type,
+    request.nonce,
+    request.requestDigest,
+    request.operationId,
+    request.leaseIdentityDigest,
+    request.request.profileId,
+    request.request.command,
+    request.request.args,
+    request.request.timeoutMs,
+    request.request.maxOutputBytes,
+  ];
+}
+
+function responseMacPayload(
+  response: Pick<HumanApproverIpcResponse, 'version' | 'type' | 'nonce' | 'requestDigest' | 'approved'>,
+): readonly unknown[] {
+  return [response.version, response.type, response.nonce, response.requestDigest, response.approved];
+}
+
 function encodeFrame(value: unknown): Buffer {
   const payload = Buffer.from(JSON.stringify(value), 'utf8');
   if (payload.length === 0 || payload.length > MAX_FRAME_BYTES) throw new TypeError('IPC frame is too large');
@@ -124,10 +160,13 @@ function validateResponse(value: unknown, request: HumanApproverIpcRequest): Hum
   });
 }
 
+function validateAbsolutePath(path: string, maxBytes: number): string | undefined {
+  if (!isSafeText(path, 4096) || !path.startsWith('/')) return undefined;
+  return Buffer.byteLength(path, 'utf8') > maxBytes ? undefined : path;
+}
+
 function validateSocketPath(socketPath: string): string | undefined {
-  if (!isSafeText(socketPath, 4096) || !socketPath.startsWith('/')) return undefined;
-  if (Buffer.byteLength(socketPath, 'utf8') > MAX_UNIX_SOCKET_PATH_BYTES) return undefined;
-  return socketPath;
+  return validateAbsolutePath(socketPath, MAX_UNIX_SOCKET_PATH_BYTES);
 }
 
 async function isPrivateUnixSocket(socketPath: string): Promise<boolean> {
@@ -150,6 +189,29 @@ async function isPrivateUnixSocket(socketPath: string): Promise<boolean> {
   }
 }
 
+async function readPrivateSecret(secretFile: string | undefined): Promise<Buffer | undefined> {
+  const path = secretFile === undefined ? undefined : validateAbsolutePath(secretFile, 4096);
+  if (path === undefined) return undefined;
+  try {
+    const stat = await fs.lstat(path);
+    const uid = process.getuid?.();
+    if (!stat.isFile() || (stat.mode & 0o077) !== 0 || (uid !== undefined && stat.uid !== uid)) return undefined;
+    let directory = dirname(path);
+    while (true) {
+      const directoryStat = await fs.lstat(directory);
+      if (!directoryStat.isDirectory() || (directoryStat.mode & 0o022) !== 0) return undefined;
+      if (uid !== undefined && directoryStat.uid !== uid && directoryStat.uid !== 0) return undefined;
+      const parent = dirname(directory);
+      if (parent === directory) break;
+      directory = parent;
+    }
+    const secret = await fs.readFile(path);
+    return secret.length === APPROVER_SECRET_BYTES ? secret : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function closeSocket(socket: Socket): void {
   socket.removeAllListeners();
   socket.destroy();
@@ -159,12 +221,14 @@ function closeSocket(socket: Socket): void {
 export class UnixSocketHumanApproverChannel implements HumanApproverIpcChannel {
   constructor(
     private readonly socketPath: string,
+    private readonly secretFile?: string,
     private readonly timeoutMs = MAX_IPC_TIMEOUT_MS,
   ) {}
 
   async approve(request: HumanApproverIpcRequest, signal?: AbortSignal): Promise<HumanApproverIpcResponse> {
     const socketPath = validateSocketPath(this.socketPath);
-    if (socketPath === undefined || !(await isPrivateUnixSocket(socketPath))) throw new Error('approver unavailable');
+    const secret = await readPrivateSecret(this.secretFile);
+    if (socketPath === undefined || secret === undefined || !(await isPrivateUnixSocket(socketPath))) throw new Error('approver unavailable');
     if (signal?.aborted) throw new Error('approver cancelled');
 
     const timeoutMs = Math.min(Math.max(1, this.timeoutMs), MAX_IPC_TIMEOUT_MS);
@@ -195,7 +259,12 @@ export class UnixSocketHumanApproverChannel implements HumanApproverIpcChannel {
       signal?.addEventListener('abort', abort, { once: true });
       socket.on('connect', () => {
         try {
-          socket.end(encodeFrame(request));
+          socket.end(
+            encodeFrame({
+              ...request,
+              requestMac: mac(secret, 'ssh-mcp-approver/request/v1', requestMacPayload(request)),
+            }),
+          );
         } catch (error) {
           fail(error);
         }
@@ -206,8 +275,23 @@ export class UnixSocketHumanApproverChannel implements HumanApproverIpcChannel {
       });
       socket.on('end', () => {
         try {
-          const response = validateResponse(decodeSingleFrame(data), request);
+          const value = decodeSingleFrame(data);
+          if (!isRecord(value) || !hasExactKeys(value, ['version', 'type', 'nonce', 'requestDigest', 'approved', 'responseMac']))
+            throw new Error('approver protocol invalid');
+          if (typeof value.responseMac !== 'string' || !HEX_64.test(value.responseMac)) throw new Error('approver protocol invalid');
+          const response = validateResponse(
+            {
+              version: value.version,
+              type: value.type,
+              nonce: value.nonce,
+              requestDigest: value.requestDigest,
+              approved: value.approved,
+            },
+            request,
+          );
           if (response === undefined) throw new Error('approver protocol invalid');
+          if (!equalMac(value.responseMac, mac(secret, 'ssh-mcp-approver/response/v1', responseMacPayload(response))))
+            throw new Error('approver authentication failed');
           finish(response);
         } catch (error) {
           fail(error);
@@ -294,8 +378,9 @@ export function createLocalHumanSudoApprovalProvider(
 ): HumanSudoApprovalProvider | undefined {
   if (platform === 'linux' || platform === 'darwin') {
     const socketPath = environment[APPROVER_SOCKET_ENV];
-    if (socketPath === undefined || !socketPath.startsWith('/')) return undefined;
-    return new IpcHumanSudoApprovalProvider(new UnixSocketHumanApproverChannel(socketPath), 'posix');
+    const secretFile = environment[APPROVER_SECRET_FILE_ENV];
+    if (socketPath === undefined || secretFile === undefined || !socketPath.startsWith('/') || !secretFile.startsWith('/')) return undefined;
+    return new IpcHumanSudoApprovalProvider(new UnixSocketHumanApproverChannel(socketPath, secretFile), 'posix');
   }
   if (platform === 'win32' && windowsBoundary !== undefined) {
     return new IpcHumanSudoApprovalProvider(new WindowsNamedPipeHumanApproverChannel(windowsBoundary), 'windows');
@@ -307,4 +392,5 @@ export const humanApproverIpc = Object.freeze({
   version: IPC_VERSION,
   maxFrameBytes: MAX_FRAME_BYTES,
   approverSocketEnvironmentVariable: APPROVER_SOCKET_ENV,
+  approverSecretFileEnvironmentVariable: APPROVER_SECRET_FILE_ENV,
 });

@@ -17,6 +17,7 @@
 #include <array>
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <climits>
 #include <cmath>
 #include <cstdlib>
@@ -1280,6 +1281,33 @@ bool RandomBytes(std::vector<BYTE>* bytes) {
   return bytes != nullptr && !bytes->empty() && BCryptGenRandom(nullptr, bytes->data(), static_cast<ULONG>(bytes->size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0;
 }
 
+void WipeBytes(std::vector<BYTE>* bytes) {
+  if (bytes == nullptr || bytes->empty()) return;
+  SecureZeroMemory(bytes->data(), bytes->size());
+  bytes->clear();
+  bytes->shrink_to_fit();
+}
+
+class WipeBytesOnExit final {
+ public:
+  explicit WipeBytesOnExit(std::vector<BYTE>* bytes) : bytes_(bytes) {}
+  ~WipeBytesOnExit() { WipeBytes(bytes_); }
+  WipeBytesOnExit(const WipeBytesOnExit&) = delete;
+  WipeBytesOnExit& operator=(const WipeBytesOnExit&) = delete;
+
+ private:
+  std::vector<BYTE>* bytes_;
+};
+
+std::string CurrentExecutionAuditSessionId() {
+  static const std::string session_id = [] {
+    std::vector<BYTE> random_id(kExecutionAuditKeyIdBytes);
+    WipeBytesOnExit wipe(&random_id);
+    return RandomBytes(&random_id) ? HexBytes(random_id.data(), random_id.size()) : std::string();
+  }();
+  return session_id;
+}
+
 bool HmacSha256(const std::vector<BYTE>& key, const std::string& input, std::string* output) {
   if (key.empty() || output == nullptr) return false;
   BCRYPT_ALG_HANDLE algorithm = nullptr;
@@ -1309,7 +1337,10 @@ bool HmacSha256(const std::vector<BYTE>& key, const std::string& input, std::str
 class ExecutionAuditMutex final {
  public:
   ExecutionAuditMutex() : handle_(CreateMutexW(nullptr, FALSE, L"Local\\Vissoto.ssh-mcp-server.execution-audit")) {
-    locked_ = handle_ != nullptr && WaitForSingleObject(handle_, INFINITE) == WAIT_OBJECT_0;
+    constexpr DWORD kWaitMs = 5'000;
+    if (handle_ == nullptr) return;
+    const DWORD result = WaitForSingleObject(handle_, kWaitMs);
+    locked_ = result == WAIT_OBJECT_0 || result == WAIT_ABANDONED;
   }
   ~ExecutionAuditMutex() {
     if (locked_) ReleaseMutex(handle_);
@@ -1327,6 +1358,8 @@ class ExecutionAuditMutex final {
 struct ExecutionAuditRecord final {
   std::string event;
   std::string operation_id;
+  std::string session_id;
+  bool legacy_session = false;
   long long timestamp = 0;
   std::string key_id;
   std::string previous_event_hmac;
@@ -1336,6 +1369,7 @@ struct ExecutionAuditRecord final {
   std::vector<std::string> args;
   std::string args_hmac;
   std::string approval_state;
+  std::string new_key_id;
   std::string outcome;
   std::string code;
   bool has_exit_code = false;
@@ -1347,10 +1381,20 @@ struct ExecutionAuditRecord final {
 struct ExecutionAuditState final {
   std::wstring root;
   std::vector<BYTE> operator_sid;
+  std::string session_id;
   std::string active_key_id;
   std::vector<BYTE> active_key;
   std::string head;
-  std::vector<std::string> unfinished;
+  struct UnfinishedIntent final {
+    std::string operation_id;
+    std::string session_id;
+  };
+  std::vector<UnfinishedIntent> unfinished;
+
+  ~ExecutionAuditState() { WipeBytes(&active_key); }
+  ExecutionAuditState(const ExecutionAuditState&) = delete;
+  ExecutionAuditState& operator=(const ExecutionAuditState&) = delete;
+  ExecutionAuditState() = default;
 };
 
 struct ExecutionAuditAppendResult final {
@@ -1515,18 +1559,25 @@ bool ParseAuditRecord(const std::string& line, ExecutionAuditRecord* record) {
   long long version = 0;
   bool exit_null = false;
   if (record == nullptr || !ReadAuditNumber(line, "version", &version) || version != 1 || !ReadAuditString(line, "event", &record->event) ||
-      (record->event != "intent" && record->event != "finished") || !ReadAuditString(line, "operationId", &record->operation_id) ||
+      (record->event != "intent" && record->event != "finished" && record->event != "rotation") || !ReadAuditString(line, "operationId", &record->operation_id) ||
       !IsLowerHex(record->operation_id, 32) || !ReadAuditNumber(line, "timestamp", &record->timestamp) || record->timestamp < 0 ||
       !ReadAuditString(line, "keyId", &record->key_id) || !IsLowerHex(record->key_id, 32) ||
       !ReadAuditNullableString(line, "previousEventHmac", &record->has_previous, &record->previous_event_hmac) ||
       (record->has_previous && !IsLowerHex(record->previous_event_hmac, 64)) || !ReadAuditString(line, "eventHmac", &record->event_hmac) ||
       !IsLowerHex(record->event_hmac, 64)) return false;
+  size_t session_start = 0;
+  if (!ReadAuditProperty(line, "sessionId", &session_start)) {
+    record->legacy_session = true;
+  } else if (!ParseJsonStringAt(line, session_start, &record->session_id, &session_start) || !IsLowerHex(record->session_id, 32)) {
+    return false;
+  }
   if (record->event == "intent") {
     return ReadAuditString(line, "profileId", &record->profile_id) && IsCanonicalProfileId(record->profile_id) &&
            ReadAuditString(line, "command", &record->command) && !record->command.empty() &&
            ReadAuditStringArray(line, "args", &record->args) && ReadAuditString(line, "argsHmac", &record->args_hmac) && IsLowerHex(record->args_hmac, 64) &&
            ReadAuditString(line, "approvalState", &record->approval_state) && !record->approval_state.empty();
   }
+  if (record->event == "rotation") return ReadAuditString(line, "newKeyId", &record->new_key_id) && IsLowerHex(record->new_key_id, 32);
   return ReadAuditString(line, "outcome", &record->outcome) &&
          (record->outcome == "success" || record->outcome == "failure" || record->outcome == "timeout" || record->outcome == "cancelled" || record->outcome == "approval-required" || record->outcome == "unknown") &&
          ReadAuditString(line, "code", &record->code) && !record->code.empty() && ReadAuditNumber(line, "exitCode", &record->exit_code, &exit_null) &&
@@ -1534,8 +1585,9 @@ bool ParseAuditRecord(const std::string& line, ExecutionAuditRecord* record) {
 }
 
 std::string SerializeAuditRecord(const ExecutionAuditRecord& record, bool include_hmac) {
-  std::string value = "{\"version\":1,\"event\":" + JsonString(record.event) + ",\"operationId\":" + JsonString(record.operation_id) +
-                      ",\"timestamp\":" + std::to_string(record.timestamp) + ",\"keyId\":" + JsonString(record.key_id) + ",\"previousEventHmac\":" +
+  std::string value = "{\"version\":1,\"event\":" + JsonString(record.event) + ",\"operationId\":" + JsonString(record.operation_id);
+  if (!record.legacy_session) value += ",\"sessionId\":" + JsonString(record.session_id);
+  value += ",\"timestamp\":" + std::to_string(record.timestamp) + ",\"keyId\":" + JsonString(record.key_id) + ",\"previousEventHmac\":" +
                       (record.has_previous ? JsonString(record.previous_event_hmac) : "null");
   if (record.event == "intent") {
     value += ",\"profileId\":" + JsonString(record.profile_id) + ",\"command\":" + JsonString(record.command) + ",\"args\":[";
@@ -1544,6 +1596,8 @@ std::string SerializeAuditRecord(const ExecutionAuditRecord& record, bool includ
       value += JsonString(record.args[index]);
     }
     value += "],\"argsHmac\":" + JsonString(record.args_hmac) + ",\"approvalState\":" + JsonString(record.approval_state);
+  } else if (record.event == "rotation") {
+    value += ",\"newKeyId\":" + JsonString(record.new_key_id);
   } else {
     value += ",\"outcome\":" + JsonString(record.outcome) + ",\"code\":" + JsonString(record.code) + ",\"exitCode\":" +
              (record.has_exit_code ? std::to_string(record.exit_code) : "null") + ",\"durationMs\":" + std::to_string(record.duration_ms);
@@ -1556,17 +1610,25 @@ std::wstring ExecutionAuditCredentialTarget(const std::string& key_id) {
   return std::wstring(kCredentialTargetPrefix) + kExecutionAuditCredentialPrefix + std::wstring(key_id.begin(), key_id.end());
 }
 
+void ReleaseAuditCredential(PCREDENTIALW credential) {
+  if (credential == nullptr) return;
+  if (credential->CredentialBlob != nullptr && credential->CredentialBlobSize == kExecutionAuditKeyBytes) {
+    SecureZeroMemory(credential->CredentialBlob, credential->CredentialBlobSize);
+  }
+  CredFree(credential);
+}
+
 bool LoadAuditKey(const std::string& key_id, std::vector<BYTE>* key) {
   if (!IsLowerHex(key_id, 32) || key == nullptr) return false;
   PCREDENTIALW credential = nullptr;
   const std::wstring target = ExecutionAuditCredentialTarget(key_id);
   if (!CredReadW(target.c_str(), CRED_TYPE_GENERIC, 0, &credential) || credential == nullptr || credential->CredentialBlob == nullptr ||
       credential->CredentialBlobSize != kExecutionAuditKeyBytes) {
-    if (credential != nullptr) CredFree(credential);
+    ReleaseAuditCredential(credential);
     return false;
   }
   key->assign(credential->CredentialBlob, credential->CredentialBlob + credential->CredentialBlobSize);
-  CredFree(credential);
+  ReleaseAuditCredential(credential);
   return true;
 }
 
@@ -1590,7 +1652,8 @@ void RemoveAuditKey(const std::string& key_id) {
 bool LoadExecutionAuditState(ExecutionAuditState* state) {
   if (state == nullptr) return false;
   std::wstring known_hosts_root;
-  if (!LoadConfiguration(&state->root, &known_hosts_root, &state->operator_sid)) return false;
+  state->session_id = CurrentExecutionAuditSessionId();
+  if (!IsLowerHex(state->session_id, 32) || !LoadConfiguration(&state->root, &known_hosts_root, &state->operator_sid)) return false;
   std::vector<BYTE> active;
   if (!ReadAuditFile(state->root, kExecutionAuditActiveLeaf, state->operator_sid.data(), false, &active)) return false;
   const std::string active_text(reinterpret_cast<const char*>(active.data()), active.size());
@@ -1612,15 +1675,21 @@ bool LoadExecutionAuditState(ExecutionAuditState* state) {
     const std::string line = contents.substr(cursor, next - cursor);
     ExecutionAuditRecord record;
     std::vector<BYTE> key;
+    WipeBytesOnExit wipe_key(&key);
     std::string expected_hmac;
     if (!ParseAuditRecord(line, &record) || record.has_previous != !previous.empty() || (record.has_previous && record.previous_event_hmac != previous) ||
         !LoadAuditKey(record.key_id, &key) || !HmacSha256(key, SerializeAuditRecord(record, false), &expected_hmac)) return false;
     if (expected_hmac != record.event_hmac || line != SerializeAuditRecord(record, true)) return false;
     if (record.event == "intent") {
-      if (std::find(state->unfinished.begin(), state->unfinished.end(), record.operation_id) != state->unfinished.end()) return false;
-      state->unfinished.push_back(record.operation_id);
-    } else {
-      const auto found = std::find(state->unfinished.begin(), state->unfinished.end(), record.operation_id);
+      const auto duplicate = std::find_if(state->unfinished.begin(), state->unfinished.end(), [&record](const ExecutionAuditState::UnfinishedIntent& unfinished) {
+        return unfinished.operation_id == record.operation_id;
+      });
+      if (duplicate != state->unfinished.end()) return false;
+      state->unfinished.push_back({record.operation_id, record.legacy_session ? "legacy" : record.session_id});
+    } else if (record.event == "finished") {
+      const auto found = std::find_if(state->unfinished.begin(), state->unfinished.end(), [&record](const ExecutionAuditState::UnfinishedIntent& unfinished) {
+        return unfinished.operation_id == record.operation_id;
+      });
       if (found == state->unfinished.end()) return false;
       state->unfinished.erase(found);
     }
@@ -1634,6 +1703,7 @@ bool LoadExecutionAuditState(ExecutionAuditState* state) {
 bool AppendExecutionAuditRecord(ExecutionAuditState* state, ExecutionAuditRecord record, ExecutionAuditAppendResult* result) {
   if (state == nullptr || result == nullptr) return false;
   record.key_id = state->active_key_id;
+  record.session_id = state->session_id;
   record.has_previous = !state->head.empty();
   record.previous_event_hmac = state->head;
   FILETIME now{};
@@ -1661,9 +1731,11 @@ bool AppendExecutionAuditRecord(ExecutionAuditState* state, ExecutionAuditRecord
   result->previous_event_hmac = record.previous_event_hmac;
   result->event_hmac = record.event_hmac;
   state->head = record.event_hmac;
-  if (record.event == "intent") state->unfinished.push_back(record.operation_id);
+  if (record.event == "intent") state->unfinished.push_back({record.operation_id, record.session_id});
   else {
-    const auto found = std::find(state->unfinished.begin(), state->unfinished.end(), record.operation_id);
+    const auto found = std::find_if(state->unfinished.begin(), state->unfinished.end(), [&record](const ExecutionAuditState::UnfinishedIntent& unfinished) {
+      return unfinished.operation_id == record.operation_id;
+    });
     if (found == state->unfinished.end()) return false;
     state->unfinished.erase(found);
   }
@@ -1675,10 +1747,14 @@ bool AppendAuditIntent(const ExecutionAuditRecord& intent, ExecutionAuditAppendR
   if (!mutex.locked()) return false;
   ExecutionAuditState state;
   if (!LoadExecutionAuditState(&state)) return false;
-  while (!state.unfinished.empty()) {
+  while (true) {
+    const auto interrupted = std::find_if(state.unfinished.begin(), state.unfinished.end(), [&state](const ExecutionAuditState::UnfinishedIntent& unfinished) {
+      return unfinished.session_id != state.session_id;
+    });
+    if (interrupted == state.unfinished.end()) break;
     ExecutionAuditRecord recovered;
     recovered.event = "finished";
-    recovered.operation_id = state.unfinished.front();
+    recovered.operation_id = interrupted->operation_id;
     recovered.outcome = "unknown";
     recovered.code = "outcome-unknown";
     recovered.has_exit_code = false;
@@ -1692,7 +1768,9 @@ bool AppendAuditFinished(const ExecutionAuditRecord& finished, ExecutionAuditApp
   ExecutionAuditMutex mutex;
   if (!mutex.locked()) return false;
   ExecutionAuditState state;
-  if (!LoadExecutionAuditState(&state) || std::find(state.unfinished.begin(), state.unfinished.end(), finished.operation_id) == state.unfinished.end()) return false;
+  if (!LoadExecutionAuditState(&state) || std::find_if(state.unfinished.begin(), state.unfinished.end(), [&finished, &state](const ExecutionAuditState::UnfinishedIntent& unfinished) {
+        return unfinished.operation_id == finished.operation_id && unfinished.session_id == state.session_id;
+      }) == state.unfinished.end()) return false;
   return AppendExecutionAuditRecord(&state, finished, result);
 }
 
@@ -1789,6 +1867,8 @@ napi_value InitializeExecutionAuditKey(napi_env env, napi_callback_info info) {
   if (AuditLeafExistsOrUnsafe(root, kExecutionAuditActiveLeaf) || AuditLeafExistsOrUnsafe(root, kExecutionAuditJournalLeaf)) return Unavailable(env);
   std::vector<BYTE> key(kExecutionAuditKeyBytes);
   std::vector<BYTE> id(kExecutionAuditKeyIdBytes);
+  WipeBytesOnExit wipe_key(&key);
+  WipeBytesOnExit wipe_id(&id);
   if (!RandomBytes(&key) || !RandomBytes(&id)) return Unavailable(env);
   const std::string key_id = HexBytes(id.data(), id.size());
   const std::string active_text = "v1:" + key_id + "\n";
@@ -1810,6 +1890,8 @@ napi_value RotateExecutionAuditKey(napi_env env, napi_callback_info info) {
   if (!mutex.locked() || !LoadExecutionAuditState(&state)) return Unavailable(env);
   std::vector<BYTE> key(kExecutionAuditKeyBytes);
   std::vector<BYTE> id(kExecutionAuditKeyIdBytes);
+  WipeBytesOnExit wipe_key(&key);
+  WipeBytesOnExit wipe_id(&id);
   if (!RandomBytes(&key) || !RandomBytes(&id)) return Unavailable(env);
   const std::string key_id = HexBytes(id.data(), id.size());
   const std::string active_text = "v1:" + key_id + "\n";
@@ -1819,6 +1901,14 @@ napi_value RotateExecutionAuditKey(napi_env env, napi_callback_info info) {
     RemoveAuditKey(key_id);
     return Unavailable(env);
   }
+  state.active_key_id = key_id;
+  state.active_key = key;
+  ExecutionAuditRecord rotation;
+  rotation.event = "rotation";
+  rotation.operation_id = "00000000000000000000000000000000";
+  rotation.new_key_id = key_id;
+  ExecutionAuditAppendResult rotation_result;
+  if (!AppendExecutionAuditRecord(&state, std::move(rotation), &rotation_result)) return Unavailable(env);
   napi_value result{};
   return napi_get_undefined(env, &result) == napi_ok ? result : Unavailable(env);
 }
@@ -2260,6 +2350,7 @@ struct NativeAgentCommandRunResult final {
   bool timed_out = false;
   bool output_limited = false;
   DWORD exit_code = 1;
+  std::string failure_code;
   std::string stdout_data;
   std::string stderr_data;
   Handle unreaped_job;
@@ -2306,6 +2397,24 @@ void RedactNativePath(std::string* output, const std::wstring& path) {
     output->replace(position, encoded.size(), "[REDACTED_PATH]");
     position = output->find(encoded, position + sizeof("[REDACTED_PATH]") - 1);
   }
+}
+
+bool ContainsCaseInsensitive(const std::string& value, const char* needle) {
+  if (needle == nullptr || *needle == '\0') return false;
+  const size_t length = std::strlen(needle);
+  return std::search(value.begin(), value.end(), needle, needle + length, [](char left, char right) {
+    return std::tolower(static_cast<unsigned char>(left)) == std::tolower(static_cast<unsigned char>(right));
+  }) != value.end();
+}
+
+const char* ClassifyNativeAgentFailure(const std::string& stderr_data) {
+  if (ContainsCaseInsensitive(stderr_data, "host key verification failed")) return "host-key-failure";
+  if (ContainsCaseInsensitive(stderr_data, "permission denied (") || ContainsCaseInsensitive(stderr_data, "no more authentication methods to try") ||
+      ContainsCaseInsensitive(stderr_data, "authentication failed")) return "authentication-failure";
+  if (ContainsCaseInsensitive(stderr_data, "ssh: connect to host ") || ContainsCaseInsensitive(stderr_data, "could not resolve hostname") ||
+      ContainsCaseInsensitive(stderr_data, "connection refused") || ContainsCaseInsensitive(stderr_data, "connection timed out") ||
+      ContainsCaseInsensitive(stderr_data, "network is unreachable")) return "connection-failure";
+  return nullptr;
 }
 
 bool HasUnsafeCommandText(const std::wstring& value) {
@@ -2667,6 +2776,10 @@ NativeAgentCommandRunResult RunNativeAgentCommand(SnapshotSession* snapshot, con
     RedactNativePath(&result.stdout_data, sensitive_path);
     RedactNativePath(&result.stderr_data, sensitive_path);
   }
+  if (!result.failed && !result.output_limited && result.exit_code != 0) {
+    const char* failure_code = ClassifyNativeAgentFailure(result.stderr_data);
+    if (failure_code != nullptr) result.failure_code = failure_code;
+  }
   return result;
 }
 
@@ -2675,6 +2788,9 @@ napi_value NativeAgentCommandError(napi_env env, const char* code) {
   if (strcmp(code, "timeout") == 0) message = "Windows agent command timed out";
   else if (strcmp(code, "cancelled") == 0) message = "Windows agent command cancelled";
   else if (strcmp(code, "output-limit") == 0) message = "Windows agent command output exceeded its limit";
+  else if (strcmp(code, "host-key-failure") == 0) message = "Windows agent command host verification failed";
+  else if (strcmp(code, "authentication-failure") == 0) message = "Windows agent command authentication failed";
+  else if (strcmp(code, "connection-failure") == 0) message = "Windows agent command connection failed";
   napi_value message_value{};
   napi_value error{};
   napi_value code_value{};
@@ -2734,6 +2850,7 @@ void CompleteNativeAgentCommand(napi_env env, napi_status, void* data) {
   if (job->cancellation->requested.load()) error_code = "cancelled";
   else if (job->result.timed_out) error_code = "timeout";
   else if (job->result.output_limited) error_code = "output-limit";
+  else if (!job->result.failure_code.empty()) error_code = job->result.failure_code.c_str();
   else if (!job->result.launched || job->result.failed) error_code = "windows-agent-command-unavailable";
   if (error_code != nullptr) {
     napi_value error = NativeAgentCommandError(env, error_code);
@@ -3115,6 +3232,20 @@ napi_value TestAgentCommandRequest(napi_env env, napi_callback_info info) {
   return napi_get_boolean(env, ReadNativeAgentCommandRequest(env, request, &parsed), &result) == napi_ok ? result : Unavailable(env);
 }
 
+napi_value TestClassifyAgentCommandFailure(napi_env env, napi_callback_info info) {
+  size_t count = 1;
+  napi_value input{};
+  size_t length = 0;
+  if (napi_get_cb_info(env, info, &count, &input, nullptr, nullptr) != napi_ok || count != 1 || napi_get_value_string_utf8(env, input, nullptr, 0, &length) != napi_ok || length > 4096) return Unavailable(env);
+  std::vector<char> buffer(length + 1);
+  if (napi_get_value_string_utf8(env, input, buffer.data(), buffer.size(), &length) != napi_ok) return Unavailable(env);
+  const std::string stderr_data(buffer.data(), length);
+  const char* classification = ClassifyNativeAgentFailure(stderr_data);
+  if (classification == nullptr) classification = "remote-failure";
+  napi_value result{};
+  return napi_create_string_utf8(env, classification, NAPI_AUTO_LENGTH, &result) == napi_ok ? result : Unavailable(env);
+}
+
 napi_value TestBlockDeferredReaper(napi_env env, napi_callback_info info) {
   size_t count = 0;
   if (napi_get_cb_info(env, info, &count, nullptr, nullptr, nullptr) != napi_ok || count != 0) return Unavailable(env);
@@ -3384,6 +3515,7 @@ NAPI_MODULE_INIT() {
     {"testFinalizeSnapshotCapability", nullptr, TestFinalizeSnapshotCapability, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"testReadinessDescriptor", nullptr, TestReadinessDescriptor, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"testAgentCommandRequest", nullptr, TestAgentCommandRequest, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"testClassifyAgentCommandFailure", nullptr, TestClassifyAgentCommandFailure, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"testBlockDeferredReaper", nullptr, TestBlockDeferredReaper, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"testReleaseDeferredReaper", nullptr, TestReleaseDeferredReaper, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"testWaitForMasterStarted", nullptr, TestWaitForMasterStarted, nullptr, nullptr, nullptr, napi_default, nullptr},

@@ -21,9 +21,11 @@ cannot supply any of those values.
    `ssh-mcp-approver` IPC contract: a private authenticated Unix socket on
    POSIX or a SID-protected named pipe on Windows. The production entrypoint
    reads the POSIX socket location only from the trusted local environment
-   (`SSH_MCP_APPROVER_SOCKET`), never from MCP input. Frames are versioned and
-   bound to a one-use nonce, operation ID, lease identity digest, and canonical
-   request. The current Windows native addon does not expose the required
+   (`SSH_MCP_APPROVER_SOCKET`) plus the private 32-byte installation secret
+   file (`SSH_MCP_APPROVER_SECRET_FILE`), never from MCP input. The client
+   authenticates both directions with HMAC; frames are versioned and bound to
+   a one-use nonce, operation ID, lease identity digest, and canonical request.
+   The current Windows native addon does not expose the required
    authenticated named-pipe/SID boundary, so Windows remains unavailable until
    that explicit native dependency is supplied; it is not simulated. The
    server fails closed with `approval-unavailable` when the component is absent.

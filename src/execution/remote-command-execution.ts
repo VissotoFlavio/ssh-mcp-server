@@ -17,7 +17,7 @@ export const REMOTE_COMMAND_DEFAULT_OUTPUT_LIMIT = 64 * 1024;
 export const REMOTE_COMMAND_MAX_OUTPUT_LIMIT = 1024 * 1024;
 const APPROVAL_TTL_MS = 60_000;
 const MAX_COMMAND_LENGTH = 256;
-const MAX_ARGUMENTS = 128;
+const MAX_ARGUMENTS = 64;
 const MAX_ARGUMENT_LENGTH = 4096;
 // eslint-disable-next-line no-control-regex -- reject control characters at the MCP trust boundary
 const CONTROL_CHARACTERS = /[\u0000-\u001F\u007F]/u;
@@ -148,6 +148,8 @@ export interface ExecutionAuthorizationProvider {
 export interface SudoApprovalRecord {
   readonly token: string;
   readonly request: SudoApprovalRequest;
+  readonly identity: ApprovedProfileIdentity;
+  readonly authorization?: ExecutionAuthorization;
   readonly expiresAt: number;
 }
 
@@ -350,13 +352,44 @@ function cryptoRandomToken(): string {
 
 /** In-memory, request-bound, expiring and one-shot approval capability. */
 export class SudoApprovalStore {
-  private readonly approvals = new Map<string, { readonly requestHash: string; readonly expiresAt: number; used: boolean }>();
+  private readonly approvals = new Map<
+    string,
+    {
+      readonly requestHash: string;
+      readonly request: SudoApprovalRequest;
+      readonly identity: ApprovedProfileIdentity;
+      readonly expiresAt: number;
+      readonly authorization?: ExecutionAuthorization;
+      used: boolean;
+    }
+  >();
 
-  issue(request: SudoApprovalRequest, identity: ApprovedProfileIdentity, now = Date.now()): SudoApprovalRecord {
+  issue(
+    request: SudoApprovalRequest,
+    identity: ApprovedProfileIdentity,
+    now = Date.now(),
+    authorization?: ExecutionAuthorization,
+  ): SudoApprovalRecord {
     const token = approvalToken();
     const expiresAt = now + APPROVAL_TTL_MS;
-    this.approvals.set(token, { requestHash: canonicalRequest(request, identity), expiresAt, used: false });
-    return Object.freeze({ token, request: Object.freeze({ ...request, args: Object.freeze([...request.args]) }), expiresAt });
+    const frozenRequest = Object.freeze({ ...request, args: Object.freeze([...request.args]) });
+    this.approvals.set(token, {
+      requestHash: canonicalRequest(frozenRequest, identity),
+      request: frozenRequest,
+      identity,
+      expiresAt,
+      authorization,
+      used: false,
+    });
+    const expiry = setTimeout(() => {
+      const current = this.approvals.get(token);
+      if (current?.used !== true && current?.expiresAt === expiresAt) {
+        this.approvals.delete(token);
+        void current.authorization?.release?.();
+      }
+    }, APPROVAL_TTL_MS);
+    expiry.unref?.();
+    return Object.freeze({ token, request: frozenRequest, identity, authorization, expiresAt });
   }
 
   consume(
@@ -369,12 +402,31 @@ export class SudoApprovalStore {
     if (record === undefined || record.used) return 'reused';
     if (record.expiresAt <= now) {
       this.approvals.delete(token);
+      void record.authorization?.release?.();
       return 'expired';
     }
     if (record.requestHash !== canonicalRequest(request, identity)) return 'altered';
     record.used = true;
     this.approvals.delete(token);
     return 'approved';
+  }
+
+  consumeForAuthorization(
+    token: string,
+    request: SudoApprovalRequest,
+    now = Date.now(),
+  ): { readonly status: 'approved' | 'expired' | 'altered' | 'reused'; readonly authorization?: ExecutionAuthorization } {
+    const record = this.approvals.get(token);
+    if (record === undefined || record.used) return { status: 'reused' };
+    if (record.expiresAt <= now) {
+      this.approvals.delete(token);
+      void record.authorization?.release?.();
+      return { status: 'expired' };
+    }
+    if (record.requestHash !== canonicalRequest(request, record.identity)) return { status: 'altered' };
+    record.used = true;
+    this.approvals.delete(token);
+    return { status: 'approved', authorization: record.authorization };
   }
 }
 
@@ -566,9 +618,14 @@ export class RemoteCommandExecutionProvider {
     readonly capability?: string;
     readonly token?: string;
   }> {
-    const request = parseRequest(input);
-    const startedAt = this.now();
     const operationId = cryptoRandomToken().slice(0, 32);
+    let request: RemoteCommandRequest;
+    try {
+      request = parseRequest(input);
+    } catch {
+      return { approved: false, code: 'approval-rejected', operationId };
+    }
+    const startedAt = this.now();
     const rejected = (code: 'approval-unavailable' | 'approval-rejected' | 'cancelled' = 'approval-rejected') => {
       const result = safeResult(request.profileId, code === 'cancelled' ? 'cancelled' : 'approval-required', code, { operationId });
       writeRemoteAudit(this.dependencies.auditSink, request, 'rejected', result, Math.max(0, this.now() - startedAt));
@@ -585,18 +642,35 @@ export class RemoteCommandExecutionProvider {
     if (!requiresSudo(request.command, request.args)) return rejected();
     if (this.dependencies.humanApproval === undefined) return rejected('approval-unavailable');
     let profile: ConnectionProfile | undefined;
+    let authorization: ExecutionAuthorization | undefined;
     try {
-      profile = await this.dependencies.profiles.getProfile(request.profileId, signal);
+      if (this.dependencies.authorizationProvider !== undefined) {
+        authorization = await boundedOperation(
+          (authorizationSignal) => this.dependencies.authorizationProvider!.authorize(request.profileId, authorizationSignal),
+          Math.min(APPROVAL_TTL_MS, request.timeoutMs!),
+          signal,
+        );
+        profile = authorization.profile;
+      } else {
+        profile = await this.dependencies.profiles.getProfile(request.profileId, signal);
+      }
     } catch {
+      await authorization?.release?.();
       return rejected('approval-unavailable');
     }
-    if (profile === undefined) return rejected('approval-unavailable');
-    if (signal?.aborted) return rejected('cancelled');
+    if (profile === undefined) {
+      await authorization?.release?.();
+      return rejected('approval-unavailable');
+    }
+    if (signal?.aborted) {
+      await authorization?.release?.();
+      return rejected('cancelled');
+    }
     const boundSudoRequest: SudoApprovalRequest = {
       ...sudoRequest,
       operationId,
-      approvedIdentity: profileIdentity(profile),
-      leaseIdentityDigest: identityDigest(profileIdentity(profile)),
+      approvedIdentity: authorization?.identity ?? profileIdentity(profile),
+      leaseIdentityDigest: authorization?.identityDigest ?? identityDigest(profileIdentity(profile)),
     };
     let approved = false;
     try {
@@ -608,16 +682,26 @@ export class RemoteCommandExecutionProvider {
         )) === true;
     } catch (error) {
       const approvalCode = mapTransportError(error);
-      if (signal?.aborted || approvalCode === 'cancelled') return rejected('cancelled');
-      if (approvalCode === 'timeout') return rejected('approval-unavailable');
+      if (signal?.aborted || approvalCode === 'cancelled') {
+        await authorization?.release?.();
+        return rejected('cancelled');
+      }
+      if (approvalCode === 'timeout') {
+        await authorization?.release?.();
+        return rejected('approval-unavailable');
+      }
       approved = false;
     }
-    if (!approved) return rejected('approval-rejected');
+    if (!approved) {
+      await authorization?.release?.();
+      return rejected('approval-rejected');
+    }
     const approvalResult = safeResult(request.profileId, 'success', 'success', { operationId });
     if (!writeRemoteAudit(this.dependencies.auditSink, request, 'approved', approvalResult, Math.max(0, this.now() - startedAt))) {
+      await authorization?.release?.();
       return { approved: false, code: 'approval-unavailable', operationId };
     }
-    const record = this.approvals.issue(boundSudoRequest, profileIdentity(profile), this.now());
+    const record = this.approvals.issue(boundSudoRequest, authorization?.identity ?? profileIdentity(profile), this.now(), authorization);
     const response = { approved: true, code: 'approved' as const, operationId, capability: record.token } as {
       approved: boolean;
       code: 'approved';
@@ -693,32 +777,45 @@ export class RemoteCommandExecutionProvider {
     if (signal?.aborted) return finish(safeResult(request.profileId, 'cancelled', 'cancelled', { operationId }));
     let authorization: ExecutionAuthorization | undefined;
     try {
-      authorization = await boundedOperation(
-        (validationSignal) =>
-          (
-            this.dependencies.authorizationProvider ??
-            createProfileExecutionAuthorizationProvider(this.dependencies.profiles, this.dependencies.connectionValidation, this.now)
-          ).authorize(request.profileId, validationSignal),
-        remainingTimeout(startedAt, request.timeoutMs!),
-        signal,
-      );
       if (requiresSudo(request.command, request.args)) {
         approvalState = 'blocked';
         if (request.approvalToken === undefined)
           return finish(
             safeResult(
               request.profileId,
-              'approval-required',
+              this.dependencies.humanApproval === undefined ? 'failure' : 'approval-required',
               this.dependencies.humanApproval === undefined ? 'approval-unavailable' : 'approval-required',
               { operationId },
             ),
           );
-        const consumed = this.approvals.consume(request.approvalToken, sudoRequest, authorization.identity, this.now());
-        approvalState = consumed;
-        if (consumed !== 'approved') {
-          const code = consumed === 'expired' ? 'approval-expired' : consumed === 'altered' ? 'approval-altered' : 'approval-reused';
+        const consumed = this.approvals.consumeForAuthorization(request.approvalToken, sudoRequest, this.now());
+        approvalState = consumed.status;
+        if (consumed.status !== 'approved') {
+          const code = consumed.status === 'expired' ? 'approval-expired' : consumed.status === 'altered' ? 'approval-altered' : 'approval-reused';
           return finish(safeResult(request.profileId, 'approval-required', code, { operationId }));
         }
+        authorization = consumed.authorization;
+        if (authorization === undefined) {
+          authorization = await boundedOperation(
+            (validationSignal) =>
+              (
+                this.dependencies.authorizationProvider ??
+                createProfileExecutionAuthorizationProvider(this.dependencies.profiles, this.dependencies.connectionValidation, this.now)
+              ).authorize(request.profileId, validationSignal),
+            remainingTimeout(startedAt, request.timeoutMs!),
+            signal,
+          );
+        }
+      } else {
+        authorization = await boundedOperation(
+          (validationSignal) =>
+            (
+              this.dependencies.authorizationProvider ??
+              createProfileExecutionAuthorizationProvider(this.dependencies.profiles, this.dependencies.connectionValidation, this.now)
+            ).authorize(request.profileId, validationSignal),
+          remainingTimeout(startedAt, request.timeoutMs!),
+          signal,
+        );
       }
       const consumedAuthorization = authorization.consume();
       const result = boundedTransportResult(

@@ -1,6 +1,6 @@
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { constants } from 'node:fs';
-import { lstat, open, readFile, realpath } from 'node:fs/promises';
+import { lstat, open, readFile, realpath, unlink } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 
 export type ExecutionAuditOutcome = 'success' | 'failure' | 'timeout' | 'cancelled' | 'approval-required' | 'unknown';
@@ -104,6 +104,7 @@ interface JournalLine {
 export class PosixExecutionAuditJournal implements ExecutionAuditJournal {
   private readonly now: () => number;
   private readonly journalPath: string;
+  private readonly lockPath: string;
   private queue: Promise<void> = Promise.resolve();
   private readonly sessionId = randomBytes(16).toString('hex');
   private readonly unfinished = new Map<string, string | undefined>();
@@ -114,59 +115,70 @@ export class PosixExecutionAuditJournal implements ExecutionAuditJournal {
     }
     this.now = options.now ?? Date.now;
     this.journalPath = join(options.root, JOURNAL_FILE);
+    this.lockPath = join(options.root, '.execution-audit.lock');
   }
 
   async begin(intent: ExecutionAuditIntent): Promise<ExecutionAuditHandle> {
     if (!OPERATION_ID_PATTERN.test(intent.operationId)) throw new Error('execution audit operation is invalid');
     return this.exclusive(async () => {
-      const key = await this.loadKey();
-      await this.verifyRoot();
-      let chain = await this.verifyChain(key);
-      for (const [interruptedOperationId, sessionId] of this.unfinished) {
-        if (sessionId === this.sessionId) continue;
-        const recovered = await this.append(key, chain, {
-          event: 'finished',
-          operationId: interruptedOperationId,
-          sessionId: this.sessionId,
-          outcome: 'unknown',
-          code: 'outcome-unknown',
-          exitCode: null,
-          durationMs: 0,
-        });
-        chain = recovered.hmac;
-        this.unfinished.delete(interruptedOperationId);
-      }
-      await this.append(key, chain, {
-        event: 'intent',
-        operationId: intent.operationId,
-        profileId: intent.profileId,
-        command: intent.command,
-        args: [...intent.args],
-        argsHmac: intent.argsHmac,
-        approvalState: intent.approvalState,
-        sessionId: this.sessionId,
-      });
-      this.unfinished.set(intent.operationId, this.sessionId);
-      let finished = false;
-      return {
-        operationId: intent.operationId,
-        finish: async (finishedEvent: ExecutionAuditFinished) => {
-          if (finished) return;
-          await this.exclusive(async () => {
-            if (finished) return;
-            finished = true;
-            const currentKey = await this.loadKey();
-            const currentPreviousHmac = await this.verifyChain(currentKey);
-            await this.append(currentKey, currentPreviousHmac, {
-              event: 'finished',
-              operationId: intent.operationId,
-              sessionId: this.sessionId,
-              ...finishedEvent,
-            });
-            this.unfinished.delete(intent.operationId);
+      const lock = await this.acquireLock();
+      try {
+        const key = await this.loadKey();
+        await this.verifyRoot();
+        let chain = await this.verifyChain(key);
+        for (const [interruptedOperationId, sessionId] of this.unfinished) {
+          if (sessionId === this.sessionId) continue;
+          const recovered = await this.append(key, chain, {
+            event: 'finished',
+            operationId: interruptedOperationId,
+            sessionId: this.sessionId,
+            outcome: 'unknown',
+            code: 'outcome-unknown',
+            exitCode: null,
+            durationMs: 0,
           });
-        },
-      };
+          chain = recovered.hmac;
+          this.unfinished.delete(interruptedOperationId);
+        }
+        await this.append(key, chain, {
+          event: 'intent',
+          operationId: intent.operationId,
+          profileId: intent.profileId,
+          command: intent.command,
+          args: [...intent.args],
+          argsHmac: intent.argsHmac,
+          approvalState: intent.approvalState,
+          sessionId: this.sessionId,
+        });
+        this.unfinished.set(intent.operationId, this.sessionId);
+        let finished = false;
+        return {
+          operationId: intent.operationId,
+          finish: async (finishedEvent: ExecutionAuditFinished) => {
+            if (finished) return;
+            await this.exclusive(async () => {
+              if (finished) return;
+              const finishLock = await this.acquireLock();
+              try {
+                finished = true;
+                const currentKey = await this.loadKey();
+                const currentPreviousHmac = await this.verifyChain(currentKey);
+                await this.append(currentKey, currentPreviousHmac, {
+                  event: 'finished',
+                  operationId: intent.operationId,
+                  sessionId: this.sessionId,
+                  ...finishedEvent,
+                });
+                this.unfinished.delete(intent.operationId);
+              } finally {
+                await finishLock();
+              }
+            });
+          },
+        };
+      } finally {
+        await lock();
+      }
     });
   }
 
@@ -188,6 +200,29 @@ export class PosixExecutionAuditJournal implements ExecutionAuditJournal {
       return await work();
     } finally {
       release();
+    }
+  }
+
+  private async acquireLock(): Promise<() => Promise<void>> {
+    await this.verifyRoot();
+    const deadline = Date.now() + 5_000;
+    while (true) {
+      try {
+        const handle = await open(this.lockPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, PRIVATE_FILE_MODE);
+        await handle.close();
+        return async () => {
+          try {
+            await unlink(this.lockPath);
+          } catch (error: unknown) {
+            if ((error as { code?: unknown }).code !== 'ENOENT') throw new Error('execution audit lock is unavailable');
+          }
+        };
+      } catch (error: unknown) {
+        if ((error as { code?: unknown }).code !== 'EEXIST' || Date.now() >= deadline) {
+          throw new Error('execution audit lock is unavailable');
+        }
+        await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      }
     }
   }
 

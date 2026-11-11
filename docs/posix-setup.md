@@ -121,10 +121,20 @@ every time it starts:
 codex mcp add ssh-mcp-server \
   --env SSH_MCP_STATE_ROOT=/absolute/path/to/ssh-mcp-state \
   --env SSH_MCP_KNOWN_HOSTS_ROOT=/absolute/path/to/ssh-mcp-known-hosts \
+  --env SSH_MCP_AUDIT_ROOT=/absolute/path/to/ssh-mcp-audit \
+  --env SSH_MCP_AUDIT_KEY_FILE=/absolute/path/to/ssh-mcp-audit-key \
+  --env SSH_MCP_APPROVER_SOCKET=/absolute/path/to/ssh-mcp-approver.sock \
+  --env SSH_MCP_APPROVER_SECRET_FILE=/absolute/path/to/ssh-mcp-approver.secret \
   -- /absolute/path/to/node /absolute/path/to/ssh-mcp-server/dist/server.js
 
 codex mcp list
 ```
+
+Create the audit key and approver secret out of band as the operator. Keep
+both files owner-only (`0600`); the audit key contains `v1:` followed by 64
+lowercase hexadecimal characters, and the approver secret is exactly 32 random
+bytes shared only with the separate `ssh-mcp-approver` component. The server
+never generates either secret during execution.
 
 Restart Codex if its client requires it, then first call
 `list_approved_profiles` with `{}`. Call `validate_connection` only with a

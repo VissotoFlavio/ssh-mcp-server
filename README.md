@@ -184,6 +184,11 @@ fingerprint before writing, and explains the conditional `agent-key` and
 than substituting environment variables, shared locations, `PATH`, WSL, or
 administrator execution.
 
+Before the first Windows remote command, initialize the protected audit key
+with `npm run windows:audit:init`; rotate it only with
+`npm run windows:audit:rotate`. See
+[the Windows audit journal procedure](docs/windows-execution-audit-journal.md).
+
 ## Register with a Codex MCP client
 
 Build first, then register the stdio server with absolute, operator-approved

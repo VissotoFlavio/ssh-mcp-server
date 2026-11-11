@@ -383,7 +383,7 @@ function registerTools(
                 properties: {
                   profileId: { type: 'string', pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$' },
                   command: { type: 'string', minLength: 1, maxLength: 256 },
-                  args: { type: 'array', items: { type: 'string', maxLength: 4096 }, maxItems: 128 },
+                  args: { type: 'array', items: { type: 'string', maxLength: 4096 }, maxItems: 64 },
                   timeoutMs: { type: 'integer', minimum: 1, maximum: 60000 },
                   maxOutputBytes: { type: 'integer', minimum: 1, maximum: 1048576 },
                   approvalToken: { type: 'string', maxLength: 256 },
@@ -401,7 +401,7 @@ function registerTools(
                 properties: {
                   profileId: { type: 'string', pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$' },
                   command: { type: 'string', minLength: 1, maxLength: 256 },
-                  args: { type: 'array', items: { type: 'string', maxLength: 4096 }, maxItems: 128 },
+                  args: { type: 'array', items: { type: 'string', maxLength: 4096 }, maxItems: 64 },
                   timeoutMs: { type: 'integer', minimum: 1, maximum: 60000 },
                   maxOutputBytes: { type: 'integer', minimum: 1, maximum: 1048576 },
                 },

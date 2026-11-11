@@ -1,4 +1,9 @@
 import assert from 'node:assert/strict';
+import { createHmac, randomBytes } from 'node:crypto';
+import { promises as fs } from 'node:fs';
+import { createServer } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 
 import {
@@ -27,6 +32,40 @@ function validResponse(request: HumanApproverIpcRequest, approved = true): Human
     requestDigest: request.requestDigest,
     approved,
   };
+}
+
+function encodeFrame(value: unknown): Buffer {
+  const payload = Buffer.from(JSON.stringify(value), 'utf8');
+  const frame = Buffer.alloc(4 + payload.length);
+  frame.writeUInt32BE(payload.length, 0);
+  payload.copy(frame, 4);
+  return frame;
+}
+
+function requestMac(request: HumanApproverIpcRequest, secret: Buffer): string {
+  const fields = [
+    request.version,
+    request.type,
+    request.nonce,
+    request.requestDigest,
+    request.operationId,
+    request.leaseIdentityDigest,
+    request.request.profileId,
+    request.request.command,
+    request.request.args,
+    request.request.timeoutMs,
+    request.request.maxOutputBytes,
+  ];
+  return createHmac('sha256', secret)
+    .update(`ssh-mcp-approver/request/v1\0${JSON.stringify(fields)}`)
+    .digest('hex');
+}
+
+function responseMac(response: HumanApproverIpcResponse, secret: Buffer): string {
+  const fields = [response.version, response.type, response.nonce, response.requestDigest, response.approved];
+  return createHmac('sha256', secret)
+    .update(`ssh-mcp-approver/response/v1\0${JSON.stringify(fields)}`)
+    .digest('hex');
 }
 
 test('IPC approval carries operation and immutable identity internally', async () => {
@@ -161,4 +200,48 @@ test('IPC accepts a bound injected success without exposing identity details', a
 
 test('production factory is unavailable on Windows without the authenticated native boundary', async () => {
   assert.equal(createLocalHumanSudoApprovalProvider('win32', {}), undefined);
+});
+
+test('POSIX IPC authenticates a fragmented response from a private Unix socket', { skip: process.platform === 'win32' }, async () => {
+  const root = await fs.mkdtemp(join(tmpdir(), 'ssh-mcp-approver-'));
+  const socketPath = join(root, 'approver.sock');
+  const secretFile = join(root, 'approver.secret');
+  const secret = randomBytes(32);
+  await fs.writeFile(secretFile, secret, { mode: 0o600 });
+  await fs.chmod(secretFile, 0o600);
+  let received: Record<string, unknown> | undefined;
+  const server = createServer((socket) => {
+    let data = Buffer.alloc(0);
+    socket.on('data', (chunk) => {
+      data = Buffer.concat([data, chunk]);
+      if (data.length < 4) return;
+      const length = data.readUInt32BE(0);
+      if (data.length !== length + 4) return;
+      received = JSON.parse(data.subarray(4).toString('utf8')) as Record<string, unknown>;
+      assert.equal(received.requestMac, requestMac(received as unknown as HumanApproverIpcRequest, secret));
+      const response: HumanApproverIpcResponse = {
+        version: 1,
+        type: 'approval-response',
+        nonce: received.nonce as string,
+        requestDigest: received.requestDigest as string,
+        approved: true,
+      };
+      const frame = encodeFrame({ ...response, responseMac: responseMac(response, secret) });
+      socket.write(frame.subarray(0, 3));
+      setTimeout(() => socket.end(frame.subarray(3)), 5);
+    });
+  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(socketPath, resolve);
+    });
+    await fs.chmod(socketPath, 0o600);
+    const provider = new IpcHumanSudoApprovalProvider(new UnixSocketHumanApproverChannel(socketPath, secretFile, 5000), 'posix');
+    assert.equal(await provider.approve(baseRequest), true);
+    assert.equal(received?.requestMac, requestMac(received as unknown as HumanApproverIpcRequest, secret));
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => (error === undefined ? resolve() : reject(error))));
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });

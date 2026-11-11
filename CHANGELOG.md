@@ -7,6 +7,16 @@ publish a release.
 
 ### Added
 
+- Added the native Windows execution-audit provider with Credential Manager
+  HMAC keys, explicit operator initialization/rotation, session-aware recovery,
+  durable rotation events, bounded mutex acquisition, stable SSH failure codes,
+  and key-buffer cleanup.
+- Added authenticated POSIX `ssh-mcp-approver` framing with an owner-only
+  installation secret, request/response HMACs, fragmented-frame coverage, and
+  cross-process audit-journal locking.
+- Bound sudo approval tokens to the validated execution authorization lease and
+  report missing approval infrastructure as `failure` with
+  `approval-unavailable` before transport.
 - Added the separate POSIX `ExecutionAuditJournal` with explicit versioned
   256-bit HMAC key handling, durable intent/finished JSONL events, chained
   integrity checks, and fail-closed behavior for missing, rotated, or invalid

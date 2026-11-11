@@ -28,6 +28,7 @@ const testOnlyHookNames = [
   'testFinalizeSnapshotCapability',
   'testReadinessDescriptor',
   'testAgentCommandRequest',
+  'testClassifyAgentCommandFailure',
   'testBlockDeferredReaper',
   'testReleaseDeferredReaper',
   'testWaitForMasterStarted',
@@ -156,6 +157,10 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
     testFinalizeSnapshotCapability(capability: object): void;
     testReadinessDescriptor(descriptor: unknown): boolean;
     testAgentCommandRequest(request: unknown): boolean;
+    testClassifyAgentCommandFailure(stderr: string): string;
+    digestExecutionAuditArguments(args: readonly string[]): string;
+    appendExecutionAuditIntent(intent: object): { keyId: string; previousEventHmac: string | null; eventHmac: string };
+    appendExecutionAuditFinished(event: object): { keyId: string; previousEventHmac: string | null; eventHmac: string };
     testBlockDeferredReaper(): void;
     testReleaseDeferredReaper(): void;
     testWaitForMasterStarted(timeoutMs: number): boolean;
@@ -194,6 +199,16 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
     assert.equal(testBinding.testAgentCommandRequest({ ...valid, args: ['-c'] }), false);
     assert.equal(testBinding.testAgentCommandRequest({ ...valid, args: ['echo;whoami'] }), false);
     assert.equal(testBinding.testAgentCommandRequest({ ...valid, extra: 'rejected' }), false);
+  });
+
+  test('classifies only stable OpenSSH diagnostics and preserves remote failures', () => {
+    assert.equal(testBinding.testClassifyAgentCommandFailure('Host key verification failed.'), 'host-key-failure');
+    assert.equal(testBinding.testClassifyAgentCommandFailure('ssh: Permission denied (publickey).'), 'authentication-failure');
+    assert.equal(
+      testBinding.testClassifyAgentCommandFailure('ssh: connect to host api.internal.example port 22: Connection refused'),
+      'connection-failure',
+    );
+    assert.equal(testBinding.testClassifyAgentCommandFailure('remote command stderr: Permission denied'), 'remote-failure');
   });
 
   test('accepts only an isolated private per-user configuration and verified Windows OpenSSH', () => {
@@ -278,6 +293,8 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
       assert.match(beforeRotation, /"keyId":"[0-9a-f]{32}"/u);
       assert.doesNotMatch(beforeRotation, /secret|stdout|stderr/u);
       binding.rotateExecutionAuditKey();
+      const afterRotation = readFileSync(join(root, 'state', 'execution-audit.v1.jsonl'), 'utf8');
+      assert.match(afterRotation, /"event":"rotation"/u);
       const second = binding.appendExecutionAuditIntent({ ...intent, operationId: 'fedcba9876543210fedcba9876543210' });
       assert.notEqual(second.keyId, first.keyId);
       assert.equal(second.previousEventHmac, finished.eventHmac);
@@ -287,6 +304,66 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
         code: 'outcome-unknown',
         exitCode: null,
         durationMs: 0,
+      });
+    } finally {
+      if (configured) runFixture('cleanup', root);
+    }
+  });
+
+  test('recovers only intents from an earlier native session', () => {
+    const root = uniqueRoot('execution-audit-session');
+    let configured = false;
+    try {
+      runFixture('safe', root);
+      configured = true;
+      binding.initializeExecutionAuditKey();
+      const makeIntent = (operationId: string, args: string[]) => ({
+        operationId,
+        profileId: 'production-api',
+        command: 'systemctl',
+        args,
+        argsHmac: binding.digestExecutionAuditArguments(args),
+        approvalState: 'not-required',
+      });
+      binding.appendExecutionAuditIntent(makeIntent('0123456789abcdef0123456789abcdef', ['status', 'ssh']));
+      binding.appendExecutionAuditIntent(makeIntent('fedcba9876543210fedcba9876543210', ['status', 'cron']));
+      let lines = readFileSync(join(root, 'state', 'execution-audit.v1.jsonl'), 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      assert.equal(lines.filter((line) => line.outcome === 'unknown').length, 0);
+      binding.appendExecutionAuditFinished({
+        operationId: '0123456789abcdef0123456789abcdef',
+        outcome: 'success',
+        code: 'success',
+        exitCode: 0,
+        durationMs: 1,
+      });
+      binding.appendExecutionAuditFinished({
+        operationId: 'fedcba9876543210fedcba9876543210',
+        outcome: 'success',
+        code: 'success',
+        exitCode: 0,
+        durationMs: 1,
+      });
+
+      const interrupted = makeIntent('abcdefabcdefabcdefabcdefabcdefab', ['status', 'sshd']);
+      interrupted.argsHmac = testBinding.digestExecutionAuditArguments(interrupted.args);
+      testBinding.appendExecutionAuditIntent(interrupted);
+      binding.appendExecutionAuditIntent(makeIntent('a1b2c3d4e5f60123456789abcdef0123', ['status', 'systemd']));
+      lines = readFileSync(join(root, 'state', 'execution-audit.v1.jsonl'), 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      const recovered = lines.find((line) => line.operationId === interrupted.operationId && line.event === 'finished');
+      assert.equal(recovered?.outcome, 'unknown');
+      assert.equal(new Set(lines.filter((line) => line.event === 'intent').map((line) => line.sessionId)).size, 2);
+      binding.appendExecutionAuditFinished({
+        operationId: 'a1b2c3d4e5f60123456789abcdef0123',
+        outcome: 'success',
+        code: 'success',
+        exitCode: 0,
+        durationMs: 1,
       });
     } finally {
       if (configured) runFixture('cleanup', root);
