@@ -6,6 +6,7 @@ import type { Client, ClientChannel } from 'ssh2';
 
 import {
   RemoteCommandExecutionProvider,
+  RemoteCommandConcurrencyLimiter,
   RemoteExecutionError,
   Ssh2RemoteCommandTransport,
   SudoApprovalStore,
@@ -46,7 +47,14 @@ class FakeTransport implements RemoteCommandTransport {
 
 function createProvider(
   transport = new FakeTransport(),
-  options: { now?: () => number; audit?: string[]; approvals?: SudoApprovalStore; humanApproval?: boolean; authorizationError?: unknown } = {},
+  options: {
+    now?: () => number;
+    audit?: string[];
+    approvals?: SudoApprovalStore;
+    humanApproval?: boolean;
+    authorizationError?: unknown;
+    concurrency?: RemoteCommandConcurrencyLimiter;
+  } = {},
 ) {
   return {
     provider: new RemoteCommandExecutionProvider({
@@ -62,6 +70,7 @@ function createProvider(
       sudoApprovals: options.approvals,
       humanApproval: options.humanApproval === false ? undefined : { approve: async () => true },
       auditSink: options.audit === undefined ? undefined : (event) => options.audit!.push(event),
+      concurrency: options.concurrency,
       now: options.now,
     }),
     transport,
@@ -327,7 +336,7 @@ test('reports unknown outcome when cancellation occurs after command handoff', a
   assert.equal(result.exitCode, null);
 });
 
-test('rejects shell interpreters and control syntax but leaves remote wrappers to the target', async () => {
+test('rejects shell interpreters, remote wrappers, and control syntax', async () => {
   const { provider, transport } = createProvider();
   for (const request of [
     { ...command, command: 'sh', args: ['-c', 'sudo id'] },
@@ -340,12 +349,24 @@ test('rejects shell interpreters and control syntax but leaves remote wrappers t
     { ...command, command: 'bash', args: ['-c', 'id'] },
   ]) {
     const result = await provider.execute(request);
-    assert.equal(
-      result.code,
-      ['nohup', 'env'].includes(request.command) || request.command.includes('sudoedit') ? 'approval-required' : 'invalid-input',
-    );
+    assert.equal(result.code, request.command.includes('sudoedit') ? 'approval-required' : 'invalid-input');
   }
   assert.equal(transport.calls.length, 0);
+});
+
+test('rejects new remote work when the process concurrency limit is full', async () => {
+  const limiter = new RemoteCommandConcurrencyLimiter(1);
+  const firstTransport = new FakeTransport();
+  firstTransport.never = true;
+  const { provider } = createProvider(firstTransport, { concurrency: limiter });
+  const firstController = new AbortController();
+  const first = provider.execute(command, firstController.signal);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const limited = await provider.execute(command);
+  assert.equal(limited.code, 'execution-limit');
+  assert.equal(firstTransport.calls.length, 1);
+  firstController.abort();
+  await first.catch(() => undefined);
 });
 
 test('redacts separated flags, headers, URL credentials, and shell assignments in audit records', () => {

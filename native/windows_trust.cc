@@ -948,7 +948,7 @@ std::wstring PosixShellQuote(const std::wstring& value) {
 bool IsSafeReadinessHost(const std::wstring& host) {
   if (host.empty() || host.size() > 253 || host.front() == L'-' || host.back() == L'.') return false;
   for (wchar_t character : host) {
-    if (!((character >= L'a' && character <= L'z') || (character >= L'A' && character <= L'Z') || (character >= L'0' && character <= L'9') || character == L'.' || character == L'-' || character == L':' || character == L'%')) return false;
+    if (!((character >= L'a' && character <= L'z') || (character >= L'A' && character <= L'Z') || (character >= L'0' && character <= L'9') || character == L'.' || character == L'-')) return false;
   }
   return true;
 }
@@ -997,10 +997,11 @@ bool ReadReadinessDescriptor(napi_env env, napi_value descriptor, std::wstring* 
   return true;
 }
 
-bool StopMaster(Handle* master, const std::wstring& ssh, const std::wstring& control_path, const std::wstring& destination, DWORD timeout, const std::atomic<bool>* cancelled = nullptr, Handle* unreaped = nullptr) {
+bool StopMaster(Handle* master, const std::wstring& ssh, const std::wstring& control_path, const std::wstring& host, const std::wstring& user, DWORD timeout,
+                const std::atomic<bool>* cancelled = nullptr, Handle* unreaped = nullptr) {
   const ULONGLONG deadline = GetTickCount64() + timeout;
   DWORD ignored = 1;
-  const std::vector<std::wstring> exit_arguments = {L"-F", L"none", L"-S", control_path, L"-O", L"exit", L"--", destination};
+  const std::vector<std::wstring> exit_arguments = {L"-F", L"none", L"-S", control_path, L"-O", L"exit", L"-l", user, host};
   if (timeout > 0) LaunchHiddenProcess(ssh, FixedCommandLine(ssh, exit_arguments), timeout, &ignored, cancelled);
   DWORD wait = WAIT_TIMEOUT;
   while (GetTickCount64() < deadline && (cancelled == nullptr || !cancelled->load())) {
@@ -1035,16 +1036,15 @@ NativeReadinessResult ValidateAgentKeyReadiness(SnapshotSession* snapshot, const
   Handle ssh_handle;
   if ((cancelled != nullptr && cancelled->load()) || !snapshot->ReadyKnownHostsPath(&known_hosts, &snapshot_directory) || !TrustedOpenSsh(&ssh, &ssh_add, &version, &system_handle, &openssh_handle, &ssh_add_handle, &ssh_handle)) return result;
   const std::wstring control_path = snapshot_directory + L"\\control";
-  const std::wstring destination = user + L"@" + host;
   const std::vector<std::wstring> master_arguments = {
       L"-F", L"none", L"-N", L"-T", L"-n", L"-M", L"-S", control_path,
       L"-o", L"ControlPersist=no", L"-o", L"CanonicalizeHostname=no", L"-o", L"ProxyCommand=none", L"-o", L"ProxyJump=none",
-      L"-o", L"HostName=" + host, L"-o", L"BatchMode=yes", L"-o", L"StrictHostKeyChecking=yes", L"-o", L"UserKnownHostsFile=" + known_hosts,
+      L"-o", L"BatchMode=yes", L"-o", L"StrictHostKeyChecking=yes", L"-o", L"UserKnownHostsFile=" + known_hosts,
       L"-o", L"GlobalKnownHostsFile=NUL", L"-o", L"PasswordAuthentication=no", L"-o", L"KbdInteractiveAuthentication=no",
       // The approved key is deliberately held only by the current-user agent;
       // no private-key path is available to this native boundary. Restricting
       // identities here would therefore suppress that agent identity.
-      L"-o", L"NumberOfPasswordPrompts=0", L"-o", L"IdentitiesOnly=no", L"-p", std::to_wstring(port), L"--", destination};
+      L"-o", L"NumberOfPasswordPrompts=0", L"-o", L"IdentitiesOnly=no", L"-p", std::to_wstring(port), L"-l", user, host};
   Handle master;
   if (!StartHiddenProcess(ssh, FixedCommandLine(ssh, master_arguments), &master)) return result;
   const ULONGLONG started = GetTickCount64();
@@ -1054,7 +1054,7 @@ NativeReadinessResult ValidateAgentKeyReadiness(SnapshotSession* snapshot, const
     if (!GetExitCodeProcess(master.get(), &master_exit) || master_exit != STILL_ACTIVE) break;
     const DWORD remaining = static_cast<DWORD>(timeout - (GetTickCount64() - started));
     DWORD check_exit = 1;
-    const std::vector<std::wstring> check_arguments = {L"-F", L"none", L"-S", control_path, L"-O", L"check", L"--", destination};
+    const std::vector<std::wstring> check_arguments = {L"-F", L"none", L"-S", control_path, L"-O", L"check", L"-l", user, host};
     if (LaunchHiddenProcess(ssh, FixedCommandLine(ssh, check_arguments), std::max<DWORD>(1, std::min<DWORD>(remaining, 250)), &check_exit, cancelled) == LaunchResult::kCompleted && check_exit == 0) {
       ready = true;
       break;
@@ -1062,7 +1062,7 @@ NativeReadinessResult ValidateAgentKeyReadiness(SnapshotSession* snapshot, const
   }
   const ULONGLONG elapsed = GetTickCount64() - started;
   const DWORD cleanup = elapsed < timeout ? static_cast<DWORD>(timeout - elapsed) : 0;
-  result.ready = StopMaster(&master, ssh, control_path, destination, cleanup, cancelled, &result.unreaped_master) && ready && (cancelled == nullptr || !cancelled->load());
+  result.ready = StopMaster(&master, ssh, control_path, host, user, cleanup, cancelled, &result.unreaped_master) && ready && (cancelled == nullptr || !cancelled->load());
   return result;
 }
 
@@ -2901,10 +2901,10 @@ NativeAgentCommandRunResult RunNativeAgentCommand(SnapshotSession* snapshot, con
   }
   const std::vector<std::wstring> arguments = {
       L"-F", L"none", L"-T", L"-n", L"-o", L"CanonicalizeHostname=no", L"-o", L"ProxyCommand=none", L"-o", L"ProxyJump=none",
-      L"-o", L"HostName=" + request.host, L"-o", L"BatchMode=yes", L"-o", L"StrictHostKeyChecking=yes", L"-o", L"UserKnownHostsFile=" + known_hosts_short,
+      L"-o", L"BatchMode=yes", L"-o", L"StrictHostKeyChecking=yes", L"-o", L"UserKnownHostsFile=" + known_hosts_short,
       L"-o", L"GlobalKnownHostsFile=NUL", L"-o", L"PasswordAuthentication=no", L"-o", L"KbdInteractiveAuthentication=no",
       L"-o", L"NumberOfPasswordPrompts=0", L"-o", L"IdentityFile=" + identity_file, L"-o", L"IdentitiesOnly=yes", L"-p", std::to_wstring(request.port),
-      L"--", request.user + L"@" + request.host};
+      L"-l", request.user, request.host};
   std::vector<std::wstring> fixed_arguments = arguments;
   std::wstring remote_command = PosixShellQuote(request.command);
   for (const std::wstring& argument : request.arguments) remote_command.append(L" ").append(PosixShellQuote(argument));

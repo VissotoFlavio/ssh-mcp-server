@@ -16,6 +16,7 @@ export const REMOTE_COMMAND_DEFAULT_TIMEOUT_MS = 30_000;
 export const REMOTE_COMMAND_MAX_TIMEOUT_MS = 60_000;
 export const REMOTE_COMMAND_DEFAULT_OUTPUT_LIMIT = 64 * 1024;
 export const REMOTE_COMMAND_MAX_OUTPUT_LIMIT = 1024 * 1024;
+export const REMOTE_COMMAND_MAX_CONCURRENCY = 4;
 const APPROVAL_TTL_MS = 60_000;
 const MAX_COMMAND_LENGTH = 256;
 const MAX_ARGUMENTS = 64;
@@ -45,6 +46,15 @@ const REJECTED_EXECUTABLES = new Set([
   'perl',
   'ruby',
   'node',
+  'env',
+  'nohup',
+  'setsid',
+  'daemonize',
+  'xargs',
+  'parallel',
+  'find',
+  'timeout',
+  'watch',
 ]);
 const REJECTED_SHELL_FLAGS = new Set(['-c', '-ccommand', '--command', '-command', '-encodedcommand', '--eval', '-e', '/c', '/k']);
 const SHELL_METACHARACTERS = /[;&|<>`$(){}]/u;
@@ -67,6 +77,7 @@ export type RemoteExecutionCode =
   | 'approval-unavailable'
   | 'approval-busy'
   | 'approval-rejected'
+  | 'execution-limit'
   | 'execution-audit-unavailable'
   | 'outcome-unknown'
   | 'invalid-input'
@@ -447,7 +458,28 @@ export interface RemoteCommandExecutionDependencies {
   readonly auditSink?: (serializedEvent: string) => void;
   readonly auditJournal?: ExecutionAuditJournal;
   readonly authorizationProvider?: ExecutionAuthorizationProvider;
+  readonly concurrency?: RemoteCommandConcurrencyLimiter;
   readonly now?: () => number;
+}
+
+/** Limits in-process remote work before any profile authorization or SSH launch. */
+export class RemoteCommandConcurrencyLimiter {
+  private active = 0;
+
+  constructor(private readonly limit = REMOTE_COMMAND_MAX_CONCURRENCY) {
+    if (!Number.isSafeInteger(limit) || limit < 1) throw new RangeError('Remote command concurrency limit must be positive');
+  }
+
+  tryAcquire(): (() => void) | undefined {
+    if (this.active >= this.limit) return undefined;
+    this.active += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.active -= 1;
+    };
+  }
 }
 
 function safeResult(
@@ -629,10 +661,12 @@ function auditedResult(
 
 export class RemoteCommandExecutionProvider {
   private readonly approvals: SudoApprovalStore;
+  private readonly concurrency: RemoteCommandConcurrencyLimiter;
   private readonly now: () => number;
 
   constructor(private readonly dependencies: RemoteCommandExecutionDependencies) {
     this.approvals = dependencies.sudoApprovals ?? new SudoApprovalStore();
+    this.concurrency = dependencies.concurrency ?? new RemoteCommandConcurrencyLimiter();
     this.now = dependencies.now ?? Date.now;
   }
 
@@ -876,10 +910,13 @@ export class RemoteCommandExecutionProvider {
       }
     }
 
-    if (signal?.aborted) return finish(safeResult(request.profileId, 'cancelled', 'cancelled', { operationId }));
+    const releaseConcurrency = this.concurrency.tryAcquire();
+    if (releaseConcurrency === undefined) return finish(safeResult(request.profileId, 'failure', 'execution-limit', { operationId }));
+
     let authorization: ExecutionAuthorization | undefined;
     let commandStarted = false;
     try {
+      if (signal?.aborted) return finish(safeResult(request.profileId, 'cancelled', 'cancelled', { operationId }));
       if (requiresSudo(request.command, request.args)) {
         approvalState = 'blocked';
         if (request.approvalToken === undefined)
@@ -965,6 +1002,7 @@ export class RemoteCommandExecutionProvider {
       } catch {
         // A failed capability release is fail-closed at the journal boundary.
       }
+      releaseConcurrency();
     }
   }
 }
@@ -1222,6 +1260,7 @@ export function serializeRemoteAuditEvent(input: unknown): string {
     'approval-unavailable',
     'approval-busy',
     'approval-rejected',
+    'execution-limit',
     'execution-audit-unavailable',
     'outcome-unknown',
     'invalid-input',
