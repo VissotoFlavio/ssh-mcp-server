@@ -59,6 +59,7 @@ export function createWindowsRuntimeProviders(
         | 'withKnownHostsSnapshot'
         | 'captureKnownHostsSnapshot'
         | 'disposeKnownHostsSnapshot'
+        | 'executionAuditJournal'
       > & {
         readonly executionAuditJournal?: ExecutionAuditJournal;
         readonly executeNativeAgentCommand?: WindowsSecureStorage['executeNativeAgentCommand'];

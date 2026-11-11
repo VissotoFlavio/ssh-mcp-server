@@ -18,10 +18,15 @@ cannot supply any of those values.
    confirm the exact request. The MCP caller cannot provide an approval
    boolean. Use the returned opaque one-time capability only with the
    unchanged request. The supported local integration is the typed
-   `ssh-mcp-approver` IPC contract: an authenticated Unix socket on POSIX or a
-   SID-protected named pipe on Windows. This repository currently provides only
-   the typed boundary; hosts must inject a real authenticated approver. The
-   server fails closed with `approval-unavailable` when it is absent.
+   `ssh-mcp-approver` IPC contract: a private authenticated Unix socket on
+   POSIX or a SID-protected named pipe on Windows. The production entrypoint
+   reads the POSIX socket location only from the trusted local environment
+   (`SSH_MCP_APPROVER_SOCKET`), never from MCP input. Frames are versioned and
+   bound to a one-use nonce, operation ID, lease identity digest, and canonical
+   request. The current Windows native addon does not expose the required
+   authenticated named-pipe/SID boundary, so Windows remains unavailable until
+   that explicit native dependency is supplied; it is not simulated. The
+   server fails closed with `approval-unavailable` when the component is absent.
 5. Inspect the redacted local audit stream on standard error when diagnosing a
    result. It contains the bounded command/arguments, profile, approval state,
    duration, exit status, outcome, and stable code, but never stdout/stderr,
@@ -81,3 +86,10 @@ either native boundary is unavailable; they never fall back to an ambient ssh2
 agent. No password, private key,
 executable path, or known-hosts path is accepted from MCP input or written to
 audit.
+
+Windows execution audit setup is separate from profile provisioning: an
+operator must explicitly initialize the protected native journal key before
+the first remote command. Rotation is an explicit native operation and is
+never performed by the execution path. See
+[`windows-execution-audit-journal.md`](windows-execution-audit-journal.md) for
+the protected files, chain fields, durability guarantees, and recovery rule.

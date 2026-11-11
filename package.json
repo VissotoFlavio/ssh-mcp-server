@@ -8,7 +8,8 @@
     "README.md",
     "CHANGELOG.md",
     "docs",
-    "skills"
+    "skills",
+    "scripts"
   ],
   "description": "Secure MCP server for approved SSH profile discovery, validation, and bounded remote command execution without agent-supplied credentials.",
   "type": "module",
@@ -25,6 +26,8 @@
     "format": "prettier --write --ignore-path .gitignore .",
     "format:check": "prettier --check --ignore-path .gitignore .",
     "start": "node dist/server.js",
+    "windows:audit:init": "node scripts/windows-audit-journal.mjs init",
+    "windows:audit:rotate": "node scripts/windows-audit-journal.mjs rotate",
     "test": "tsx --test \"test/unit/**/*.test.ts\"",
     "test:integration": "node -e \"if (process.env.SSH_INTEGRATION_TEST !== 'true') throw new Error('Set SSH_INTEGRATION_TEST=true to run integration tests.');\" && tsx --test \"test/integration/**/*.test.ts\""
   },

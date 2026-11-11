@@ -7,6 +7,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 
 import { serializeAuditEvent } from './diagnostics/redacted-diagnostics-audit.js';
+import { createLocalHumanSudoApprovalProvider } from './execution/human-approver-ipc.js';
 import {
   remoteCommandToolName,
   requestSudoApprovalToolName,
@@ -666,7 +667,9 @@ export function createProductionRuntimeProviders(
 
 if (isEntrypoint) {
   const runProductionServer = async (): Promise<void> => {
-    await runStdioServer(createProductionRuntimeProviders());
+    const localApprover = createLocalHumanSudoApprovalProvider();
+    const runtime = createProductionRuntimeProviders();
+    await runStdioServer(localApprover === undefined ? runtime : { ...runtime, humanSudoApprovalProvider: localApprover });
   };
 
   runProductionServer().catch((error: unknown) => {

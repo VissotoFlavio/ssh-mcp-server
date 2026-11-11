@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <cwctype>
 #include <vector>
@@ -32,6 +33,7 @@ constexpr wchar_t kConfigurationKey[] = L"Software\\Vissoto\\ssh-mcp-server";
 constexpr wchar_t kStateFile[] = L"connection-profiles.json";
 constexpr DWORD kMaxFileBytes = 1024 * 1024;
 constexpr wchar_t kCredentialTargetPrefix[] = L"Vissoto/ssh-mcp-server/";
+constexpr wchar_t kExecutionAuditCredentialPrefix[] = L"execution-audit/";
 
 #ifdef SSH_MCP_NATIVE_TEST
 PSID g_test_system_owner = nullptr;
@@ -1246,11 +1248,617 @@ std::string JsonString(const std::string& value) {
   return result + "\"";
 }
 
+constexpr wchar_t kExecutionAuditActiveLeaf[] = L"execution-audit.active";
+constexpr wchar_t kExecutionAuditJournalLeaf[] = L"execution-audit.v1.jsonl";
+constexpr size_t kExecutionAuditKeyBytes = 32;
+constexpr size_t kExecutionAuditKeyIdBytes = 16;
+constexpr size_t kExecutionAuditMaxArgs = 64;
+constexpr size_t kExecutionAuditMaxString = 4096;
+
+bool IsCanonicalProfileId(const std::string& value);
+
+bool IsLowerHex(const std::string& value, size_t expected) {
+  if (value.size() != expected) return false;
+  for (const char character : value) {
+    if (!((character >= '0' && character <= '9') || (character >= 'a' && character <= 'f'))) return false;
+  }
+  return true;
+}
+
+std::string HexBytes(const BYTE* bytes, size_t length) {
+  static constexpr char kHex[] = "0123456789abcdef";
+  std::string value;
+  value.reserve(length * 2);
+  for (size_t index = 0; index < length; ++index) {
+    value.push_back(kHex[(bytes[index] >> 4) & 0x0f]);
+    value.push_back(kHex[bytes[index] & 0x0f]);
+  }
+  return value;
+}
+
+bool RandomBytes(std::vector<BYTE>* bytes) {
+  return bytes != nullptr && !bytes->empty() && BCryptGenRandom(nullptr, bytes->data(), static_cast<ULONG>(bytes->size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0;
+}
+
+bool HmacSha256(const std::vector<BYTE>& key, const std::string& input, std::string* output) {
+  if (key.empty() || output == nullptr) return false;
+  BCRYPT_ALG_HANDLE algorithm = nullptr;
+  DWORD object_bytes = 0;
+  DWORD hash_bytes = 0;
+  DWORD returned = 0;
+  if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG) != 0 ||
+      BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&object_bytes), sizeof(object_bytes), &returned, 0) != 0 ||
+      BCryptGetProperty(algorithm, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hash_bytes), sizeof(hash_bytes), &returned, 0) != 0 ||
+      object_bytes == 0 || hash_bytes != 32) {
+    if (algorithm != nullptr) BCryptCloseAlgorithmProvider(algorithm, 0);
+    return false;
+  }
+  std::vector<BYTE> object(object_bytes);
+  std::vector<BYTE> hash(hash_bytes);
+  BCRYPT_HASH_HANDLE handle = nullptr;
+  const bool hashed = BCryptCreateHash(algorithm, &handle, object.data(), object_bytes, const_cast<PUCHAR>(key.data()), static_cast<ULONG>(key.size()), 0) == 0 &&
+                      BCryptHashData(handle, reinterpret_cast<PUCHAR>(const_cast<char*>(input.data())), static_cast<ULONG>(input.size()), 0) == 0 &&
+                      BCryptFinishHash(handle, hash.data(), hash_bytes, 0) == 0;
+  if (handle != nullptr) BCryptDestroyHash(handle);
+  BCryptCloseAlgorithmProvider(algorithm, 0);
+  if (!hashed) return false;
+  *output = HexBytes(hash.data(), hash.size());
+  return true;
+}
+
+class ExecutionAuditMutex final {
+ public:
+  ExecutionAuditMutex() : handle_(CreateMutexW(nullptr, FALSE, L"Local\\Vissoto.ssh-mcp-server.execution-audit")) {
+    locked_ = handle_ != nullptr && WaitForSingleObject(handle_, INFINITE) == WAIT_OBJECT_0;
+  }
+  ~ExecutionAuditMutex() {
+    if (locked_) ReleaseMutex(handle_);
+    if (handle_ != nullptr) CloseHandle(handle_);
+  }
+  bool locked() const { return locked_; }
+  ExecutionAuditMutex(const ExecutionAuditMutex&) = delete;
+  ExecutionAuditMutex& operator=(const ExecutionAuditMutex&) = delete;
+
+ private:
+  HANDLE handle_ = nullptr;
+  bool locked_ = false;
+};
+
+struct ExecutionAuditRecord final {
+  std::string event;
+  std::string operation_id;
+  long long timestamp = 0;
+  std::string key_id;
+  std::string previous_event_hmac;
+  bool has_previous = false;
+  std::string profile_id;
+  std::string command;
+  std::vector<std::string> args;
+  std::string args_hmac;
+  std::string approval_state;
+  std::string outcome;
+  std::string code;
+  bool has_exit_code = false;
+  long long exit_code = 0;
+  long long duration_ms = 0;
+  std::string event_hmac;
+};
+
+struct ExecutionAuditState final {
+  std::wstring root;
+  std::vector<BYTE> operator_sid;
+  std::string active_key_id;
+  std::vector<BYTE> active_key;
+  std::string head;
+  std::vector<std::string> unfinished;
+};
+
+struct ExecutionAuditAppendResult final {
+  std::string key_id;
+  std::string previous_event_hmac;
+  bool has_previous = false;
+  std::string event_hmac;
+};
+
+bool ReadAuditFile(const std::wstring& root, const std::wstring& leaf, PSID operator_sid, bool allow_missing, std::vector<BYTE>* output) {
+  if (output == nullptr || leaf.empty() || leaf.find_first_of(L"\\/:*") != std::wstring::npos || !VerifyDirectoryChain(root, operator_sid)) return false;
+  const std::wstring path = root + L"\\" + leaf;
+  Handle file(CreateFileW(path.c_str(), GENERIC_READ | FILE_READ_ATTRIBUTES | READ_CONTROL, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+  if (file.get() == INVALID_HANDLE_VALUE) return allow_missing && GetLastError() == ERROR_FILE_NOT_FOUND;
+  if (!VerifyFile(file.get(), operator_sid, false)) return false;
+  LARGE_INTEGER size{};
+  if (!GetFileSizeEx(file.get(), &size) || size.QuadPart <= 0 || size.QuadPart > 4 * 1024 * 1024) return false;
+  output->resize(static_cast<size_t>(size.QuadPart));
+  DWORD read = 0;
+  return ReadFile(file.get(), output->data(), static_cast<DWORD>(output->size()), &read, nullptr) && read == output->size();
+}
+
+bool WriteNewAuditFile(const std::wstring& root, const std::wstring& leaf, PSID operator_sid, const std::vector<BYTE>& content) {
+  if (content.empty() || leaf.empty() || leaf.find_first_of(L"\\/:*") != std::wstring::npos) return false;
+  Handle root_handle(CreateFileW(root.c_str(), FILE_READ_ATTRIBUTES | READ_CONTROL | FILE_ADD_FILE | FILE_TRAVERSE, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+  if (root_handle.get() == INVALID_HANDLE_VALUE || !VerifyFile(root_handle.get(), operator_sid, true)) return false;
+  PrivateSecurityAttributes security(operator_sid, FILE_ALL_ACCESS, false);
+  Handle file;
+  if (!security.valid() || !CreatePrivateRelative(root_handle.get(), leaf, security, false, SnapshotFailure::kNone, &file) || !VerifyFile(file.get(), operator_sid, false)) return false;
+  DWORD written = 0;
+  return content.size() <= MAXDWORD && WriteFile(file.get(), content.data(), static_cast<DWORD>(content.size()), &written, nullptr) && written == content.size() && FlushFileBuffers(file.get()) && VerifyFile(file.get(), operator_sid, false);
+}
+
+bool WriteExistingAuditFile(const std::wstring& root, const std::wstring& leaf, PSID operator_sid, const std::vector<BYTE>& content) {
+  const std::wstring path = root + L"\\" + leaf;
+  Handle file(CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE | FILE_READ_ATTRIBUTES | READ_CONTROL, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+  if (file.get() == INVALID_HANDLE_VALUE || !VerifyFile(file.get(), operator_sid, false)) return false;
+  FILE_ID_INFO identity{};
+  if (!ReadIdentity(file.get(), &identity)) return false;
+  LARGE_INTEGER zero{};
+  DWORD written = 0;
+  return SetFilePointerEx(file.get(), zero, nullptr, FILE_BEGIN) && SetEndOfFile(file.get()) && content.size() <= MAXDWORD && WriteFile(file.get(), content.data(), static_cast<DWORD>(content.size()), &written, nullptr) && written == content.size() && FlushFileBuffers(file.get()) && HasIdentity(file.get(), identity) && VerifyFile(file.get(), operator_sid, false);
+}
+
+bool AuditLeafExistsOrUnsafe(const std::wstring& root, const wchar_t* leaf) {
+  const std::wstring path = root + L"\\" + leaf;
+  Handle file(CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES | READ_CONTROL, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+  if (file.get() != INVALID_HANDLE_VALUE) return true;
+  const DWORD error = GetLastError();
+  return error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND;
+}
+
+bool ReadAuditProperty(const std::string& line, const char* name, size_t* value_start) {
+  const std::string token = std::string("\"") + name + "\":";
+  const size_t position = line.find(token);
+  if (position == std::string::npos) return false;
+  *value_start = position + token.size();
+  return true;
+}
+
+bool ParseJsonStringAt(const std::string& line, size_t start, std::string* value, size_t* end) {
+  if (start >= line.size() || line[start] != '"' || value == nullptr || end == nullptr) return false;
+  std::string decoded;
+  for (size_t index = start + 1; index < line.size(); ++index) {
+    const char character = line[index];
+    if (character == '"') {
+      *value = std::move(decoded);
+      *end = index + 1;
+      return true;
+    }
+    if (character == '\\') {
+      if (++index >= line.size()) return false;
+      switch (line[index]) {
+        case '\\': decoded.push_back('\\'); break;
+        case '"': decoded.push_back('"'); break;
+        case 'b': decoded.push_back('\b'); break;
+        case 'f': decoded.push_back('\f'); break;
+        case 'n': decoded.push_back('\n'); break;
+        case 'r': decoded.push_back('\r'); break;
+        case 't': decoded.push_back('\t'); break;
+        case 'u': {
+          if (index + 4 >= line.size()) return false;
+          unsigned int code = 0;
+          for (size_t offset = 1; offset <= 4; ++offset) {
+            const char digit = line[index + offset];
+            if (digit >= '0' && digit <= '9') code = code * 16 + digit - '0';
+            else if (digit >= 'a' && digit <= 'f') code = code * 16 + digit - 'a' + 10;
+            else if (digit >= 'A' && digit <= 'F') code = code * 16 + digit - 'A' + 10;
+            else return false;
+          }
+          if (code > 0x7f) return false;
+          decoded.push_back(static_cast<char>(code));
+          index += 4;
+          break;
+        }
+        default: return false;
+      }
+    } else {
+      if (static_cast<unsigned char>(character) < 0x20) return false;
+      decoded.push_back(character);
+    }
+    if (decoded.size() > kExecutionAuditMaxString) return false;
+  }
+  return false;
+}
+
+bool ReadAuditString(const std::string& line, const char* name, std::string* value) {
+  size_t start = 0;
+  return ReadAuditProperty(line, name, &start) && ParseJsonStringAt(line, start, value, &start);
+}
+
+bool ReadAuditNullableString(const std::string& line, const char* name, bool* present, std::string* value) {
+  size_t start = 0;
+  if (!ReadAuditProperty(line, name, &start)) return false;
+  if (line.compare(start, 4, "null") == 0) {
+    *present = false;
+    value->clear();
+    return true;
+  }
+  *present = true;
+  return ParseJsonStringAt(line, start, value, &start);
+}
+
+bool ReadAuditNumber(const std::string& line, const char* name, long long* value, bool* is_null = nullptr) {
+  size_t start = 0;
+  if (!ReadAuditProperty(line, name, &start)) return false;
+  if (is_null != nullptr && line.compare(start, 4, "null") == 0) {
+    *is_null = true;
+    *value = 0;
+    return true;
+  }
+  char* end = nullptr;
+  const long long parsed = _strtoi64(line.c_str() + start, &end, 10);
+  if (end == line.c_str() + start || parsed < 0 && line[start] != '-') return false;
+  if (*end != ',' && *end != '}') return false;
+  if (is_null != nullptr) *is_null = false;
+  *value = parsed;
+  return true;
+}
+
+bool ReadAuditStringArray(const std::string& line, const char* name, std::vector<std::string>* values) {
+  size_t start = 0;
+  if (values == nullptr || !ReadAuditProperty(line, name, &start) || start >= line.size() || line[start] != '[') return false;
+  ++start;
+  values->clear();
+  if (start < line.size() && line[start] == ']') return true;
+  while (values->size() < kExecutionAuditMaxArgs) {
+    std::string value;
+    size_t end = 0;
+    if (!ParseJsonStringAt(line, start, &value, &end)) return false;
+    values->push_back(std::move(value));
+    start = end;
+    if (start >= line.size()) return false;
+    if (line[start] == ']') return true;
+    if (line[start] != ',') return false;
+    ++start;
+  }
+  return false;
+}
+
+bool ParseAuditRecord(const std::string& line, ExecutionAuditRecord* record) {
+  long long version = 0;
+  bool exit_null = false;
+  if (record == nullptr || !ReadAuditNumber(line, "version", &version) || version != 1 || !ReadAuditString(line, "event", &record->event) ||
+      (record->event != "intent" && record->event != "finished") || !ReadAuditString(line, "operationId", &record->operation_id) ||
+      !IsLowerHex(record->operation_id, 32) || !ReadAuditNumber(line, "timestamp", &record->timestamp) || record->timestamp < 0 ||
+      !ReadAuditString(line, "keyId", &record->key_id) || !IsLowerHex(record->key_id, 32) ||
+      !ReadAuditNullableString(line, "previousEventHmac", &record->has_previous, &record->previous_event_hmac) ||
+      (record->has_previous && !IsLowerHex(record->previous_event_hmac, 64)) || !ReadAuditString(line, "eventHmac", &record->event_hmac) ||
+      !IsLowerHex(record->event_hmac, 64)) return false;
+  if (record->event == "intent") {
+    return ReadAuditString(line, "profileId", &record->profile_id) && IsCanonicalProfileId(record->profile_id) &&
+           ReadAuditString(line, "command", &record->command) && !record->command.empty() &&
+           ReadAuditStringArray(line, "args", &record->args) && ReadAuditString(line, "argsHmac", &record->args_hmac) && IsLowerHex(record->args_hmac, 64) &&
+           ReadAuditString(line, "approvalState", &record->approval_state) && !record->approval_state.empty();
+  }
+  return ReadAuditString(line, "outcome", &record->outcome) &&
+         (record->outcome == "success" || record->outcome == "failure" || record->outcome == "timeout" || record->outcome == "cancelled" || record->outcome == "approval-required" || record->outcome == "unknown") &&
+         ReadAuditString(line, "code", &record->code) && !record->code.empty() && ReadAuditNumber(line, "exitCode", &record->exit_code, &exit_null) &&
+         ReadAuditNumber(line, "durationMs", &record->duration_ms) && record->duration_ms >= 0 && record->duration_ms <= 86400000 && (record->has_exit_code = !exit_null, true);
+}
+
+std::string SerializeAuditRecord(const ExecutionAuditRecord& record, bool include_hmac) {
+  std::string value = "{\"version\":1,\"event\":" + JsonString(record.event) + ",\"operationId\":" + JsonString(record.operation_id) +
+                      ",\"timestamp\":" + std::to_string(record.timestamp) + ",\"keyId\":" + JsonString(record.key_id) + ",\"previousEventHmac\":" +
+                      (record.has_previous ? JsonString(record.previous_event_hmac) : "null");
+  if (record.event == "intent") {
+    value += ",\"profileId\":" + JsonString(record.profile_id) + ",\"command\":" + JsonString(record.command) + ",\"args\":[";
+    for (size_t index = 0; index < record.args.size(); ++index) {
+      if (index != 0) value += ',';
+      value += JsonString(record.args[index]);
+    }
+    value += "],\"argsHmac\":" + JsonString(record.args_hmac) + ",\"approvalState\":" + JsonString(record.approval_state);
+  } else {
+    value += ",\"outcome\":" + JsonString(record.outcome) + ",\"code\":" + JsonString(record.code) + ",\"exitCode\":" +
+             (record.has_exit_code ? std::to_string(record.exit_code) : "null") + ",\"durationMs\":" + std::to_string(record.duration_ms);
+  }
+  if (include_hmac) value += ",\"eventHmac\":" + JsonString(record.event_hmac);
+  return value + "}";
+}
+
+std::wstring ExecutionAuditCredentialTarget(const std::string& key_id) {
+  return std::wstring(kCredentialTargetPrefix) + kExecutionAuditCredentialPrefix + std::wstring(key_id.begin(), key_id.end());
+}
+
+bool LoadAuditKey(const std::string& key_id, std::vector<BYTE>* key) {
+  if (!IsLowerHex(key_id, 32) || key == nullptr) return false;
+  PCREDENTIALW credential = nullptr;
+  const std::wstring target = ExecutionAuditCredentialTarget(key_id);
+  if (!CredReadW(target.c_str(), CRED_TYPE_GENERIC, 0, &credential) || credential == nullptr || credential->CredentialBlob == nullptr ||
+      credential->CredentialBlobSize != kExecutionAuditKeyBytes) {
+    if (credential != nullptr) CredFree(credential);
+    return false;
+  }
+  key->assign(credential->CredentialBlob, credential->CredentialBlob + credential->CredentialBlobSize);
+  CredFree(credential);
+  return true;
+}
+
+bool StoreAuditKey(const std::string& key_id, const std::vector<BYTE>& key) {
+  if (!IsLowerHex(key_id, 32) || key.size() != kExecutionAuditKeyBytes) return false;
+  const std::wstring target = ExecutionAuditCredentialTarget(key_id);
+  CREDENTIALW credential{};
+  credential.Type = CRED_TYPE_GENERIC;
+  credential.TargetName = const_cast<LPWSTR>(target.c_str());
+  credential.CredentialBlobSize = static_cast<DWORD>(key.size());
+  credential.CredentialBlob = const_cast<LPBYTE>(key.data());
+  credential.Persist = CRED_PERSIST_LOCAL_MACHINE;
+  return CredWriteW(&credential, 0) != FALSE;
+}
+
+void RemoveAuditKey(const std::string& key_id) {
+  if (!IsLowerHex(key_id, 32)) return;
+  CredDeleteW(ExecutionAuditCredentialTarget(key_id).c_str(), CRED_TYPE_GENERIC, 0);
+}
+
+bool LoadExecutionAuditState(ExecutionAuditState* state) {
+  if (state == nullptr) return false;
+  std::wstring known_hosts_root;
+  if (!LoadConfiguration(&state->root, &known_hosts_root, &state->operator_sid)) return false;
+  std::vector<BYTE> active;
+  if (!ReadAuditFile(state->root, kExecutionAuditActiveLeaf, state->operator_sid.data(), false, &active)) return false;
+  const std::string active_text(reinterpret_cast<const char*>(active.data()), active.size());
+  if (active_text.rfind("v1:", 0) != 0) return false;
+  const std::string key_id = active_text.substr(3, active_text.find_first_of("\r\n", 3) == std::string::npos ? std::string::npos : active_text.find_first_of("\r\n", 3) - 3);
+  if (!IsLowerHex(key_id, 32) || active_text != "v1:" + key_id + "\n") return false;
+  state->active_key_id = key_id;
+  if (!LoadAuditKey(key_id, &state->active_key)) return false;
+  std::vector<BYTE> bytes;
+  if (!ReadAuditFile(state->root, kExecutionAuditJournalLeaf, state->operator_sid.data(), true, &bytes)) return false;
+  if (bytes.empty()) return true;
+  const std::string contents(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+  if (contents.back() != '\n') return false;
+  size_t cursor = 0;
+  std::string previous;
+  while (cursor < contents.size()) {
+    const size_t next = contents.find('\n', cursor);
+    if (next == std::string::npos || next == cursor) return false;
+    const std::string line = contents.substr(cursor, next - cursor);
+    ExecutionAuditRecord record;
+    std::vector<BYTE> key;
+    std::string expected_hmac;
+    if (!ParseAuditRecord(line, &record) || record.has_previous != !previous.empty() || (record.has_previous && record.previous_event_hmac != previous) ||
+        !LoadAuditKey(record.key_id, &key) || !HmacSha256(key, SerializeAuditRecord(record, false), &expected_hmac)) return false;
+    if (expected_hmac != record.event_hmac || line != SerializeAuditRecord(record, true)) return false;
+    if (record.event == "intent") {
+      if (std::find(state->unfinished.begin(), state->unfinished.end(), record.operation_id) != state->unfinished.end()) return false;
+      state->unfinished.push_back(record.operation_id);
+    } else {
+      const auto found = std::find(state->unfinished.begin(), state->unfinished.end(), record.operation_id);
+      if (found == state->unfinished.end()) return false;
+      state->unfinished.erase(found);
+    }
+    previous = record.event_hmac;
+    cursor = next + 1;
+  }
+  state->head = previous;
+  return true;
+}
+
+bool AppendExecutionAuditRecord(ExecutionAuditState* state, ExecutionAuditRecord record, ExecutionAuditAppendResult* result) {
+  if (state == nullptr || result == nullptr) return false;
+  record.key_id = state->active_key_id;
+  record.has_previous = !state->head.empty();
+  record.previous_event_hmac = state->head;
+  FILETIME now{};
+  GetSystemTimeAsFileTime(&now);
+  ULARGE_INTEGER ticks{};
+  ticks.LowPart = now.dwLowDateTime;
+  ticks.HighPart = now.dwHighDateTime;
+  record.timestamp = static_cast<long long>(ticks.QuadPart / 10000ULL) - 11644473600000LL;
+  if (!HmacSha256(state->active_key, SerializeAuditRecord(record, false), &record.event_hmac)) return false;
+  const std::string line = SerializeAuditRecord(record, true) + "\n";
+  const std::wstring path = state->root + L"\\" + kExecutionAuditJournalLeaf;
+  Handle file(CreateFileW(path.c_str(), GENERIC_READ | FILE_APPEND_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+  if (file.get() == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_NOT_FOUND) {
+    PrivateSecurityAttributes security(state->operator_sid.data(), FILE_ALL_ACCESS, false);
+    Handle root(CreateFileW(state->root.c_str(), FILE_READ_ATTRIBUTES | READ_CONTROL | FILE_ADD_FILE | FILE_TRAVERSE, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+    if (root.get() == INVALID_HANDLE_VALUE || !security.valid() || !CreatePrivateRelative(root.get(), kExecutionAuditJournalLeaf, security, false, SnapshotFailure::kNone, &file)) return false;
+  }
+  if (file.get() == INVALID_HANDLE_VALUE || !VerifyFile(file.get(), state->operator_sid.data(), false)) return false;
+  FILE_ID_INFO identity{};
+  if (!ReadIdentity(file.get(), &identity)) return false;
+  DWORD written = 0;
+  if (line.size() > MAXDWORD || !WriteFile(file.get(), line.data(), static_cast<DWORD>(line.size()), &written, nullptr) || written != line.size() || !FlushFileBuffers(file.get()) || !HasIdentity(file.get(), identity) || !VerifyFile(file.get(), state->operator_sid.data(), false)) return false;
+  result->key_id = record.key_id;
+  result->has_previous = record.has_previous;
+  result->previous_event_hmac = record.previous_event_hmac;
+  result->event_hmac = record.event_hmac;
+  state->head = record.event_hmac;
+  if (record.event == "intent") state->unfinished.push_back(record.operation_id);
+  else {
+    const auto found = std::find(state->unfinished.begin(), state->unfinished.end(), record.operation_id);
+    if (found == state->unfinished.end()) return false;
+    state->unfinished.erase(found);
+  }
+  return true;
+}
+
+bool AppendAuditIntent(const ExecutionAuditRecord& intent, ExecutionAuditAppendResult* result) {
+  ExecutionAuditMutex mutex;
+  if (!mutex.locked()) return false;
+  ExecutionAuditState state;
+  if (!LoadExecutionAuditState(&state)) return false;
+  while (!state.unfinished.empty()) {
+    ExecutionAuditRecord recovered;
+    recovered.event = "finished";
+    recovered.operation_id = state.unfinished.front();
+    recovered.outcome = "unknown";
+    recovered.code = "outcome-unknown";
+    recovered.has_exit_code = false;
+    recovered.duration_ms = 0;
+    if (!AppendExecutionAuditRecord(&state, std::move(recovered), result)) return false;
+  }
+  return AppendExecutionAuditRecord(&state, intent, result);
+}
+
+bool AppendAuditFinished(const ExecutionAuditRecord& finished, ExecutionAuditAppendResult* result) {
+  ExecutionAuditMutex mutex;
+  if (!mutex.locked()) return false;
+  ExecutionAuditState state;
+  if (!LoadExecutionAuditState(&state) || std::find(state.unfinished.begin(), state.unfinished.end(), finished.operation_id) == state.unfinished.end()) return false;
+  return AppendExecutionAuditRecord(&state, finished, result);
+}
+
 bool IsCanonicalProfileId(const std::string& value) {
   if (value.empty() || value.size() > 128) return false;
   for (const char* reserved : {"con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9", "constructor", "prototype", "__proto__"}) if (value == reserved) return false;
   for (size_t index = 0; index < value.size(); ++index) if (!((value[index] >= 'a' && value[index] <= 'z') || (value[index] >= '0' && value[index] <= '9') || (value[index] == '-' && index > 0 && index + 1 < value.size() && value[index - 1] != '-'))) return false;
   return true;
+}
+
+bool IsAuditText(const std::string& value, size_t maximum) {
+  return !value.empty() && value.size() <= maximum && value.find_first_of("\r\n\0") == std::string::npos;
+}
+
+bool ReadAuditArgsValue(napi_env env, napi_value value, std::vector<std::string>* args) {
+  bool is_array = false;
+  uint32_t length = 0;
+  if (args == nullptr || napi_is_array(env, value, &is_array) != napi_ok || !is_array || napi_get_array_length(env, value, &length) != napi_ok || length > kExecutionAuditMaxArgs) return false;
+  args->clear();
+  size_t total = 0;
+  for (uint32_t index = 0; index < length; ++index) {
+    napi_value item{};
+    size_t bytes = 0;
+    if (napi_get_element(env, value, index, &item) != napi_ok || napi_get_value_string_utf8(env, item, nullptr, 0, &bytes) != napi_ok || bytes > kExecutionAuditMaxString) return false;
+    std::vector<char> buffer(bytes + 1);
+    if (napi_get_value_string_utf8(env, item, buffer.data(), buffer.size(), &bytes) != napi_ok) return false;
+    args->emplace_back(buffer.data(), bytes);
+    total += bytes;
+    if (total > 64 * 1024 || !IsAuditText(args->back(), kExecutionAuditMaxString)) return false;
+  }
+  return true;
+}
+
+bool ReadAuditIntentValue(napi_env env, napi_value input, ExecutionAuditRecord* record) {
+  napi_value args_value{};
+  napi_valuetype input_type{};
+  if (record == nullptr || napi_typeof(env, input, &input_type) != napi_ok || input_type != napi_object ||
+      !ReadProvisionString(env, input, "operationId", &record->operation_id, 32) || !IsLowerHex(record->operation_id, 32) ||
+      !ReadProvisionString(env, input, "profileId", &record->profile_id, 128) || !IsCanonicalProfileId(record->profile_id) ||
+      !ReadProvisionString(env, input, "command", &record->command, kExecutionAuditMaxString) || !IsAuditText(record->command, kExecutionAuditMaxString) ||
+      !ReadProvisionValue(env, input, "args", &args_value) || !ReadAuditArgsValue(env, args_value, &record->args) ||
+      !ReadProvisionString(env, input, "argsHmac", &record->args_hmac, 64) || !IsLowerHex(record->args_hmac, 64) ||
+      !ReadProvisionString(env, input, "approvalState", &record->approval_state, 64) || !IsAuditText(record->approval_state, 64)) return false;
+  record->event = "intent";
+  return true;
+}
+
+bool ReadAuditFinishedValue(napi_env env, napi_value input, ExecutionAuditRecord* record) {
+  napi_value exit_code_value{};
+  bool is_null = false;
+  napi_valuetype input_type{};
+  if (record == nullptr || napi_typeof(env, input, &input_type) != napi_ok || input_type != napi_object || !ReadProvisionString(env, input, "operationId", &record->operation_id, 32) || !IsLowerHex(record->operation_id, 32) ||
+      !ReadProvisionString(env, input, "outcome", &record->outcome, 32) ||
+      (record->outcome != "success" && record->outcome != "failure" && record->outcome != "timeout" && record->outcome != "cancelled" && record->outcome != "approval-required" && record->outcome != "unknown") ||
+      !ReadProvisionString(env, input, "code", &record->code, 128) || !IsAuditText(record->code, 128) ||
+      !ReadProvisionValue(env, input, "exitCode", &exit_code_value)) return false;
+  napi_valuetype type{};
+  if (napi_typeof(env, exit_code_value, &type) != napi_ok) return false;
+  if (type == napi_null) {
+    is_null = true;
+  } else if (napi_get_value_int64(env, exit_code_value, &record->exit_code) != napi_ok || record->exit_code < -1 || record->exit_code > 255) {
+    return false;
+  }
+  napi_value duration_value{};
+  double duration = 0;
+  if (!ReadProvisionValue(env, input, "durationMs", &duration_value) || napi_get_value_double(env, duration_value, &duration) != napi_ok || !std::isfinite(duration) || duration < 0 || duration > 86400000 || std::floor(duration) != duration) return false;
+  record->event = "finished";
+  record->has_exit_code = !is_null;
+  record->duration_ms = static_cast<long long>(duration);
+  return true;
+}
+
+napi_value AuditAppendResultValue(napi_env env, const ExecutionAuditAppendResult& result) {
+  napi_value output{};
+  napi_value key_id{};
+  napi_value previous{};
+  napi_value event_hmac{};
+  if (napi_create_object(env, &output) != napi_ok || napi_create_string_utf8(env, result.key_id.c_str(), result.key_id.size(), &key_id) != napi_ok ||
+      (result.has_previous ? napi_create_string_utf8(env, result.previous_event_hmac.c_str(), result.previous_event_hmac.size(), &previous) : napi_get_null(env, &previous)) != napi_ok ||
+      napi_create_string_utf8(env, result.event_hmac.c_str(), result.event_hmac.size(), &event_hmac) != napi_ok ||
+      napi_set_named_property(env, output, "keyId", key_id) != napi_ok || napi_set_named_property(env, output, "previousEventHmac", previous) != napi_ok ||
+      napi_set_named_property(env, output, "eventHmac", event_hmac) != napi_ok) return Unavailable(env);
+  return output;
+}
+
+napi_value InitializeExecutionAuditKey(napi_env env, napi_callback_info info) {
+  size_t count = 0;
+  if (napi_get_cb_info(env, info, &count, nullptr, nullptr, nullptr) != napi_ok || count != 0) return Unavailable(env);
+  ExecutionAuditMutex mutex;
+  std::wstring root;
+  std::wstring known_hosts;
+  std::vector<BYTE> sid;
+  if (!mutex.locked() || !LoadConfiguration(&root, &known_hosts, &sid)) return Unavailable(env);
+  if (AuditLeafExistsOrUnsafe(root, kExecutionAuditActiveLeaf) || AuditLeafExistsOrUnsafe(root, kExecutionAuditJournalLeaf)) return Unavailable(env);
+  std::vector<BYTE> key(kExecutionAuditKeyBytes);
+  std::vector<BYTE> id(kExecutionAuditKeyIdBytes);
+  if (!RandomBytes(&key) || !RandomBytes(&id)) return Unavailable(env);
+  const std::string key_id = HexBytes(id.data(), id.size());
+  const std::string active_text = "v1:" + key_id + "\n";
+  const std::vector<BYTE> active(active_text.begin(), active_text.end());
+  if (!StoreAuditKey(key_id, key)) return Unavailable(env);
+  if (!WriteNewAuditFile(root, kExecutionAuditActiveLeaf, sid.data(), active)) {
+    RemoveAuditKey(key_id);
+    return Unavailable(env);
+  }
+  napi_value result{};
+  return napi_get_undefined(env, &result) == napi_ok ? result : Unavailable(env);
+}
+
+napi_value RotateExecutionAuditKey(napi_env env, napi_callback_info info) {
+  size_t count = 0;
+  if (napi_get_cb_info(env, info, &count, nullptr, nullptr, nullptr) != napi_ok || count != 0) return Unavailable(env);
+  ExecutionAuditMutex mutex;
+  ExecutionAuditState state;
+  if (!mutex.locked() || !LoadExecutionAuditState(&state)) return Unavailable(env);
+  std::vector<BYTE> key(kExecutionAuditKeyBytes);
+  std::vector<BYTE> id(kExecutionAuditKeyIdBytes);
+  if (!RandomBytes(&key) || !RandomBytes(&id)) return Unavailable(env);
+  const std::string key_id = HexBytes(id.data(), id.size());
+  const std::string active_text = "v1:" + key_id + "\n";
+  const std::vector<BYTE> active(active_text.begin(), active_text.end());
+  if (!StoreAuditKey(key_id, key)) return Unavailable(env);
+  if (!WriteExistingAuditFile(state.root, kExecutionAuditActiveLeaf, state.operator_sid.data(), active)) {
+    RemoveAuditKey(key_id);
+    return Unavailable(env);
+  }
+  napi_value result{};
+  return napi_get_undefined(env, &result) == napi_ok ? result : Unavailable(env);
+}
+
+napi_value DigestExecutionAuditArguments(napi_env env, napi_callback_info info) {
+  size_t count = 1;
+  napi_value input{};
+  std::vector<std::string> args;
+  if (napi_get_cb_info(env, info, &count, &input, nullptr, nullptr) != napi_ok || count != 1 || !ReadAuditArgsValue(env, input, &args)) return Unavailable(env);
+  ExecutionAuditMutex mutex;
+  ExecutionAuditState state;
+  if (!mutex.locked() || !LoadExecutionAuditState(&state)) return Unavailable(env);
+  std::string json = "[";
+  for (size_t index = 0; index < args.size(); ++index) {
+    if (index != 0) json += ',';
+    json += JsonString(args[index]);
+  }
+  json += ']';
+  std::string hmac;
+  if (!HmacSha256(state.active_key, json, &hmac)) return Unavailable(env);
+  napi_value result{};
+  return napi_create_string_utf8(env, hmac.c_str(), hmac.size(), &result) == napi_ok ? result : Unavailable(env);
+}
+
+napi_value AppendExecutionAuditIntent(napi_env env, napi_callback_info info) {
+  size_t count = 1;
+  napi_value input{};
+  ExecutionAuditRecord record;
+  ExecutionAuditAppendResult result;
+  if (napi_get_cb_info(env, info, &count, &input, nullptr, nullptr) != napi_ok || count != 1 || !ReadAuditIntentValue(env, input, &record) || !AppendAuditIntent(record, &result)) return Unavailable(env);
+  return AuditAppendResultValue(env, result);
+}
+
+napi_value AppendExecutionAuditFinished(napi_env env, napi_callback_info info) {
+  size_t count = 1;
+  napi_value input{};
+  ExecutionAuditRecord record;
+  ExecutionAuditAppendResult result;
+  if (napi_get_cb_info(env, info, &count, &input, nullptr, nullptr) != napi_ok || count != 1 || !ReadAuditFinishedValue(env, input, &record) || !AppendAuditFinished(record, &result)) return Unavailable(env);
+  return AuditAppendResultValue(env, result);
 }
 
 napi_value ProvisionApprovedProfile(napi_env env, napi_callback_info info) {
@@ -2757,6 +3365,11 @@ NAPI_MODULE_INIT() {
     {"startSshAddProbe", nullptr, StartSshAddProbe, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"readCredential", nullptr, ReadCredential, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"credentialAvailable", nullptr, CredentialAvailable, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"initializeExecutionAuditKey", nullptr, InitializeExecutionAuditKey, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"rotateExecutionAuditKey", nullptr, RotateExecutionAuditKey, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"digestExecutionAuditArguments", nullptr, DigestExecutionAuditArguments, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"appendExecutionAuditIntent", nullptr, AppendExecutionAuditIntent, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"appendExecutionAuditFinished", nullptr, AppendExecutionAuditFinished, nullptr, nullptr, nullptr, napi_default, nullptr},
 #ifdef SSH_MCP_NATIVE_TEST
     {"testReadReplacementRace", nullptr, TestReadReplacementRace, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"testReadStateFile", nullptr, TestReadStateFile, nullptr, nullptr, nullptr, napi_default, nullptr},

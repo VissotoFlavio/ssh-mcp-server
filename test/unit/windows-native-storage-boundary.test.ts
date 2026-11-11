@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert';
 import { execFileSync } from 'node:child_process';
-import { existsSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -13,6 +13,7 @@ const nativeRequire = createRequire(import.meta.url);
 // Windows PowerShell 5.1 can fail to load ACL type data in isolated child
 // processes, so these Windows-only fixtures require PowerShell 7+.
 const fixtureShell = 'pwsh.exe';
+const perUserConfigurationKey = 'HKCU:\\Software\\Vissoto\\ssh-mcp-server';
 const testOnlyHookNames = [
   'testReadReplacementRace',
   'testReadStateFile',
@@ -71,8 +72,24 @@ function uniqueRoot(suffix: string): string {
   return join(homedir(), `ssh-mcp-native-boundary-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}-${suffix}`);
 }
 
+function hasExistingPerUserConfiguration(): boolean {
+  if (process.platform !== 'win32') return false;
+  try {
+    execFileSync(
+      fixtureShell,
+      ['-NoProfile', '-NonInteractive', '-Command', `if (Test-Path -LiteralPath '${perUserConfigurationKey}') { exit 0 } else { exit 1 }`],
+      { stdio: 'ignore' },
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAddonPath)) {
   test.skip('requires Windows with the compiled production and test native addons', () => undefined);
+} else if (hasExistingPerUserConfiguration()) {
+  test.skip('requires an isolated Windows per-user configuration; the active profile configuration is preserved', () => undefined);
 } else {
   const binding = nativeRequire(addonPath) as {
     readProfileState(): Buffer;
@@ -91,6 +108,11 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
     probeSshAdd(timeoutMs: unknown): number;
     startSshAddProbe(timeoutMs: unknown): { readonly promise: Promise<boolean>; readonly cancel: () => void };
     execute(capability: object, request: object, signal?: AbortSignal): Promise<unknown>;
+    initializeExecutionAuditKey(): void;
+    rotateExecutionAuditKey(): void;
+    digestExecutionAuditArguments(args: readonly string[]): string;
+    appendExecutionAuditIntent(intent: object): { keyId: string; previousEventHmac: string | null; eventHmac: string };
+    appendExecutionAuditFinished(event: object): { keyId: string; previousEventHmac: string | null; eventHmac: string };
   };
   const testBinding = nativeRequire(testAddonPath) as {
     captureKnownHostsSnapshot(profileId: string): { bytes: Buffer; capability: object };
@@ -221,6 +243,51 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
       assert.equal(testBinding.testSnapshotArtifactCount(), 0);
       assert.throws(() => binding.disposeKnownHostsSnapshot(snapshot.capability), /Windows secure storage is unavailable/u);
       assert.equal(existsSync(sentinel), true);
+    } finally {
+      if (configured) runFixture('cleanup', root);
+    }
+  });
+
+  test('initializes, chains, flushes, and explicitly rotates the native execution audit key', () => {
+    const root = uniqueRoot('execution-audit');
+    let configured = false;
+    try {
+      runFixture('safe', root);
+      configured = true;
+      binding.initializeExecutionAuditKey();
+      assert.throws(() => binding.initializeExecutionAuditKey(), /Windows secure storage is unavailable/u);
+      const intent = {
+        operationId: '0123456789abcdef0123456789abcdef',
+        profileId: 'production-api',
+        command: 'systemctl',
+        args: ['status', 'ssh'],
+        argsHmac: binding.digestExecutionAuditArguments(['status', 'ssh']),
+        approvalState: 'not-required',
+      };
+      const first = binding.appendExecutionAuditIntent(intent);
+      assert.equal(first.previousEventHmac, null);
+      const finished = binding.appendExecutionAuditFinished({
+        operationId: intent.operationId,
+        outcome: 'success',
+        code: 'success',
+        exitCode: 0,
+        durationMs: 4,
+      });
+      assert.equal(finished.previousEventHmac, first.eventHmac);
+      const beforeRotation = readFileSync(join(root, 'state', 'execution-audit.v1.jsonl'), 'utf8');
+      assert.match(beforeRotation, /"keyId":"[0-9a-f]{32}"/u);
+      assert.doesNotMatch(beforeRotation, /secret|stdout|stderr/u);
+      binding.rotateExecutionAuditKey();
+      const second = binding.appendExecutionAuditIntent({ ...intent, operationId: 'fedcba9876543210fedcba9876543210' });
+      assert.notEqual(second.keyId, first.keyId);
+      assert.equal(second.previousEventHmac, finished.eventHmac);
+      binding.appendExecutionAuditFinished({
+        operationId: 'fedcba9876543210fedcba9876543210',
+        outcome: 'unknown',
+        code: 'outcome-unknown',
+        exitCode: null,
+        durationMs: 0,
+      });
     } finally {
       if (configured) runFixture('cleanup', root);
     }

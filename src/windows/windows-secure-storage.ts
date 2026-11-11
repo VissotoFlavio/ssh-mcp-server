@@ -1,6 +1,13 @@
 import { createRequire } from 'node:module';
 
 import { parseCredentialReference } from '../credentials/credential-store.js';
+import {
+  WindowsExecutionAuditJournal,
+  type ExecutionAuditFinished,
+  type ExecutionAuditIntent,
+  type ExecutionAuditJournal,
+  type WindowsExecutionAuditBinding,
+} from '../execution/execution-audit-journal.js';
 import type { RemoteCommandTransportResult } from '../execution/remote-command-execution.js';
 import { validateConnectionProfile, validateProfileSelection, type ConnectionProfile } from '../profiles/connection-profile.js';
 
@@ -22,6 +29,17 @@ export interface WindowsTrustBinding {
   execute?(capability: object, request: WindowsNativeAgentCommandRequest, signal?: AbortSignal): Promise<RemoteCommandTransportResult>;
   readCredential(locator: string): string;
   credentialAvailable?(locator: string): boolean;
+  digestExecutionAuditArguments?(args: readonly string[]): string;
+  appendExecutionAuditIntent?(intent: ExecutionAuditIntent): {
+    readonly keyId: string;
+    readonly previousEventHmac: string | null;
+    readonly eventHmac: string;
+  };
+  appendExecutionAuditFinished?(event: ExecutionAuditFinished & { readonly operationId: string }): {
+    readonly keyId: string;
+    readonly previousEventHmac: string | null;
+    readonly eventHmac: string;
+  };
 }
 
 export class WindowsSecureStorageError extends Error {
@@ -55,7 +73,10 @@ function loadNativeBinding(): WindowsTrustBinding {
     typeof (candidate as { disposeKnownHostsSnapshot?: unknown }).disposeKnownHostsSnapshot !== 'function' ||
     typeof (candidate as { isKnownHostsSnapshotBusy?: unknown }).isKnownHostsSnapshotBusy !== 'function' ||
     typeof (candidate as { execute?: unknown }).execute !== 'function' ||
-    typeof (candidate as { readCredential?: unknown }).readCredential !== 'function'
+    typeof (candidate as { readCredential?: unknown }).readCredential !== 'function' ||
+    typeof (candidate as { digestExecutionAuditArguments?: unknown }).digestExecutionAuditArguments !== 'function' ||
+    typeof (candidate as { appendExecutionAuditIntent?: unknown }).appendExecutionAuditIntent !== 'function' ||
+    typeof (candidate as { appendExecutionAuditFinished?: unknown }).appendExecutionAuditFinished !== 'function'
   ) {
     return unavailable();
   }
@@ -146,7 +167,17 @@ function validReadiness(value: unknown): value is {
  * roots nor filenames are accepted from MCP callers or environment variables.
  */
 export class WindowsSecureStorage {
-  constructor(private readonly binding: WindowsTrustBinding = loadNativeBinding()) {}
+  readonly executionAuditJournal?: ExecutionAuditJournal;
+
+  constructor(private readonly binding: WindowsTrustBinding = loadNativeBinding()) {
+    if (
+      typeof binding.digestExecutionAuditArguments === 'function' &&
+      typeof binding.appendExecutionAuditIntent === 'function' &&
+      typeof binding.appendExecutionAuditFinished === 'function'
+    ) {
+      this.executionAuditJournal = new WindowsExecutionAuditJournal(binding as WindowsExecutionAuditBinding);
+    }
+  }
 
   listProfiles(): readonly ConnectionProfile[] {
     try {

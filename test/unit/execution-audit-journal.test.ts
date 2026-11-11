@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
-import { PosixExecutionAuditJournal } from '../../src/execution/execution-audit-journal.js';
+import { PosixExecutionAuditJournal, WindowsExecutionAuditJournal } from '../../src/execution/execution-audit-journal.js';
 
 async function fixture(): Promise<{ root: string; keyFile: string }> {
   const root = join(tmpdir(), `ssh-mcp-audit-${randomBytes(8).toString('hex')}`);
@@ -85,4 +85,31 @@ test('finishes concurrent operations against the current chain head', async (t) 
   const contents = await readFile(join(fixtureState.root, 'execution-audit.v1.jsonl'), 'utf8');
   assert.equal(contents.match(/"event":"finished"/gu)?.length, 2);
   assert.equal(contents.includes('"outcome":"unknown"'), false);
+});
+
+test('adapts the native Windows journal without receiving key material', async () => {
+  const events: unknown[] = [];
+  const journal = new WindowsExecutionAuditJournal({
+    digestExecutionAuditArguments: (args) => {
+      events.push({ kind: 'digest', args });
+      return 'a'.repeat(64);
+    },
+    appendExecutionAuditIntent: (event) => {
+      events.push({ kind: 'intent', event });
+      return { keyId: 'b'.repeat(32), previousEventHmac: null, eventHmac: 'c'.repeat(64) };
+    },
+    appendExecutionAuditFinished: (event) => {
+      events.push({ kind: 'finished', event });
+      return { keyId: 'b'.repeat(32), previousEventHmac: 'c'.repeat(64), eventHmac: 'd'.repeat(64) };
+    },
+  });
+  assert.equal(await journal.digestArguments(['status', 'ssh']), 'a'.repeat(64));
+  const handle = await journal.begin(intent);
+  await handle.finish({ outcome: 'success', code: 'success', exitCode: 0, durationMs: 1 });
+  await handle.finish({ outcome: 'failure', code: 'ignored', exitCode: 1, durationMs: 2 });
+  assert.deepEqual(
+    events.map((event) => (event as { kind: string }).kind),
+    ['digest', 'intent', 'finished'],
+  );
+  assert.equal('key' in (events[1] as object), false);
 });

@@ -31,6 +31,18 @@ export interface ExecutionAuditJournal {
   digestArguments(args: readonly string[]): Promise<string>;
 }
 
+export interface WindowsExecutionAuditAppendResult {
+  readonly keyId: string;
+  readonly previousEventHmac: string | null;
+  readonly eventHmac: string;
+}
+
+export interface WindowsExecutionAuditBinding {
+  digestExecutionAuditArguments(args: readonly string[]): string;
+  appendExecutionAuditIntent(intent: ExecutionAuditIntent): WindowsExecutionAuditAppendResult;
+  appendExecutionAuditFinished(event: ExecutionAuditFinished & { readonly operationId: string }): WindowsExecutionAuditAppendResult;
+}
+
 export interface PosixAuditJournalOptions {
   readonly root: string;
   readonly keyFile: string;
@@ -259,6 +271,53 @@ export class PosixExecutionAuditJournal implements ExecutionAuditJournal {
     }
     assertSafeFile(await lstat(this.journalPath), this.options.uid);
     return { hmac };
+  }
+}
+
+/**
+ * Windows production journal. All key operations, chain verification, file
+ * identity checks, locking, and durable appends are performed by the native
+ * binding. This adapter deliberately receives no key material.
+ */
+export class WindowsExecutionAuditJournal implements ExecutionAuditJournal {
+  private queue: Promise<void> = Promise.resolve();
+
+  constructor(private readonly binding: WindowsExecutionAuditBinding) {}
+
+  async digestArguments(args: readonly string[]): Promise<string> {
+    return this.binding.digestExecutionAuditArguments([...args]);
+  }
+
+  async begin(intent: ExecutionAuditIntent): Promise<ExecutionAuditHandle> {
+    return this.exclusive(async () => {
+      this.binding.appendExecutionAuditIntent(intent);
+      let finished = false;
+      return {
+        operationId: intent.operationId,
+        finish: async (event: ExecutionAuditFinished) => {
+          if (finished) return;
+          await this.exclusive(async () => {
+            if (finished) return;
+            this.binding.appendExecutionAuditFinished({ operationId: intent.operationId, ...event });
+            finished = true;
+          });
+        },
+      };
+    });
+  }
+
+  private async exclusive<T>(work: () => Promise<T>): Promise<T> {
+    const previous = this.queue;
+    let release!: () => void;
+    this.queue = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await work();
+    } finally {
+      release();
+    }
   }
 }
 
