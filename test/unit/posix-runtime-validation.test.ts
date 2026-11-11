@@ -6,6 +6,7 @@ import {
   NativePosixControlMaster,
   SSH_MCP_KNOWN_HOSTS_ROOT_ENV,
   createRuntimeConnectionValidationProvider,
+  createRuntimeRemoteCommandExecutionProvider,
   type PosixControlMasterChild,
   type PosixFileStats,
   type PosixRuntimeFileSystem,
@@ -129,6 +130,45 @@ test('fails closed on an unsupported platform before any filesystem or process a
   const fileSystem = new FakeFileSystem();
   assert.throws(() => runtime(fileSystem, { platform: 'win32' }), /POSIX connection validation runtime is unavailable/);
   assert.deepEqual(fileSystem.removed, []);
+});
+
+test('production execution binds sudo approval to the validated POSIX authorization lease', async () => {
+  let authorizationCalls = 0;
+  let observedIdentity: unknown;
+  const provider = createRuntimeRemoteCommandExecutionProvider(
+    {
+      environment: { SSH_MCP_STATE_ROOT: '/state' },
+      platform: 'linux',
+      uid: 1000,
+      profileRegistry: { getProfile: async () => profile },
+      connectionValidationProvider: {
+        validateConnection: async () => ({ profileId: profile.profileId, ready: true as const }),
+        authorizeExecution: async (input) => {
+          assert.deepEqual(input, { profileId: profile.profileId });
+          authorizationCalls += 1;
+          return { profile };
+        },
+      },
+    },
+    {
+      approve: async (request) => {
+        observedIdentity = request.approvedIdentity;
+        return true;
+      },
+    },
+  );
+
+  const result = await provider.requestSudoApproval({ profileId: profile.profileId, command: 'sudo', args: ['id'] });
+  assert.equal(result.approved, true);
+  assert.equal(authorizationCalls, 1);
+  assert.deepEqual(observedIdentity, {
+    host: profile.host,
+    port: profile.port,
+    user: profile.user,
+    expectedHostFingerprint: profile.expectedHostFingerprint,
+    authMode: profile.authMode,
+    approvedKnownHostsReference: profile.approvedKnownHostsReference,
+  });
 });
 
 test('rejects an operator root with unsafe permissions before ssh-add or a master runs', async () => {

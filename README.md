@@ -193,13 +193,19 @@ with `npm run windows:audit:init`; rotate it only with
 
 Build first, then register the stdio server with absolute, operator-approved
 paths. On Linux and macOS, register the two state roots with the server so the
-configuration remains available when Codex starts it later. The following is
+configuration remains available when Codex starts it later. Remote execution
+also requires the operator-owned audit root/key; configure the optional local
+approver socket and secret when `sudo` approval is needed. The following is
 illustrative; replace all paths with local trusted values:
 
 ```sh
 codex mcp add ssh-mcp-server \
   --env SSH_MCP_STATE_ROOT=/absolute/path/to/state \
   --env SSH_MCP_KNOWN_HOSTS_ROOT=/absolute/path/to/known-hosts \
+  --env SSH_MCP_AUDIT_ROOT=/absolute/path/to/audit \
+  --env SSH_MCP_AUDIT_KEY_FILE=/absolute/path/to/audit.key \
+  --env SSH_MCP_APPROVER_SOCKET=/absolute/path/to/ssh-mcp-approver.sock \
+  --env SSH_MCP_APPROVER_SECRET_FILE=/absolute/path/to/ssh-mcp-approver.secret \
   -- /absolute/path/to/node /absolute/path/to/ssh-mcp-server/dist/server.js
 codex mcp list
 ```
