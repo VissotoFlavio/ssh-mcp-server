@@ -945,32 +945,52 @@ std::wstring PosixShellQuote(const std::wstring& value) {
   return quoted;
 }
 
+bool IsIpv6Segment(const std::wstring& segment) {
+  if (segment.empty() || segment.size() > 4) return false;
+  for (wchar_t character : segment) {
+    const bool hexadecimal = (character >= L'0' && character <= L'9') || (character >= L'a' && character <= L'f') || (character >= L'A' && character <= L'F');
+    if (!hexadecimal) return false;
+  }
+  return true;
+}
+
 bool IsBracketedIpv6Host(const std::wstring& host) {
   if (host.size() < 4 || host.front() != L'[' || host.back() != L']') return false;
   const std::wstring value = host.substr(1, host.size() - 2);
-  size_t groups = 0;
-  size_t digits = 0;
-  bool compressed = false;
-  for (size_t index = 0; index < value.size(); ++index) {
-    const wchar_t character = value[index];
-    const bool hexadecimal = (character >= L'0' && character <= L'9') || (character >= L'a' && character <= L'f') || (character >= L'A' && character <= L'F');
-    if (hexadecimal) {
-      if (++digits > 4) return false;
-      continue;
+  const size_t compression = value.find(L"::");
+  if (compression != std::wstring::npos) {
+    if (value.find(L"::", compression + 2) != std::wstring::npos) return false;
+    const std::wstring left = value.substr(0, compression);
+    const std::wstring right = value.substr(compression + 2);
+    size_t groups = 0;
+    for (const std::wstring& segment : {left, right}) {
+      size_t start = 0;
+      while (start < segment.size()) {
+        const size_t end = segment.find(L':', start);
+        const std::wstring part = segment.substr(start, end == std::wstring::npos ? std::wstring::npos : end - start);
+        if (!IsIpv6Segment(part)) return false;
+        ++groups;
+        if (end == std::wstring::npos) break;
+        start = end + 1;
+      }
     }
-    if (character != L':') return false;
-    if (digits > 0) {
-      ++groups;
-      digits = 0;
-      continue;
-    }
-    if (compressed || index + 1 >= value.size() || value[index + 1] != L':') return false;
-    compressed = true;
-    ++index;
+    return groups < 8;
   }
-  if (digits > 0) ++groups;
-  return compressed ? groups < 8 : groups == 8;
+
+  size_t groups = 0;
+  size_t start = 0;
+  while (start <= value.size()) {
+    const size_t end = value.find(L':', start);
+    const std::wstring segment = value.substr(start, end == std::wstring::npos ? std::wstring::npos : end - start);
+    if (!IsIpv6Segment(segment)) return false;
+    ++groups;
+    if (end == std::wstring::npos) break;
+    start = end + 1;
+  }
+  return groups == 8;
 }
+
+constexpr wchar_t kFixedSshTarget[] = L"ssh-mcp-target";
 
 std::wstring OpenSshHostName(const std::wstring& host) {
   return IsBracketedIpv6Host(host) ? host.substr(1, host.size() - 2) : host;
@@ -1076,7 +1096,7 @@ NativeReadinessResult ValidateAgentKeyReadiness(SnapshotSession* snapshot, const
       // The approved key is deliberately held only by the current-user agent;
       // no private-key path is available to this native boundary. Restricting
       // identities here would therefore suppress that agent identity.
-      L"-o", L"NumberOfPasswordPrompts=0", L"-o", L"IdentitiesOnly=no", L"-p", std::to_wstring(port), L"-l", user, host};
+      L"-o", L"NumberOfPasswordPrompts=0", L"-o", L"IdentitiesOnly=no", L"-p", std::to_wstring(port), L"-l", user, kFixedSshTarget};
   Handle master;
   if (!StartHiddenProcess(ssh, FixedCommandLine(ssh, master_arguments), &master)) return result;
   const ULONGLONG started = GetTickCount64();
@@ -1086,7 +1106,7 @@ NativeReadinessResult ValidateAgentKeyReadiness(SnapshotSession* snapshot, const
     if (!GetExitCodeProcess(master.get(), &master_exit) || master_exit != STILL_ACTIVE) break;
     const DWORD remaining = static_cast<DWORD>(timeout - (GetTickCount64() - started));
     DWORD check_exit = 1;
-    const std::vector<std::wstring> check_arguments = {L"-F", L"none", L"-S", control_path, L"-O", L"check", L"-l", user, host};
+    const std::vector<std::wstring> check_arguments = {L"-F", L"none", L"-S", control_path, L"-O", L"check", L"-l", user, kFixedSshTarget};
     if (LaunchHiddenProcess(ssh, FixedCommandLine(ssh, check_arguments), std::max<DWORD>(1, std::min<DWORD>(remaining, 250)), &check_exit, cancelled) == LaunchResult::kCompleted && check_exit == 0) {
       ready = true;
       break;
@@ -2938,7 +2958,7 @@ NativeAgentCommandRunResult RunNativeAgentCommand(SnapshotSession* snapshot, con
       L"-o", L"HostName=" + OpenSshHostName(request.host), L"-o", L"BatchMode=yes", L"-o", L"StrictHostKeyChecking=yes", L"-o", L"UserKnownHostsFile=" + known_hosts_short,
       L"-o", L"GlobalKnownHostsFile=NUL", L"-o", L"PasswordAuthentication=no", L"-o", L"KbdInteractiveAuthentication=no",
       L"-o", L"NumberOfPasswordPrompts=0", L"-o", L"IdentityFile=" + identity_file, L"-o", L"IdentitiesOnly=yes", L"-p", std::to_wstring(request.port),
-      L"-l", request.user, request.host};
+      L"-l", request.user, kFixedSshTarget};
   std::vector<std::wstring> fixed_arguments = arguments;
   std::wstring remote_command = PosixShellQuote(request.command);
   for (const std::wstring& argument : request.arguments) remote_command.append(L" ").append(PosixShellQuote(argument));
