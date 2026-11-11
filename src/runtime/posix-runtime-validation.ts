@@ -6,7 +6,12 @@ import { posix as posixPath } from 'node:path';
 
 import { createPlatformCredentialStoreResolver } from '../credentials/credential-store.js';
 import { PosixExecutionAuditJournal, UnavailableExecutionAuditJournal } from '../execution/execution-audit-journal.js';
-import { RemoteCommandExecutionProvider, Ssh2RemoteCommandTransport, type HumanSudoApprovalProvider } from '../execution/remote-command-execution.js';
+import {
+  createProfileExecutionAuthorizationProvider,
+  RemoteCommandExecutionProvider,
+  Ssh2RemoteCommandTransport,
+  type HumanSudoApprovalProvider,
+} from '../execution/remote-command-execution.js';
 import { HostIdentityCredentialPolicy, type AuthorizedConnection, type ConnectionProfile } from '../policy/host-identity-credential-policy.js';
 import { LocalConnectionProfileRegistry, type LocalProfileRegistry } from '../profiles/local-profile-registry.js';
 import {
@@ -536,6 +541,7 @@ export function createRuntimeRemoteCommandExecutionProvider(
     connectionValidation: validationProvider,
     transport: new Ssh2RemoteCommandTransport(credentials, environment.SSH_AUTH_SOCK),
     auditJournal,
+    authorizationProvider: createProfileExecutionAuthorizationProvider(registry, validationProvider),
     humanApproval,
   });
 }

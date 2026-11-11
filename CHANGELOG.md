@@ -13,7 +13,11 @@ publish a release.
   and key-buffer cleanup.
 - Added authenticated POSIX `ssh-mcp-approver` framing with an owner-only
   installation secret, request/response HMACs, fragmented-frame coverage, and
-  cross-process audit-journal locking.
+  cross-process audit-journal locking. The authenticated local request now
+  carries the immutable destination presentation for human confirmation.
+- Bound the POSIX production execution factory to the same validated
+  authorization lease used for readiness, and preserved native Windows
+  host-key, authentication, connection, and remote failure classifications.
 - Bound sudo approval tokens to the validated execution authorization lease and
   report missing approval infrastructure as `failure` with
   `approval-unavailable` before transport.

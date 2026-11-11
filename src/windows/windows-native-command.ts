@@ -63,6 +63,10 @@ export class WindowsNativeAgentCommandTransport implements RemoteCommandTranspor
       const code = (error as { code?: unknown })?.code;
       if (code === 'timeout') throw new RemoteExecutionError('timeout', 'Remote command timed out');
       if (code === 'cancelled') throw new RemoteExecutionError('cancelled', 'Remote command cancelled');
+      if (code === 'host-key-failure') throw new RemoteExecutionError('host-key-failure', 'Windows agent command host verification failed');
+      if (code === 'authentication-failure') throw new RemoteExecutionError('authentication-failure', 'Windows agent command authentication failed');
+      if (code === 'connection-failure') throw new RemoteExecutionError('connection-failure', 'Windows agent command connection failed');
+      if (code === 'remote-failure') throw new RemoteExecutionError('remote-failure', 'Windows agent command failed');
       throw new RemoteExecutionError('connection-failure', 'Remote SSH connection failed');
     });
   }

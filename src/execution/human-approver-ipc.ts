@@ -24,13 +24,21 @@ export interface HumanApproverIpcRequest {
   readonly requestDigest: string;
   readonly operationId: string;
   readonly leaseIdentityDigest: string;
-  /** Deliberately excludes host, user, paths, and credential references. */
+  /** Contains only the immutable destination presentation needed by the local approver. */
   readonly request: Readonly<{
     readonly profileId: string;
     readonly command: string;
     readonly args: readonly string[];
     readonly timeoutMs: number;
     readonly maxOutputBytes: number;
+    readonly presentation: Readonly<{
+      readonly host: string;
+      readonly port: number;
+      readonly user: string;
+      readonly expectedHostFingerprint: string;
+      readonly authMode: ApprovedProfileIdentity['authMode'];
+      readonly approvedKnownHostsReference: string;
+    }>;
   }>;
 }
 
@@ -77,6 +85,7 @@ function canonicalRequest(request: Pick<HumanApproverIpcRequest, 'operationId' |
     request.request.args,
     request.request.timeoutMs,
     request.request.maxOutputBytes,
+    request.request.presentation,
   ]);
 }
 
@@ -114,6 +123,7 @@ function requestMacPayload(request: HumanApproverIpcRequest): readonly unknown[]
     request.request.args,
     request.request.timeoutMs,
     request.request.maxOutputBytes,
+    request.request.presentation,
   ];
 }
 
@@ -331,17 +341,38 @@ export class IpcHumanSudoApprovalProvider implements HumanSudoApprovalProvider {
     if (signal?.aborted || (this.platform !== 'posix' && this.platform !== 'windows')) return false;
     const bound =
       request.operationId !== undefined && request.leaseIdentityDigest !== undefined
-        ? { operationId: request.operationId, leaseIdentityDigest: request.leaseIdentityDigest }
+        ? { operationId: request.operationId, leaseIdentityDigest: request.leaseIdentityDigest, identity: request.approvedIdentity }
         : this.identityForRequest === undefined
           ? undefined
           : this.identityForRequest(request);
-    if (bound === undefined || !isSafeText(bound.operationId, 128) || !isSafeText(bound.leaseIdentityDigest, 128)) return false;
+    if (
+      bound === undefined ||
+      bound.identity === undefined ||
+      !isSafeText(bound.operationId, 128) ||
+      !isSafeText(bound.leaseIdentityDigest, 128) ||
+      !isSafeText(bound.identity.host, 4096) ||
+      !Number.isSafeInteger(bound.identity.port) ||
+      bound.identity.port < 1 ||
+      bound.identity.port > 65535 ||
+      !isSafeText(bound.identity.user, 256) ||
+      !isSafeText(bound.identity.expectedHostFingerprint, 4096) ||
+      !isSafeText(bound.identity.approvedKnownHostsReference, 4096)
+    )
+      return false;
     const wireRequest = Object.freeze({
       profileId: request.profileId,
       command: request.command,
       args: Object.freeze([...request.args]),
       timeoutMs: request.timeoutMs,
       maxOutputBytes: request.maxOutputBytes,
+      presentation: Object.freeze({
+        host: bound.identity.host,
+        port: bound.identity.port,
+        user: bound.identity.user,
+        expectedHostFingerprint: bound.identity.expectedHostFingerprint,
+        authMode: bound.identity.authMode,
+        approvedKnownHostsReference: bound.identity.approvedKnownHostsReference,
+      }),
     });
     const nonce = randomBytes(32).toString('hex');
     const requestDigest = digestRequest({ operationId: bound.operationId, leaseIdentityDigest: bound.leaseIdentityDigest, request: wireRequest });

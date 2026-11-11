@@ -25,6 +25,11 @@ cannot supply any of those values.
    file (`SSH_MCP_APPROVER_SECRET_FILE`), never from MCP input. The client
    authenticates both directions with HMAC; frames are versioned and bound to
    a one-use nonce, operation ID, lease identity digest, and canonical request.
+   The local approver request includes the immutable destination presentation
+   (host, port, user, verified fingerprint, authentication mode, and approved
+   known-hosts reference) so a human can confirm where the command will run;
+   those fields remain inside the authenticated local IPC envelope and are not
+   returned to MCP callers.
    The current Windows native addon does not expose the required
    authenticated named-pipe/SID boundary, so Windows remains unavailable until
    that explicit native dependency is supplied; it is not simulated. The

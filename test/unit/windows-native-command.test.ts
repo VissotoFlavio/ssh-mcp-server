@@ -40,3 +40,17 @@ test('Windows native command boundary receives only opaque capability and fixed 
   assert.equal((seen as { nativeRequest: { command: string } }).nativeRequest.command, 'id');
   assert.equal((seen as { capability: { opaque: boolean } }).capability.opaque, true);
 });
+
+test('Windows native command preserves stable transport classifications', async () => {
+  for (const code of ['host-key-failure', 'authentication-failure', 'connection-failure', 'remote-failure'] as const) {
+    const authorization = createExecutionAuthorization(request.profile, Date.now() + 60_000, Date.now, async () => {
+      throw Object.assign(new Error('native failure'), { code });
+    });
+    await assert.rejects(
+      new WindowsNativeAgentCommandTransport({
+        execute: async () => ({ exitCode: 0, stdout: '', stderr: '', outputTruncated: false }),
+      }).execute({ ...request, authorization }),
+      (error: unknown) => error instanceof RemoteExecutionError && error.code === code,
+    );
+  }
+});

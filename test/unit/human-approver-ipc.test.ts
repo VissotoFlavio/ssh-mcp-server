@@ -22,6 +22,14 @@ const baseRequest = {
   maxOutputBytes: 100,
   operationId: '0123456789abcdef0123456789abcdef',
   leaseIdentityDigest: 'identity-digest',
+  approvedIdentity: {
+    host: 'private.example',
+    port: 22,
+    user: 'deploy',
+    expectedHostFingerprint: 'SHA256:host',
+    authMode: 'agent-key' as const,
+    approvedKnownHostsReference: 'known-hosts://production-api',
+  },
 };
 
 function validResponse(request: HumanApproverIpcRequest, approved = true): HumanApproverIpcResponse {
@@ -55,6 +63,7 @@ function requestMac(request: HumanApproverIpcRequest, secret: Buffer): string {
     request.request.args,
     request.request.timeoutMs,
     request.request.maxOutputBytes,
+    request.request.presentation,
   ];
   return createHmac('sha256', secret)
     .update(`ssh-mcp-approver/request/v1\0${JSON.stringify(fields)}`)
@@ -68,7 +77,7 @@ function responseMac(response: HumanApproverIpcResponse, secret: Buffer): string
     .digest('hex');
 }
 
-test('IPC approval carries operation and immutable identity internally', async () => {
+test('IPC approval carries operation and immutable destination internally', async () => {
   let received: unknown;
   const provider = new IpcHumanSudoApprovalProvider({ approve: async (request) => ((received = request), true) }, 'posix', () => ({
     operationId: '0123456789abcdef0123456789abcdef',
@@ -92,6 +101,14 @@ test('IPC approval carries operation and immutable identity internally', async (
   assert.equal((received as { version: number }).version, 1);
   assert.equal((received as { operationId: string }).operationId, '0123456789abcdef0123456789abcdef');
   assert.equal((received as { leaseIdentityDigest: string }).leaseIdentityDigest, 'identity-digest');
+  assert.deepEqual((received as { request: { presentation: unknown } }).request.presentation, {
+    host: 'private.example',
+    port: 22,
+    user: 'deploy',
+    expectedHostFingerprint: 'SHA256:host',
+    authMode: 'agent-key',
+    approvedKnownHostsReference: 'known-hosts://production-api',
+  });
 });
 
 test('IPC approval fails closed on cancellation', async () => {
@@ -169,7 +186,7 @@ test('IPC cancellation is forwarded to the local channel', async () => {
   assert.equal(cancelled, true);
 });
 
-test('IPC accepts a bound injected success without exposing identity details', async () => {
+test('IPC accepts a bound injected success with destination only inside the local approver request', async () => {
   let received: HumanApproverIpcRequest | undefined;
   const provider = new IpcHumanSudoApprovalProvider(
     {
@@ -194,8 +211,8 @@ test('IPC accepts a bound injected success without exposing identity details', a
     }),
     true,
   );
-  assert.equal(JSON.stringify(received).includes('private.example'), false);
-  assert.equal(JSON.stringify(received).includes('private-path'), false);
+  assert.equal(received?.request.presentation.host, 'private.example');
+  assert.equal(received?.request.presentation.approvedKnownHostsReference, 'private-path');
 });
 
 test('production factory is unavailable on Windows without the authenticated native boundary', async () => {

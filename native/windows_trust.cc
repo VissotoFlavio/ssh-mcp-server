@@ -1732,7 +1732,7 @@ bool AppendExecutionAuditRecord(ExecutionAuditState* state, ExecutionAuditRecord
   result->event_hmac = record.event_hmac;
   state->head = record.event_hmac;
   if (record.event == "intent") state->unfinished.push_back({record.operation_id, record.session_id});
-  else {
+  else if (record.event == "finished") {
     const auto found = std::find_if(state->unfinished.begin(), state->unfinished.end(), [&record](const ExecutionAuditState::UnfinishedIntent& unfinished) {
       return unfinished.operation_id == record.operation_id;
     });
