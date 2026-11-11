@@ -62,6 +62,7 @@ export interface PosixAuditJournalOptions {
 
 const JOURNAL_VERSION = 1;
 const JOURNAL_FILE = 'execution-audit.v1.jsonl';
+const JOURNAL_MANIFEST = 'execution-audit.v1.manifest';
 const JOURNAL_SEGMENT_PATTERN = /^execution-audit\.v1\.(\d{6})\.jsonl$/u;
 const MAX_JOURNAL_BYTES = 4 * 1024 * 1024;
 const PRIVATE_FILE_MODE = 0o600;
@@ -117,6 +118,7 @@ interface JournalLine {
 export class PosixExecutionAuditJournal implements ExecutionAuditJournal {
   private readonly now: () => number;
   private readonly journalPath: string;
+  private readonly manifestPath: string;
   private readonly lockPath: string;
   private queue: Promise<void> = Promise.resolve();
   private readonly sessionId = randomBytes(16).toString('hex');
@@ -128,6 +130,7 @@ export class PosixExecutionAuditJournal implements ExecutionAuditJournal {
     }
     this.now = options.now ?? Date.now;
     this.journalPath = join(options.root, JOURNAL_FILE);
+    this.manifestPath = join(options.root, JOURNAL_MANIFEST);
     this.lockPath = join(options.root, '.execution-audit.lock');
   }
 
@@ -281,14 +284,8 @@ export class PosixExecutionAuditJournal implements ExecutionAuditJournal {
   private async verifyChain(key: Buffer): Promise<string | null> {
     this.unfinished.clear();
     let previous: string | null = null;
-    const names = await readdir(this.options.root);
-    const segmentNames = names
-      .filter((name) => name === JOURNAL_FILE || JOURNAL_SEGMENT_PATTERN.test(name))
-      .sort((left, right) => {
-        if (left === JOURNAL_FILE) return 1;
-        if (right === JOURNAL_FILE) return -1;
-        return Number(JOURNAL_SEGMENT_PATTERN.exec(left)?.[1]) - Number(JOURNAL_SEGMENT_PATTERN.exec(right)?.[1]);
-      });
+    const segmentNames = await this.journalNames();
+    await this.verifyManifest(segmentNames);
     for (const name of segmentNames) {
       const path = join(this.options.root, name);
       let contents: Buffer;
@@ -337,6 +334,83 @@ export class PosixExecutionAuditJournal implements ExecutionAuditJournal {
       }
     }
     return previous;
+  }
+
+  private async journalNames(): Promise<string[]> {
+    const names = await readdir(this.options.root);
+    return names
+      .filter((name) => name === JOURNAL_FILE || JOURNAL_SEGMENT_PATTERN.test(name))
+      .sort((left, right) => {
+        if (left === JOURNAL_FILE) return 1;
+        if (right === JOURNAL_FILE) return -1;
+        return Number(JOURNAL_SEGMENT_PATTERN.exec(left)?.[1]) - Number(JOURNAL_SEGMENT_PATTERN.exec(right)?.[1]);
+      });
+  }
+
+  private async verifyManifest(expectedFiles: readonly string[]): Promise<void> {
+    if (expectedFiles.length === 0) {
+      try {
+        await lstat(this.manifestPath);
+      } catch (error: unknown) {
+        if ((error as { code?: string }).code === 'ENOENT') return;
+      }
+      throw new Error('execution audit manifest is invalid');
+    }
+    let contents: string;
+    try {
+      const stats = await lstat(this.manifestPath);
+      assertSafeFile(stats, this.options.uid);
+      if ((stats.mode & 0o777) !== PRIVATE_FILE_MODE || (await realpath(this.manifestPath)) !== this.manifestPath) {
+        throw new Error('execution audit manifest is invalid');
+      }
+      contents = (await readFile(this.manifestPath)).toString('utf8');
+    } catch {
+      throw new Error('execution audit manifest is invalid');
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(contents) as unknown;
+    } catch {
+      throw new Error('execution audit manifest is invalid');
+    }
+    if (
+      typeof parsed !== 'object' ||
+      parsed === null ||
+      Array.isArray(parsed) ||
+      (parsed as { version?: unknown }).version !== JOURNAL_VERSION ||
+      !Array.isArray((parsed as { files?: unknown }).files) ||
+      JSON.stringify((parsed as { files: unknown[] }).files) !== JSON.stringify(expectedFiles)
+    ) {
+      throw new Error('execution audit manifest is invalid');
+    }
+  }
+
+  private async writeManifest(files: readonly string[]): Promise<void> {
+    const temporary = `${this.manifestPath}.next`;
+    const handle = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), PRIVATE_FILE_MODE);
+    try {
+      const line = `${canonical({ version: JOURNAL_VERSION, files: [...files] })}\n`;
+      const written = await handle.write(line, undefined, 'utf8');
+      if (written.bytesWritten !== Buffer.byteLength(line, 'utf8')) throw new Error('execution audit manifest is unavailable');
+      await handle.chmod(PRIVATE_FILE_MODE);
+      await handle.datasync();
+    } finally {
+      await handle.close();
+    }
+    try {
+      const existing = await lstat(this.manifestPath);
+      assertSafeFile(existing, this.options.uid);
+      if ((existing.mode & 0o777) !== PRIVATE_FILE_MODE || (await realpath(this.manifestPath)) !== this.manifestPath) {
+        throw new Error('execution audit manifest is unavailable');
+      }
+    } catch (error: unknown) {
+      if ((error as { code?: string }).code !== 'ENOENT') {
+        await unlink(temporary).catch(() => undefined);
+        throw error;
+      }
+    }
+    await rename(temporary, this.manifestPath);
+    assertSafeFile(await lstat(this.manifestPath), this.options.uid);
   }
 
   private async append(key: Buffer, previousHmac: string | null, event: Record<string, unknown>): Promise<{ readonly hmac: string }> {
@@ -390,6 +464,7 @@ export class PosixExecutionAuditJournal implements ExecutionAuditJournal {
         } finally {
           await rotated.close();
         }
+        await this.writeManifest(await this.journalNames());
         assertSafeFile(await lstat(this.journalPath), this.options.uid);
         return { hmac };
       }
@@ -399,6 +474,7 @@ export class PosixExecutionAuditJournal implements ExecutionAuditJournal {
     } finally {
       await handle.close();
     }
+    await this.writeManifest(await this.journalNames());
     assertSafeFile(await lstat(this.journalPath), this.options.uid);
     return { hmac };
   }

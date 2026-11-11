@@ -823,14 +823,21 @@ enum class LaunchResult { kCompleted, kTimedOut, kFailed };
 
 bool CreateHiddenProcessWithExplicitHandles(const std::wstring& application, std::wstring* command, HANDLE input, HANDLE output, HANDLE error,
                                             PROCESS_INFORMATION* information) {
-  HANDLE inherited_handles[] = {input, output, error};
+  HANDLE inherited_handles[3]{};
+  SIZE_T inherited_count = 0;
+  for (HANDLE candidate : {input, output, error}) {
+    if (std::find(inherited_handles, inherited_handles + inherited_count, candidate) == inherited_handles + inherited_count) {
+      inherited_handles[inherited_count++] = candidate;
+    }
+  }
+  if (inherited_count == 0) return false;
   SIZE_T attribute_bytes = 0;
   InitializeProcThreadAttributeList(nullptr, 1, 0, &attribute_bytes);
   if (attribute_bytes == 0) return false;
   std::vector<BYTE> attribute_storage(attribute_bytes);
   auto* attributes = reinterpret_cast<PPROC_THREAD_ATTRIBUTE_LIST>(attribute_storage.data());
   if (InitializeProcThreadAttributeList(attributes, 1, 0, &attribute_bytes) == FALSE) return false;
-  if (UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited_handles, sizeof(inherited_handles), nullptr, nullptr) == FALSE) {
+  if (UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited_handles, inherited_count * sizeof(HANDLE), nullptr, nullptr) == FALSE) {
     DeleteProcThreadAttributeList(attributes);
     return false;
   }
@@ -1265,6 +1272,8 @@ std::string JsonString(const std::string& value) {
 
 constexpr wchar_t kExecutionAuditActiveLeaf[] = L"execution-audit.active";
 constexpr wchar_t kExecutionAuditJournalLeaf[] = L"execution-audit.v1.jsonl";
+constexpr wchar_t kExecutionAuditManifestLeaf[] = L"execution-audit.v1.manifest";
+constexpr wchar_t kExecutionAuditSegmentPrefix[] = L"execution-audit.v1.";
 constexpr size_t kExecutionAuditKeyBytes = 32;
 constexpr size_t kExecutionAuditKeyIdBytes = 16;
 constexpr size_t kExecutionAuditMaxArgs = 64;
@@ -1472,6 +1481,62 @@ bool WriteAtomicAuditFile(const std::wstring& root, const std::wstring& leaf, PS
   }
   Handle target(CreateFileW(target_path.c_str(), FILE_READ_ATTRIBUTES | READ_CONTROL, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
   return target.get() != INVALID_HANDLE_VALUE && VerifyFile(target.get(), operator_sid, false);
+}
+
+bool AuditLeafExistsOrUnsafe(const std::wstring& root, const wchar_t* leaf);
+
+bool ListExecutionAuditLeaves(const std::wstring& root, PSID operator_sid, std::vector<std::wstring>* leaves) {
+  if (leaves == nullptr || !VerifyDirectoryChain(root, operator_sid)) return false;
+  leaves->clear();
+  if (AuditLeafExistsOrUnsafe(root, kExecutionAuditJournalLeaf)) leaves->push_back(kExecutionAuditJournalLeaf);
+  const std::wstring pattern = root + L"\\execution-audit.v1.*.jsonl";
+  WIN32_FIND_DATAW data{};
+  HANDLE raw = FindFirstFileW(pattern.c_str(), &data);
+  if (raw == INVALID_HANDLE_VALUE) {
+    return GetLastError() == ERROR_FILE_NOT_FOUND;
+  }
+  Handle search(raw);
+  do {
+    const std::wstring name = data.cFileName;
+    const std::wstring prefix = kExecutionAuditSegmentPrefix;
+    if (name.size() != prefix.size() + 10 || name.compare(0, prefix.size(), prefix) != 0 || name.substr(name.size() - 5) != L".jsonl") return false;
+    for (size_t index = prefix.size(); index < name.size() - 5; ++index) {
+      if (name[index] < L'0' || name[index] > L'9') return false;
+    }
+    leaves->push_back(name);
+  } while (FindNextFileW(search.get(), &data) != FALSE);
+  if (GetLastError() != ERROR_NO_MORE_FILES) return false;
+  std::sort(leaves->begin(), leaves->end(), [](const std::wstring& left, const std::wstring& right) {
+    if (left == kExecutionAuditJournalLeaf) return false;
+    if (right == kExecutionAuditJournalLeaf) return true;
+    return left < right;
+  });
+  return true;
+}
+
+std::string ExecutionAuditManifestText(const std::vector<std::wstring>& leaves) {
+  std::string value = "v1\n";
+  for (const std::wstring& leaf : leaves) {
+    for (const wchar_t character : leaf) value.push_back(static_cast<char>(character));
+    value.push_back('\n');
+  }
+  return value;
+}
+
+bool VerifyExecutionAuditManifest(const std::wstring& root, PSID operator_sid, const std::vector<std::wstring>& leaves) {
+  std::vector<BYTE> content;
+  if (leaves.empty()) return ReadAuditFile(root, kExecutionAuditManifestLeaf, operator_sid, true, &content) && content.empty();
+  if (!ReadAuditFile(root, kExecutionAuditManifestLeaf, operator_sid, false, &content)) return false;
+  const std::string manifest(reinterpret_cast<const char*>(content.data()), content.size());
+  return manifest == ExecutionAuditManifestText(leaves);
+}
+
+bool WriteExecutionAuditManifest(const ExecutionAuditState& state) {
+  std::vector<std::wstring> leaves;
+  if (!ListExecutionAuditLeaves(state.root, state.operator_sid.data(), &leaves)) return false;
+  const std::string text = ExecutionAuditManifestText(leaves);
+  const std::vector<BYTE> bytes(text.begin(), text.end());
+  return WriteAtomicAuditFile(state.root, kExecutionAuditManifestLeaf, state.operator_sid.data(), bytes);
 }
 
 bool AuditLeafExistsOrUnsafe(const std::wstring& root, const wchar_t* leaf) {
@@ -1705,45 +1770,48 @@ bool LoadExecutionAuditState(ExecutionAuditState* state) {
   if (!IsLowerHex(key_id, 32) || active_text != "v1:" + key_id + "\n") return false;
   state->active_key_id = key_id;
   if (!LoadAuditKey(key_id, &state->active_key)) return false;
-  std::vector<BYTE> bytes;
-  if (!ReadAuditFile(state->root, kExecutionAuditJournalLeaf, state->operator_sid.data(), true, &bytes)) return false;
-  if (bytes.empty()) return true;
-  const std::string contents(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-  if (contents.back() != '\n') return false;
-  size_t cursor = 0;
+  std::vector<std::wstring> leaves;
+  if (!ListExecutionAuditLeaves(state->root, state->operator_sid.data(), &leaves) || !VerifyExecutionAuditManifest(state->root, state->operator_sid.data(), leaves)) return false;
   std::string previous;
   std::string expected_active_key_id;
-  while (cursor < contents.size()) {
-    const size_t next = contents.find('\n', cursor);
-    if (next == std::string::npos || next == cursor) return false;
-    const std::string line = contents.substr(cursor, next - cursor);
-    ExecutionAuditRecord record;
-    std::vector<BYTE> key;
-    WipeBytesOnExit wipe_key(&key);
-    std::string expected_hmac;
-    if (!ParseAuditRecord(line, &record) || record.has_previous != !previous.empty() || (record.has_previous && record.previous_event_hmac != previous) ||
-        !LoadAuditKey(record.key_id, &key) || !HmacSha256(key, SerializeAuditRecord(record, false), &expected_hmac)) return false;
-    if (expected_hmac != record.event_hmac || line != SerializeAuditRecord(record, true)) return false;
-    if (!expected_active_key_id.empty() && record.event != "rotation" && record.key_id != expected_active_key_id) return false;
-    if (record.event == "rotation") {
-      if (!IsLowerHex(record.new_key_id, kExecutionAuditKeyIdBytes * 2)) return false;
-      expected_active_key_id = record.new_key_id;
+  for (const std::wstring& leaf : leaves) {
+    std::vector<BYTE> bytes;
+    if (!ReadAuditFile(state->root, leaf, state->operator_sid.data(), false, &bytes)) return false;
+    const std::string contents(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    if (contents.empty() || contents.back() != '\n') return false;
+    size_t cursor = 0;
+    while (cursor < contents.size()) {
+      const size_t next = contents.find('\n', cursor);
+      if (next == std::string::npos || next == cursor) return false;
+      const std::string line = contents.substr(cursor, next - cursor);
+      ExecutionAuditRecord record;
+      std::vector<BYTE> key;
+      WipeBytesOnExit wipe_key(&key);
+      std::string expected_hmac;
+      if (!ParseAuditRecord(line, &record) || record.has_previous != !previous.empty() || (record.has_previous && record.previous_event_hmac != previous) ||
+          !LoadAuditKey(record.key_id, &key) || !HmacSha256(key, SerializeAuditRecord(record, false), &expected_hmac)) return false;
+      if (expected_hmac != record.event_hmac || line != SerializeAuditRecord(record, true)) return false;
+      if (!expected_active_key_id.empty() && record.event != "rotation" && record.key_id != expected_active_key_id) return false;
+      if (record.event == "rotation") {
+        if (!IsLowerHex(record.new_key_id, kExecutionAuditKeyIdBytes * 2)) return false;
+        expected_active_key_id = record.new_key_id;
+      }
+      if (record.event == "intent") {
+        const auto duplicate = std::find_if(state->unfinished.begin(), state->unfinished.end(), [&record](const ExecutionAuditState::UnfinishedIntent& unfinished) {
+          return unfinished.operation_id == record.operation_id;
+        });
+        if (duplicate != state->unfinished.end()) return false;
+        state->unfinished.push_back({record.operation_id, record.legacy_session ? "legacy" : record.session_id});
+      } else if (record.event == "finished") {
+        const auto found = std::find_if(state->unfinished.begin(), state->unfinished.end(), [&record](const ExecutionAuditState::UnfinishedIntent& unfinished) {
+          return unfinished.operation_id == record.operation_id;
+        });
+        if (found == state->unfinished.end()) return false;
+        state->unfinished.erase(found);
+      }
+      previous = record.event_hmac;
+      cursor = next + 1;
     }
-    if (record.event == "intent") {
-      const auto duplicate = std::find_if(state->unfinished.begin(), state->unfinished.end(), [&record](const ExecutionAuditState::UnfinishedIntent& unfinished) {
-        return unfinished.operation_id == record.operation_id;
-      });
-      if (duplicate != state->unfinished.end()) return false;
-      state->unfinished.push_back({record.operation_id, record.legacy_session ? "legacy" : record.session_id});
-    } else if (record.event == "finished") {
-      const auto found = std::find_if(state->unfinished.begin(), state->unfinished.end(), [&record](const ExecutionAuditState::UnfinishedIntent& unfinished) {
-        return unfinished.operation_id == record.operation_id;
-      });
-      if (found == state->unfinished.end()) return false;
-      state->unfinished.erase(found);
-    }
-    previous = record.event_hmac;
-    cursor = next + 1;
   }
   if (!expected_active_key_id.empty() && state->active_key_id != expected_active_key_id) return false;
   state->head = previous;
@@ -1764,6 +1832,24 @@ bool AppendExecutionAuditRecord(ExecutionAuditState* state, ExecutionAuditRecord
   record.timestamp = static_cast<long long>(ticks.QuadPart / 10000ULL) - 11644473600000LL;
   if (!HmacSha256(state->active_key, SerializeAuditRecord(record, false), &record.event_hmac)) return false;
   const std::string line = SerializeAuditRecord(record, true) + "\n";
+  if (line.size() > kExecutionAuditMaxBytes) return false;
+  std::vector<BYTE> active_bytes;
+  if (!ReadAuditFile(state->root, kExecutionAuditJournalLeaf, state->operator_sid.data(), true, &active_bytes)) return false;
+  if (active_bytes.size() > kExecutionAuditMaxBytes || line.size() > kExecutionAuditMaxBytes - active_bytes.size()) {
+    std::vector<std::wstring> leaves;
+    if (!ListExecutionAuditLeaves(state->root, state->operator_sid.data(), &leaves)) return false;
+    unsigned long next_segment = 1;
+    for (const std::wstring& leaf : leaves) {
+      if (leaf == kExecutionAuditJournalLeaf) continue;
+      const unsigned long number = std::wcstoul(leaf.substr(std::wstring(kExecutionAuditSegmentPrefix).size(), 6).c_str(), nullptr, 10);
+      next_segment = std::max(next_segment, number + 1);
+    }
+    wchar_t segment_name[64]{};
+    if (swprintf_s(segment_name, L"execution-audit.v1.%06lu.jsonl", next_segment) <= 0 ||
+        !MoveFileExW((state->root + L"\\" + kExecutionAuditJournalLeaf).c_str(), (state->root + L"\\" + segment_name).c_str(), MOVEFILE_WRITE_THROUGH))
+      return false;
+    if (!ListExecutionAuditLeaves(state->root, state->operator_sid.data(), &leaves) || !WriteExecutionAuditManifest(*state)) return false;
+  }
   const std::wstring path = state->root + L"\\" + kExecutionAuditJournalLeaf;
   Handle file(CreateFileW(path.c_str(), GENERIC_READ | FILE_APPEND_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
   if (file.get() == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_NOT_FOUND) {
@@ -1793,7 +1879,7 @@ bool AppendExecutionAuditRecord(ExecutionAuditState* state, ExecutionAuditRecord
     if (found == state->unfinished.end()) return false;
     state->unfinished.erase(found);
   }
-  return true;
+  return WriteExecutionAuditManifest(*state);
 }
 
 bool AppendAuditIntent(const ExecutionAuditRecord& intent, ExecutionAuditAppendResult* result) {

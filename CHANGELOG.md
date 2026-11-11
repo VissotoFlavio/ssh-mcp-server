@@ -13,6 +13,10 @@ publish a release.
   fail-closed `approval-unavailable` behavior. Added durable approval and
   handoff journal events, a one-pending-approval limit with `approval-busy`,
   and native broker startup documentation.
+- Added durable HMAC journal manifests and pre-append segment rollover on
+  POSIX and Windows, with indefinite retention and fail-closed manifest
+  verification. Added Windows CI coverage for real native `binding.execute`
+  calls against a disposable local SSH server using an ephemeral agent key.
 
 - Added the native Windows execution-audit provider with Credential Manager
   HMAC keys, explicit operator initialization/rotation, session-aware recovery,

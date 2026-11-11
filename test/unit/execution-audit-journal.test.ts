@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
-import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -35,8 +35,28 @@ test('writes durable chained intent and finished events without output', async (
   await handle.finish({ outcome: 'success', code: 'success', exitCode: 0, durationMs: 2 });
   const serialized = await readFile(join(fixtureState.root, 'execution-audit.v1.jsonl'), 'utf8');
   assert.equal(serialized.split('\n').filter(Boolean).length, 4);
+  assert.deepEqual(JSON.parse(await readFile(join(fixtureState.root, 'execution-audit.v1.manifest'), 'utf8')), {
+    version: 1,
+    files: ['execution-audit.v1.jsonl'],
+  });
   assert.equal(serialized.includes('stdout'), false);
   assert.equal(serialized.includes('password'), false);
+});
+
+test('rotates POSIX journal segments before the next durable append and rejects manifest drift', async (t) => {
+  if (process.platform === 'win32') return t.skip('POSIX journal permission checks require a POSIX filesystem');
+  const fixtureState = await fixture();
+  const journal = new PosixExecutionAuditJournal({ ...fixtureState, uid: process.getuid?.() });
+  const oversizedArgs = ['x'.repeat(4096)];
+  for (let index = 0; index < 1_000; index += 1) {
+    const handle = await journal.begin({ ...intent, operationId: index.toString(16).padStart(32, '0'), args: oversizedArgs });
+    await handle.finish({ outcome: 'success', code: 'success', exitCode: 0, durationMs: 1 });
+  }
+  const names = (await readdir(fixtureState.root)).filter((name) => /^execution-audit\.v1\./u.test(name));
+  assert.ok(names.some((name) => /\.\d{6}\.jsonl$/u.test(name)));
+  await writeFile(join(fixtureState.root, 'execution-audit.v1.manifest'), '{"version":1,"files":[]}\n', { mode: 0o600 });
+  const freshJournal = new PosixExecutionAuditJournal({ ...fixtureState, uid: process.getuid?.() });
+  await assert.rejects(() => freshJournal.begin({ ...intent, operationId: 'abcdefabcdefabcdefabcdefabcdefab' }), /manifest|chain/u);
 });
 
 test('fails closed for missing, rotated, and invalid chain keys', async (t) => {

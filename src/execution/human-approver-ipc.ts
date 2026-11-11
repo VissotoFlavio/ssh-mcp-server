@@ -1,5 +1,6 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { promises as fs } from 'node:fs';
+import { createRequire } from 'node:module';
 import { createConnection, type Socket } from 'node:net';
 import { dirname } from 'node:path';
 import process from 'node:process';
@@ -23,6 +24,25 @@ const APPROVER_PIPE_ENV = 'SSH_MCP_APPROVER_PIPE';
 const APPROVER_SECRET_ENV = 'SSH_MCP_APPROVER_SECRET';
 const APPROVER_SECRET_BYTES = 32;
 const HEX_64 = /^[a-f0-9]{64}$/u;
+const require = createRequire(import.meta.url);
+
+interface PosixPeerCredentialsBinding {
+  getPeerCredentials(descriptor: number): { readonly uid: number; readonly pid?: number };
+}
+
+function loadPosixPeerCredentialsBinding(): PosixPeerCredentialsBinding | undefined {
+  if (process.platform !== 'linux' && process.platform !== 'darwin') return undefined;
+  try {
+    const binding = require('../../build/Release/posix_peer_credentials.node') as unknown;
+    if (typeof binding !== 'object' || binding === null || typeof (binding as { getPeerCredentials?: unknown }).getPeerCredentials !== 'function')
+      return undefined;
+    return binding as PosixPeerCredentialsBinding;
+  } catch {
+    return undefined;
+  }
+}
+
+const posixPeerCredentialsBinding = loadPosixPeerCredentialsBinding();
 
 export interface HumanApproverIpcRequest {
   readonly version: typeof IPC_VERSION;
@@ -335,6 +355,23 @@ function closeSocket(socket: Socket): void {
   socket.destroy();
 }
 
+function hasTrustedUnixPeer(socket: Socket): boolean {
+  const descriptor = (socket as unknown as { readonly _handle?: { readonly fd?: unknown } })._handle?.fd;
+  const uid = process.getuid?.();
+  if (posixPeerCredentialsBinding === undefined || typeof descriptor !== 'number' || uid === undefined) return false;
+  try {
+    const credentials = posixPeerCredentialsBinding.getPeerCredentials(descriptor);
+    return (
+      credentials !== null &&
+      typeof credentials === 'object' &&
+      credentials.uid === uid &&
+      (process.platform === 'darwin' || (typeof credentials.pid === 'number' && credentials.pid > 0))
+    );
+  } catch {
+    return false;
+  }
+}
+
 /** Real POSIX client. The server must create the socket with owner-only permissions. */
 export class UnixSocketHumanApproverChannel implements HumanApproverIpcChannel {
   constructor(
@@ -377,6 +414,7 @@ export class UnixSocketHumanApproverChannel implements HumanApproverIpcChannel {
       signal?.addEventListener('abort', abort, { once: true });
       socket.on('connect', () => {
         try {
+          if (!hasTrustedUnixPeer(socket)) throw new Error('approver peer credentials unavailable');
           socket.end(
             encodeFrame({
               ...request,

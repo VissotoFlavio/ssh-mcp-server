@@ -5,6 +5,7 @@ import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { Server } from 'ssh2';
 
 const addonPath = join(process.cwd(), 'build', 'Release', 'windows_trust.node');
 const testAddonPath = join(process.cwd(), 'build', 'Release', 'windows_trust_test.node');
@@ -85,6 +86,64 @@ function hasExistingPerUserConfiguration(): boolean {
   } catch {
     return false;
   }
+}
+
+function runSshKeygen(output: string, comment: string): void {
+  execFileSync('ssh-keygen.exe', ['-q', '-t', 'ed25519', '-N', '', '-C', comment, '-f', output], { stdio: 'pipe' });
+}
+
+function publicKeyParts(path: string): { readonly algorithm: string; readonly encoded: string; readonly data: Buffer } {
+  const [algorithm, encoded] = readFileSync(path, 'utf8').trim().split(/\s+/u);
+  if (algorithm === undefined || encoded === undefined) throw new Error('SSH fixture public key is invalid');
+  return { algorithm, encoded, data: Buffer.from(encoded, 'base64') };
+}
+
+function fingerprint(publicKeyPath: string): string {
+  const output = execFileSync('ssh-keygen.exe', ['-lf', publicKeyPath, '-E', 'sha256'], { encoding: 'utf8' });
+  const match = /\b(SHA256:[A-Za-z0-9+/]+)\b/u.exec(output);
+  if (match === null) throw new Error('SSH fixture fingerprint is unavailable');
+  return match[1];
+}
+
+async function listenLocalSshFixture(hostKeyPath: string, agentPublicKey: Buffer): Promise<{ readonly server: Server; readonly port: number }> {
+  const server = new Server({ hostKeys: [readFileSync(hostKeyPath)] });
+  server.on('connection', (client) => {
+    client.on('authentication', (context) => {
+      if (context.method === 'publickey' && context.key.data.equals(agentPublicKey)) context.accept();
+      else context.reject();
+    });
+    client.on('ready', () => {
+      client.on('session', (accept) => {
+        const session = accept();
+        session.on('exec', (acceptChannel, _reject, info) => {
+          const channel = acceptChannel();
+          if (info.command.includes('ssh-mcp-e2e-timeout')) return;
+          if (info.command.includes('ssh-mcp-e2e-failure')) {
+            channel.stderr.write('fixture remote failure\n');
+            channel.exit(7);
+            channel.end();
+            return;
+          }
+          if (info.command.includes('ssh-mcp-e2e-output')) {
+            channel.write('x'.repeat(128 * 1024));
+            channel.exit(0);
+            channel.end();
+            return;
+          }
+          channel.write('ssh-mcp-e2e-success\n');
+          channel.exit(0);
+          channel.end();
+        });
+      });
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => resolve());
+  });
+  const address = server.address();
+  if (address === null || typeof address === 'string') throw new Error('SSH fixture did not expose a TCP port');
+  return { server, port: address.port };
 }
 
 if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAddonPath)) {
@@ -292,6 +351,7 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
       const beforeRotation = readFileSync(join(root, 'state', 'execution-audit.v1.jsonl'), 'utf8');
       assert.match(beforeRotation, /"keyId":"[0-9a-f]{32}"/u);
       assert.doesNotMatch(beforeRotation, /secret|stdout|stderr/u);
+      assert.equal(readFileSync(join(root, 'state', 'execution-audit.v1.manifest'), 'utf8'), 'v1\nexecution-audit.v1.jsonl\n');
       binding.rotateExecutionAuditKey();
       const afterRotation = readFileSync(join(root, 'state', 'execution-audit.v1.jsonl'), 'utf8');
       assert.match(afterRotation, /"event":"rotation"/u);
@@ -658,6 +718,81 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
     }
     for (const invalid of [0, -1, 60_001, '1000']) {
       assert.throws(() => binding.probeSshAdd(invalid), /Windows secure storage is unavailable/u);
+    }
+  });
+
+  test('executes the real native binding against a disposable local SSH fixture', { timeout: 120_000 }, async () => {
+    const root = uniqueRoot('native-command-e2e');
+    let configured = false;
+    let server: Server | undefined;
+    const privateAgentKey = join(root, 'state', 'agent-private');
+    const privateHostKey = join(root, 'state', 'host-private');
+    try {
+      runFixture('safe', root);
+      configured = true;
+      runSshKeygen(privateAgentKey, 'ssh-mcp-agent');
+      const agentPublic = publicKeyParts(`${privateAgentKey}.pub`);
+      writeFileSync(join(root, 'keys', 'ssh-mcp-agent-ed25519.pub'), `${agentPublic.algorithm} ${agentPublic.encoded} ssh-mcp-agent\n`, 'utf8');
+      execFileSync('ssh-add.exe', [privateAgentKey], { stdio: 'pipe' });
+      runSshKeygen(privateHostKey, 'ssh-mcp-e2e-host');
+      const hostPublic = publicKeyParts(`${privateHostKey}.pub`);
+      const fixture = await listenLocalSshFixture(privateHostKey, agentPublic.data);
+      server = fixture.server;
+      const host = '127.0.0.1';
+      const hostFingerprint = fingerprint(`${privateHostKey}.pub`);
+      writeFileSync(
+        join(root, 'known-hosts', 'production-api.known_hosts'),
+        `[${host}]:${fixture.port} ${hostPublic.algorithm} ${hostPublic.encoded}\n`,
+        'utf8',
+      );
+      const baseRequest = {
+        profileId: 'production-api',
+        host,
+        port: fixture.port,
+        user: 'fixture-user',
+        expectedHostFingerprint: hostFingerprint,
+        command: 'printf',
+        args: ['ssh-mcp-e2e-success'],
+        timeoutMs: 5_000,
+        maxOutputBytes: 1_024,
+      };
+      const execute = async (request: object, signal?: AbortSignal): Promise<{ readonly exitCode: number; readonly stdout: string }> => {
+        const snapshot = binding.captureKnownHostsSnapshot('production-api');
+        try {
+          return (await binding.execute(snapshot.capability, request, signal)) as { readonly exitCode: number; readonly stdout: string };
+        } finally {
+          binding.disposeKnownHostsSnapshot(snapshot.capability);
+        }
+      };
+
+      const success = await execute(baseRequest);
+      assert.equal(success.exitCode, 0);
+      assert.match(success.stdout, /ssh-mcp-e2e-success/u);
+      await assert.rejects(
+        execute({ ...baseRequest, args: ['ssh-mcp-e2e-failure'] }),
+        (error: unknown) => (error as { code?: string }).code === 'remote-failure' || (error as { code?: string }).code === 'outcome-unknown',
+      );
+      await assert.rejects(
+        execute({ ...baseRequest, args: ['ssh-mcp-e2e-timeout'], timeoutMs: 250 }),
+        (error: unknown) => (error as { code?: string }).code === 'timeout',
+      );
+      const controller = new AbortController();
+      const cancelled = execute({ ...baseRequest, args: ['ssh-mcp-e2e-timeout'], timeoutMs: 5_000 }, controller.signal);
+      setTimeout(() => controller.abort(), 100).unref?.();
+      await assert.rejects(cancelled, (error: unknown) => (error as { code?: string }).code === 'cancelled');
+      await assert.rejects(
+        execute({ ...baseRequest, args: ['ssh-mcp-e2e-output'], maxOutputBytes: 32 }),
+        (error: unknown) => (error as { code?: string }).code === 'output-limit',
+      );
+      assert.equal(testBinding.testSnapshotArtifactCount(), 0);
+    } finally {
+      server?.close();
+      try {
+        execFileSync('ssh-add.exe', ['-d', privateAgentKey], { stdio: 'ignore' });
+      } catch {
+        // The fixture key may already have been removed by the runner.
+      }
+      if (configured) runFixture('cleanup', root);
     }
   });
 }

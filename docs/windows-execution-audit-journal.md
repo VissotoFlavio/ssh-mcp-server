@@ -29,14 +29,16 @@ configuration is unsafe or the requested state already exists.
 Each append validates the fixed root and leaf owner/DACL, rejects reparse
 points, checks file identity, serializes access through a named mutex, and
 calls `FlushFileBuffers` before returning. The JSONL chain contains `keyId`,
-`previousEventHmac`, and `eventHmac`. An interrupted intent is closed with
+`previousEventHmac`, and `eventHmac`. A protected manifest lists the active
+file and every immutable segment; a projected append at 4 MiB rotates the
+active file before writing the next event. Segments are retained indefinitely
+and are never deleted automatically. An interrupted intent is closed with
 `outcome: "unknown"` and `code: "outcome-unknown"` before the next intent is
-accepted. Any missing key, unsafe file, tampered line, lock, write, or flush
-failure returns `execution-audit-unavailable` before SSH is attempted. The
-journal is bounded at 4 MiB; an append that would exceed the bound fails
-closed. Explicit key rotation does not silently truncate the existing chain;
-an approved archive/segmentation procedure is still required for sustained
-high-volume operation before the next command can be accepted at the limit.
+accepted. Any missing key, unsafe file, manifest inconsistency, tampered line,
+lock, write, or flush failure returns `execution-audit-unavailable` before SSH
+is attempted. Archiving a segment is an explicit operator action and must be
+followed by an independent manifest/chain verification before execution is
+re-enabled.
 
 The journal and its matching Windows Generic Credentials are operational
 security records. Preserve them together when collecting evidence; do not copy

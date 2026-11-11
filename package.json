@@ -6,6 +6,7 @@
     "dist",
     "build/Release/windows_trust.node",
     "build/Release/ssh-mcp-approver.exe",
+    "build/Release/posix_peer_credentials.node",
     "README.md",
     "CHANGELOG.md",
     "docs",
@@ -19,7 +20,7 @@
   },
   "scripts": {
     "build": "tsc --project tsconfig.json",
-    "build:native": "node -e \"if (process.platform !== 'win32') process.exit(0)\" && node-gyp rebuild",
+    "build:native": "node-gyp rebuild",
     "install": "node -e \"process.exit(0)\"",
     "check": "tsc --project tsconfig.test.json --noEmit",
     "lint": "npm run check && eslint src test",

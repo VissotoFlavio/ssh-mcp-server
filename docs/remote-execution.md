@@ -31,9 +31,11 @@ cannot supply any of those values.
    known-hosts reference) so a human can confirm where the command will run;
    those fields remain inside the authenticated local IPC envelope and are not
    returned to MCP callers.
-   The POSIX socket and its secret are a local same-user trust boundary: run
-   the MCP server and approver under a dedicated OS identity, restrict the
-   socket directory and secret to that identity, and do not treat this IPC as
+   The POSIX socket and its secret are a local trust boundary: the client
+   requires owner-only socket/key material and validates `SO_PEERCRED` on Linux
+   or `getpeereid` on macOS in addition to HMAC. If the platform cannot expose
+   peer credentials, approval remains unavailable. Run the MCP server and
+   approver under a dedicated OS identity and do not treat this IPC as
    protection from another process already trusted as the same user.
    On Windows, build the packaged native broker and start it with
    `npm run windows:approver`; it creates a SID/DACL-protected named pipe,
@@ -82,7 +84,8 @@ cannot supply any of those values.
   finished events are versioned, HMAC chained, and fdatasynced. Missing or
   interrupted finishes are `outcome-unknown` with null exit code and empty
   output; clients must not retry automatically. The POSIX journal is bounded
-  at 4 MiB and fails closed when the next append would exceed that limit.
+  at 4 MiB, rotates HMAC-linked segments before the next append, retains them
+  indefinitely, and fails closed for a missing or inconsistent manifest.
 
 ## Supported operations and exclusions
 
