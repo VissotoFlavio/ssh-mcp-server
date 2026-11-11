@@ -3076,6 +3076,14 @@ napi_value StartNativeAgentCommand(napi_env env, napi_callback_info info) {
   }
   if (count == 3) {
     napi_valuetype signal_type{};
+    if (napi_typeof(env, arguments[2], &signal_type) != napi_ok) {
+      snapshot->Release();
+      return Unavailable(env);
+    }
+    if (signal_type == napi_undefined) count = 2;
+  }
+  if (count == 3) {
+    napi_valuetype signal_type{};
     napi_value add{};
     napi_value remove{};
     napi_value signal = arguments[2];
