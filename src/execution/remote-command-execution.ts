@@ -3,6 +3,7 @@ import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { Client, type AuthHandlerMiddleware, type ClientChannel, type ConnectConfig, type NextAuthHandler } from 'ssh2';
 
 import { serializeAuditEvent } from '../diagnostics/redacted-diagnostics-audit.js';
+import { HostIdentityCredentialPolicyError } from '../policy/host-identity-credential-policy.js';
 import type { ConnectionProfile } from '../profiles/connection-profile.js';
 import type { ConnectionValidationProvider } from '../validation/trusted-connection-validation.js';
 
@@ -97,6 +98,8 @@ export interface RemoteCommandTransportRequest {
   readonly args: readonly string[];
   readonly timeoutMs: number;
   readonly maxOutputBytes: number;
+  /** Called once the transport has handed the command to the remote session. */
+  readonly onCommandStarted?: () => void;
 }
 
 export interface RemoteCommandTransportResult {
@@ -324,6 +327,11 @@ export function createProfileExecutionAuthorizationProvider(
         return createExecutionAuthorization(validated.profile, now() + APPROVAL_TTL_MS, now, validated.withTransportContext, validated.release);
       } catch (error) {
         if (error instanceof RemoteExecutionError) throw error;
+        if (error instanceof HostIdentityCredentialPolicyError) {
+          if (error.code.startsWith('known-hosts-')) throw new RemoteExecutionError('host-key-failure', 'Remote host identity validation failed');
+          if (error.code === 'agent-identity-unavailable' || error.code.startsWith('credential-'))
+            throw new RemoteExecutionError('authentication-failure', 'Remote authentication validation failed');
+        }
         throw new RemoteExecutionError('provider-failure', 'Remote profile validation failed');
       }
     },
@@ -351,13 +359,17 @@ function cryptoRandomToken(): string {
   return randomBytes(32).toString('hex');
 }
 
+function releaseAuthorization(authorization: ExecutionAuthorization | undefined): void {
+  if (authorization?.release === undefined) return;
+  void authorization.release().catch(() => undefined);
+}
+
 /** In-memory, request-bound, expiring and one-shot approval capability. */
 export class SudoApprovalStore {
   private readonly approvals = new Map<
     string,
     {
       readonly requestHash: string;
-      readonly request: SudoApprovalRequest;
       readonly identity: ApprovedProfileIdentity;
       readonly expiresAt: number;
       readonly authorization?: ExecutionAuthorization;
@@ -376,7 +388,6 @@ export class SudoApprovalStore {
     const frozenRequest = Object.freeze({ ...request, args: Object.freeze([...request.args]) });
     this.approvals.set(token, {
       requestHash: canonicalRequest(frozenRequest, identity),
-      request: frozenRequest,
       identity,
       expiresAt,
       authorization,
@@ -386,30 +397,11 @@ export class SudoApprovalStore {
       const current = this.approvals.get(token);
       if (current?.used !== true && current?.expiresAt === expiresAt) {
         this.approvals.delete(token);
-        void current.authorization?.release?.();
+        releaseAuthorization(current.authorization);
       }
     }, APPROVAL_TTL_MS);
     expiry.unref?.();
     return Object.freeze({ token, request: frozenRequest, identity, authorization, expiresAt });
-  }
-
-  consume(
-    token: string,
-    request: SudoApprovalRequest,
-    identity: ApprovedProfileIdentity,
-    now = Date.now(),
-  ): 'approved' | 'expired' | 'altered' | 'reused' {
-    const record = this.approvals.get(token);
-    if (record === undefined || record.used) return 'reused';
-    if (record.expiresAt <= now) {
-      this.approvals.delete(token);
-      void record.authorization?.release?.();
-      return 'expired';
-    }
-    if (record.requestHash !== canonicalRequest(request, identity)) return 'altered';
-    record.used = true;
-    this.approvals.delete(token);
-    return 'approved';
   }
 
   consumeForAuthorization(
@@ -421,7 +413,7 @@ export class SudoApprovalStore {
     if (record === undefined || record.used) return { status: 'reused' };
     if (record.expiresAt <= now) {
       this.approvals.delete(token);
-      void record.authorization?.release?.();
+      releaseAuthorization(record.authorization);
       return { status: 'expired' };
     }
     if (record.requestHash !== canonicalRequest(request, record.identity)) return { status: 'altered' };
@@ -529,7 +521,29 @@ async function boundedTransportExecute(
   request: RemoteCommandTransportRequest,
   signal: AbortSignal | undefined,
 ): Promise<RemoteCommandTransportResult> {
-  return boundedOperation((operationSignal) => transport.execute(request, operationSignal), request.timeoutMs, signal);
+  let commandStarted = false;
+  try {
+    return await boundedOperation(
+      (operationSignal) =>
+        transport.execute(
+          {
+            ...request,
+            onCommandStarted: () => {
+              commandStarted = true;
+              request.onCommandStarted?.();
+            },
+          },
+          operationSignal,
+        ),
+      request.timeoutMs,
+      signal,
+    );
+  } catch (error) {
+    const code = mapTransportError(error);
+    if (commandStarted && (code === 'timeout' || code === 'cancelled'))
+      throw new RemoteExecutionError('outcome-unknown', 'Remote command outcome is unknown');
+    throw error;
+  }
 }
 
 function mapTransportError(error: unknown): RemoteExecutionCode {
@@ -778,6 +792,7 @@ export class RemoteCommandExecutionProvider {
 
     if (signal?.aborted) return finish(safeResult(request.profileId, 'cancelled', 'cancelled', { operationId }));
     let authorization: ExecutionAuthorization | undefined;
+    let commandStarted = false;
     try {
       if (requiresSudo(request.command, request.args)) {
         approvalState = 'blocked';
@@ -830,6 +845,9 @@ export class RemoteCommandExecutionProvider {
             args: request.args,
             timeoutMs: remainingTimeout(startedAt, request.timeoutMs!),
             maxOutputBytes: request.maxOutputBytes!,
+            onCommandStarted: () => {
+              commandStarted = true;
+            },
           },
           signal,
         ),
@@ -839,7 +857,13 @@ export class RemoteCommandExecutionProvider {
       const safe = safeResult(request.profileId, outcome, outcome === 'success' ? 'success' : 'remote-failure', { ...result, operationId });
       return finish(safe);
     } catch (error) {
-      const code = signal?.aborted ? 'cancelled' : mapTransportError(error);
+      const mappedCode = mapTransportError(error);
+      const code =
+        commandStarted && (signal?.aborted || mappedCode === 'timeout' || mappedCode === 'cancelled')
+          ? 'outcome-unknown'
+          : signal?.aborted
+            ? 'cancelled'
+            : mappedCode;
       const outcome: RemoteExecutionOutcome =
         code === 'outcome-unknown' ? 'unknown' : code === 'timeout' ? 'timeout' : code === 'cancelled' ? 'cancelled' : 'failure';
       return finish(safeResult(request.profileId, outcome, code, { operationId }));
@@ -927,7 +951,12 @@ export class Ssh2RemoteCommandTransport implements RemoteCommandTransport {
           channel?.close();
           client.destroy();
         } finally {
-          finish(new RemoteExecutionError('cancelled', 'Remote command cancelled'));
+          finish(
+            new RemoteExecutionError(
+              commandStarted ? 'outcome-unknown' : 'cancelled',
+              commandStarted ? 'Remote command outcome is unknown' : 'Remote command cancelled',
+            ),
+          );
         }
       };
       const timeout = () => {
@@ -936,7 +965,12 @@ export class Ssh2RemoteCommandTransport implements RemoteCommandTransport {
           channel?.close();
           client.destroy();
         } finally {
-          finish(new RemoteExecutionError('timeout', 'Remote command timed out'));
+          finish(
+            new RemoteExecutionError(
+              commandStarted ? 'outcome-unknown' : 'timeout',
+              commandStarted ? 'Remote command outcome is unknown' : 'Remote command timed out',
+            ),
+          );
         }
       };
       const timer = setTimeout(timeout, request.timeoutMs);
@@ -954,8 +988,8 @@ export class Ssh2RemoteCommandTransport implements RemoteCommandTransport {
         finish(new RemoteExecutionError(code, 'Remote SSH connection failed'));
       });
       client.on('close', () => {
-        if (!finished && timedOut) finish(new RemoteExecutionError('timeout', 'Remote command timed out'));
-        else if (!finished && commandStarted) finish(new RemoteExecutionError('outcome-unknown', 'Remote command outcome is unknown'));
+        if (!finished && commandStarted) finish(new RemoteExecutionError('outcome-unknown', 'Remote command outcome is unknown'));
+        else if (!finished && timedOut) finish(new RemoteExecutionError('timeout', 'Remote command timed out'));
       });
       try {
         const authHandler: AuthHandlerMiddleware = (_methodsLeft, _partialSuccess, callback: NextAuthHandler) => {
@@ -982,6 +1016,7 @@ export class Ssh2RemoteCommandTransport implements RemoteCommandTransport {
         client.on('ready', () => {
           ready = true;
           commandStarted = true;
+          request.onCommandStarted?.();
           client.exec(remoteCommand(request.command, request.args), (error, execChannel) => {
             if (error !== undefined) return finish(new RemoteExecutionError('remote-failure', 'Remote command failed'));
             channel = execChannel;

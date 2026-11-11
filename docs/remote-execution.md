@@ -52,6 +52,9 @@ cannot supply any of those values.
 - Cancellation aborts the channel and closes the SSH client.
 - Timeout or cancellation closes the server-controlled channel/session but
   does not promise to kill a process already detached on the remote host.
+- If timeout, cancellation, or transport closure happens after the command is
+  handed to the remote session, the result is `outcome: "unknown"` with code
+  `outcome-unknown`; callers must not retry automatically.
 - Timeout, transport failure, authentication failure, host-key failure, and
   output-limit completion all close the SSH client before returning.
 - Local execution uses direct process APIs or the in-process SSH2 client; a
@@ -71,7 +74,8 @@ cannot supply any of those values.
   The key is never generated automatically. Intent is durable before SSH and
   finished events are versioned, HMAC chained, and fdatasynced. Missing or
   interrupted finishes are `outcome-unknown` with null exit code and empty
-  output; clients must not retry automatically.
+  output; clients must not retry automatically. The POSIX journal is bounded
+  at 4 MiB and fails closed when the next append would exceed that limit.
 
 ## Supported operations and exclusions
 

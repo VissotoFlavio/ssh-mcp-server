@@ -1255,6 +1255,7 @@ constexpr size_t kExecutionAuditKeyBytes = 32;
 constexpr size_t kExecutionAuditKeyIdBytes = 16;
 constexpr size_t kExecutionAuditMaxArgs = 64;
 constexpr size_t kExecutionAuditMaxString = 4096;
+constexpr size_t kExecutionAuditMaxBytes = 4 * 1024 * 1024;
 
 bool IsCanonicalProfileId(const std::string& value);
 
@@ -1411,7 +1412,7 @@ bool ReadAuditFile(const std::wstring& root, const std::wstring& leaf, PSID oper
   if (file.get() == INVALID_HANDLE_VALUE) return allow_missing && GetLastError() == ERROR_FILE_NOT_FOUND;
   if (!VerifyFile(file.get(), operator_sid, false)) return false;
   LARGE_INTEGER size{};
-  if (!GetFileSizeEx(file.get(), &size) || size.QuadPart <= 0 || size.QuadPart > 4 * 1024 * 1024) return false;
+  if (!GetFileSizeEx(file.get(), &size) || size.QuadPart <= 0 || size.QuadPart > static_cast<LONGLONG>(kExecutionAuditMaxBytes)) return false;
   output->resize(static_cast<size_t>(size.QuadPart));
   DWORD read = 0;
   return ReadFile(file.get(), output->data(), static_cast<DWORD>(output->size()), &read, nullptr) && read == output->size();
@@ -1724,6 +1725,10 @@ bool AppendExecutionAuditRecord(ExecutionAuditState* state, ExecutionAuditRecord
   if (file.get() == INVALID_HANDLE_VALUE || !VerifyFile(file.get(), state->operator_sid.data(), false)) return false;
   FILE_ID_INFO identity{};
   if (!ReadIdentity(file.get(), &identity)) return false;
+  LARGE_INTEGER size{};
+  if (!GetFileSizeEx(file.get(), &size) || size.QuadPart < 0 || size.QuadPart > static_cast<LONGLONG>(kExecutionAuditMaxBytes) ||
+      line.size() > kExecutionAuditMaxBytes - static_cast<size_t>(size.QuadPart))
+    return false;
   DWORD written = 0;
   if (line.size() > MAXDWORD || !WriteFile(file.get(), line.data(), static_cast<DWORD>(line.size()), &written, nullptr) || written != line.size() || !FlushFileBuffers(file.get()) || !HasIdentity(file.get(), identity) || !VerifyFile(file.get(), state->operator_sid.data(), false)) return false;
   result->key_id = record.key_id;
@@ -1897,18 +1902,18 @@ napi_value RotateExecutionAuditKey(napi_env env, napi_callback_info info) {
   const std::string active_text = "v1:" + key_id + "\n";
   const std::vector<BYTE> active(active_text.begin(), active_text.end());
   if (!StoreAuditKey(key_id, key)) return Unavailable(env);
-  if (!WriteExistingAuditFile(state.root, kExecutionAuditActiveLeaf, state.operator_sid.data(), active)) {
-    RemoveAuditKey(key_id);
-    return Unavailable(env);
-  }
-  state.active_key_id = key_id;
-  state.active_key = key;
   ExecutionAuditRecord rotation;
   rotation.event = "rotation";
   rotation.operation_id = "00000000000000000000000000000000";
   rotation.new_key_id = key_id;
   ExecutionAuditAppendResult rotation_result;
-  if (!AppendExecutionAuditRecord(&state, std::move(rotation), &rotation_result)) return Unavailable(env);
+  if (!AppendExecutionAuditRecord(&state, std::move(rotation), &rotation_result)) {
+    RemoveAuditKey(key_id);
+    return Unavailable(env);
+  }
+  if (!WriteExistingAuditFile(state.root, kExecutionAuditActiveLeaf, state.operator_sid.data(), active)) return Unavailable(env);
+  state.active_key_id = key_id;
+  state.active_key = key;
   napi_value result{};
   return napi_get_undefined(env, &result) == napi_ok ? result : Unavailable(env);
 }
@@ -2617,6 +2622,7 @@ bool StartNativeAgentCommandProcess(const std::wstring& application, const std::
   startup.StartupInfo.hStdInput = input.get();
   startup.StartupInfo.hStdOutput = stdout_write_handle.get();
   startup.StartupInfo.hStdError = stderr_write_handle.get();
+  startup.lpAttributeList = attributes;
   PROCESS_INFORMATION information{};
   std::wstring mutable_command_line = command_line;
   if (!CreateProcessW(application.c_str(), mutable_command_line.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr,

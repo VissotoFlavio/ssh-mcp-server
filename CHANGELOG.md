@@ -39,6 +39,10 @@ publish a release.
   first delivery targets POSIX hosts from POSIX or Windows clients, excludes
   remote Windows-host quoting, shells/scripts/redirection/pipes, file transfer,
   and port forwarding, and leaves file transfer to issue #94.
+- Bounded audit journals at 4 MiB with durable short-write checks, preserved
+  public host-key/authentication failure classes from authorization, and
+  classified timeout or cancellation after command handoff as
+  `outcome-unknown`.
 
 - The remote execution candidate now accepts an explicit host-injected human
   approval provider, binds approvals to the complete approved profile identity,

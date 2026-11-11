@@ -11,6 +11,7 @@ import {
   type RemoteCommandTransport,
   type RemoteCommandTransportResult,
 } from '../../src/execution/remote-command-execution.js';
+import { HostIdentityCredentialPolicyError } from '../../src/policy/host-identity-credential-policy.js';
 import type { ConnectionProfile } from '../../src/profiles/connection-profile.js';
 
 const profile: ConnectionProfile = {
@@ -28,9 +29,11 @@ class FakeTransport implements RemoteCommandTransport {
   result = { exitCode: 0, stdout: 'ok', stderr: '', outputTruncated: false };
   error: Error | undefined;
   never = false;
+  startOnExecute = false;
 
   async execute(request: Parameters<RemoteCommandTransport['execute']>[0]): Promise<RemoteCommandTransportResult> {
     this.calls.push(request);
+    if (this.startOnExecute) request.onCommandStarted?.();
     if (this.never) return new Promise<RemoteCommandTransportResult>(() => undefined);
     if (this.error !== undefined) throw this.error;
     return this.result;
@@ -39,14 +42,17 @@ class FakeTransport implements RemoteCommandTransport {
 
 function createProvider(
   transport = new FakeTransport(),
-  options: { now?: () => number; audit?: string[]; approvals?: SudoApprovalStore; humanApproval?: boolean } = {},
+  options: { now?: () => number; audit?: string[]; approvals?: SudoApprovalStore; humanApproval?: boolean; authorizationError?: unknown } = {},
 ) {
   return {
     provider: new RemoteCommandExecutionProvider({
       profiles: { getProfile: async (profileId: string) => (profileId === profile.profileId ? profile : undefined) },
       connectionValidation: {
         validateConnection: async (input: unknown) => ({ profileId: (input as { profileId: string }).profileId, ready: true as const }),
-        authorizeExecution: async () => ({ profile }),
+        authorizeExecution: async () => {
+          if (options.authorizationError !== undefined) throw options.authorizationError;
+          return { profile };
+        },
       },
       transport,
       sudoApprovals: options.approvals,
@@ -104,6 +110,16 @@ test('maps authentication, host-key, timeout and cancellation failures safely', 
       assert.equal(JSON.stringify(result).includes('hidden'), false);
     });
   }
+});
+
+test('preserves public host-key and authentication failure classes from authorization', async () => {
+  const hostKey = createProvider(undefined, { authorizationError: new HostIdentityCredentialPolicyError('known-hosts-entry-mismatch', 'private') });
+  assert.equal((await hostKey.provider.execute(command)).code, 'host-key-failure');
+
+  const authentication = createProvider(undefined, {
+    authorizationError: new HostIdentityCredentialPolicyError('agent-identity-unavailable', 'private'),
+  });
+  assert.equal((await authentication.provider.execute(command)).code, 'authentication-failure');
 });
 
 test('blocks sudo without a server-issued approval and records a redacted audit event', async () => {
@@ -193,6 +209,19 @@ test('preserves unknown outcome when the transport cannot establish completion',
   transport.error = new RemoteExecutionError('outcome-unknown', 'unknown');
   const { provider } = createProvider(transport);
   const result = await provider.execute(command);
+  assert.equal(result.outcome, 'unknown');
+  assert.equal(result.code, 'outcome-unknown');
+  assert.equal(result.exitCode, null);
+});
+
+test('reports unknown outcome when cancellation occurs after command handoff', async () => {
+  const transport = new FakeTransport();
+  transport.never = true;
+  transport.startOnExecute = true;
+  const { provider } = createProvider(transport);
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), 5);
+  const result = await provider.execute({ ...command, timeoutMs: 100 }, controller.signal);
   assert.equal(result.outcome, 'unknown');
   assert.equal(result.code, 'outcome-unknown');
   assert.equal(result.exitCode, null);

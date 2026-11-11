@@ -52,6 +52,7 @@ export interface PosixAuditJournalOptions {
 
 const JOURNAL_VERSION = 1;
 const JOURNAL_FILE = 'execution-audit.v1.jsonl';
+const MAX_JOURNAL_BYTES = 4 * 1024 * 1024;
 const PRIVATE_FILE_MODE = 0o600;
 const UNSAFE_WRITE_BITS = 0o022;
 const OPERATION_ID_PATTERN = /^[a-f0-9]{32}$/u;
@@ -250,6 +251,7 @@ export class PosixExecutionAuditJournal implements ExecutionAuditJournal {
       if ((error as { code?: unknown }).code === 'ENOENT') return null;
       throw new Error('execution audit journal is unavailable');
     }
+    if (contents.byteLength > MAX_JOURNAL_BYTES) throw new Error('execution audit journal is unavailable');
     for (const line of contents.toString('utf8').split('\n')) {
       if (line === '') continue;
       let parsed: JournalLine;
@@ -298,8 +300,14 @@ export class PosixExecutionAuditJournal implements ExecutionAuditJournal {
     );
     try {
       await handle.chmod(PRIVATE_FILE_MODE);
-      assertSafeFile(await handle.stat(), this.options.uid);
-      await handle.write(line, undefined, 'utf8');
+      const stats = await handle.stat();
+      assertSafeFile(stats, this.options.uid);
+      const lineBytes = Buffer.byteLength(line, 'utf8');
+      if (stats.size > MAX_JOURNAL_BYTES || lineBytes > MAX_JOURNAL_BYTES - stats.size) {
+        throw new Error('execution audit journal is unavailable');
+      }
+      const writeResult = await handle.write(line, undefined, 'utf8');
+      if (writeResult.bytesWritten !== lineBytes) throw new Error('execution audit journal is unavailable');
       await handle.datasync();
     } finally {
       await handle.close();

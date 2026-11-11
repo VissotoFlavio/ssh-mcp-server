@@ -5,8 +5,7 @@ import {
   RemoteExecutionError,
   Ssh2RemoteCommandTransport,
   WindowsRemoteCommandTransport,
-  createExecutionAuthorization,
-  type ExecutionAuthorizationProvider,
+  createProfileExecutionAuthorizationProvider,
   type HumanSudoApprovalProvider,
 } from '../execution/remote-command-execution.js';
 import { APPROVED_PROFILE_CLASSIFICATION, type ApprovedProfileListingProvider } from '../profiles/approved-profile-listing.js';
@@ -18,24 +17,6 @@ import { WindowsNativeAgentCommandTransport } from './windows-native-command.js'
 import { createWindowsReadinessStatusProvider, type WindowsReadinessStatusProvider } from './windows-readiness-status.js';
 import { WindowsSecureStorage } from './windows-secure-storage.js';
 import { createWindowsValidationSession, WindowsValidationSession } from './windows-validation-session.js';
-
-function createWindowsExecutionAuthorizationProvider(validationProvider: ConnectionValidationProvider): ExecutionAuthorizationProvider {
-  return {
-    async authorize(profileId, signal) {
-      if (signal?.aborted) throw new RemoteExecutionError('cancelled', 'Remote command cancelled');
-      if (validationProvider.authorizeExecution === undefined)
-        throw new RemoteExecutionError('provider-failure', 'Remote execution authorization is unavailable');
-      try {
-        const validated = await validationProvider.authorizeExecution({ profileId }, signal);
-        if (validated.profile.profileId !== profileId) throw new RemoteExecutionError('provider-failure', 'Remote profile validation failed');
-        return createExecutionAuthorization(validated.profile, Date.now() + 60_000, Date.now, validated.withTransportContext, validated.release);
-      } catch (error) {
-        if (error instanceof RemoteExecutionError) throw error;
-        throw new RemoteExecutionError('provider-failure', 'Remote profile validation failed');
-      }
-    },
-  };
-}
 
 export interface WindowsRuntimeProviders {
   readonly approvedProfileListingProvider: ApprovedProfileListingProvider;
@@ -128,7 +109,10 @@ export function createWindowsRuntimeProviders(
             ),
           ),
           auditJournal: storage.executionAuditJournal ?? new UnavailableExecutionAuditJournal(),
-          authorizationProvider: validationProvider === undefined ? undefined : createWindowsExecutionAuthorizationProvider(validationProvider),
+          authorizationProvider:
+            validationProvider === undefined
+              ? undefined
+              : createProfileExecutionAuthorizationProvider({ getProfile: storage.getProfile.bind(storage) }, validationProvider),
           humanApproval,
         });
   const readinessStorage =
