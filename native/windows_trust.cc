@@ -2965,6 +2965,11 @@ NativeAgentCommandRunResult RunNativeAgentCommand(SnapshotSession* snapshot, con
   fixed_arguments.push_back(remote_command);
   const std::wstring command_line = FixedCommandLine(ssh, fixed_arguments);
   if (command_line.size() >= 32767) return result;
+#ifdef SSH_MCP_NATIVE_TEST
+  result.stderr_data = "[test-command] ";
+  for (wchar_t character : command_line) result.stderr_data.push_back(character >= 0 && character <= 0x7f ? static_cast<char>(character) : '?');
+  result.stderr_data.push_back('\n');
+#endif
   NativeAgentCommandProcess process;
   if (!StartNativeAgentCommandProcess(ssh, command_line, &process)) return result;
   result.launched = true;
@@ -3017,7 +3022,7 @@ NativeAgentCommandRunResult RunNativeAgentCommand(SnapshotSession* snapshot, con
   return result;
 }
 
-napi_value NativeAgentCommandError(napi_env env, const char* code) {
+napi_value NativeAgentCommandError(napi_env env, const char* code, const std::string* debug_stderr = nullptr) {
   const char* message = "Windows agent command is unavailable";
   if (strcmp(code, "timeout") == 0) message = "Windows agent command timed out";
   else if (strcmp(code, "cancelled") == 0) message = "Windows agent command cancelled";
@@ -3026,6 +3031,13 @@ napi_value NativeAgentCommandError(napi_env env, const char* code) {
   else if (strcmp(code, "host-key-failure") == 0) message = "Windows agent command host verification failed";
   else if (strcmp(code, "authentication-failure") == 0) message = "Windows agent command authentication failed";
   else if (strcmp(code, "connection-failure") == 0) message = "Windows agent command connection failed";
+#ifdef SSH_MCP_NATIVE_TEST
+  std::string debug_message;
+  if (debug_stderr != nullptr && debug_stderr->rfind("[test-command]", 0) == 0) {
+    debug_message = std::string(message) + "\n" + *debug_stderr;
+    message = debug_message.c_str();
+  }
+#endif
   napi_value message_value{};
   napi_value error{};
   napi_value code_value{};
@@ -3089,7 +3101,13 @@ void CompleteNativeAgentCommand(napi_env env, napi_status, void* data) {
   else if (job->result.launched && job->result.failed) error_code = "outcome-unknown";
   else if (!job->result.launched || job->result.failed) error_code = "windows-agent-command-unavailable";
   if (error_code != nullptr) {
-    napi_value error = NativeAgentCommandError(env, error_code);
+    napi_value error = NativeAgentCommandError(env, error_code,
+#ifdef SSH_MCP_NATIVE_TEST
+                                                &job->result.stderr_data
+#else
+                                                nullptr
+#endif
+    );
     napi_reject_deferred(env, job->deferred, error);
     return;
   }
