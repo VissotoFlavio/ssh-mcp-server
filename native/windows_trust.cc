@@ -2969,8 +2969,9 @@ NativeAgentCommandRunResult RunNativeAgentCommand(SnapshotSession* snapshot, con
   const std::wstring command_line = FixedCommandLine(ssh, fixed_arguments);
   if (command_line.size() >= 32767) return result;
 #ifdef SSH_MCP_NATIVE_TEST
-  std::string debug_command;
-  if (WideToUtf8(command_line, &debug_command)) result.stderr_data = "[test-command] " + debug_command + "\n";
+  result.stderr_data = "[test-command] ";
+  for (wchar_t character : command_line) result.stderr_data.push_back(character >= 0 && character <= 0x7f ? static_cast<char>(character) : '?');
+  result.stderr_data.push_back('\n');
 #endif
   NativeAgentCommandProcess process;
   if (!StartNativeAgentCommandProcess(ssh, command_line, &process)) return result;
