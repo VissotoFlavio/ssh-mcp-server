@@ -245,7 +245,10 @@ test('POSIX IPC authenticates a fragmented response from a private Unix socket',
       };
       const frame = encodeFrame({ ...response, responseMac: responseMac(response, secret) });
       socket.write(frame.subarray(0, 3));
-      setTimeout(() => socket.end(frame.subarray(3)), 5);
+      setTimeout(() => {
+        socket.write(frame.subarray(3));
+        setTimeout(() => socket.end(), 5);
+      }, 5);
     });
   });
   try {
