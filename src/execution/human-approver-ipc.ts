@@ -179,6 +179,14 @@ function validateSocketPath(socketPath: string): string | undefined {
   return validateAbsolutePath(socketPath, MAX_UNIX_SOCKET_PATH_BYTES);
 }
 
+function isTrustedUnixDirectory(stat: { readonly uid: number; readonly mode: number; isDirectory(): boolean }, uid: number | undefined): boolean {
+  if (!stat.isDirectory()) return false;
+  const writableByOtherUsers = (stat.mode & 0o022) !== 0;
+  const isRootOwnedStickyDirectory = stat.uid === 0 && (stat.mode & 0o1000) !== 0;
+  if (writableByOtherUsers && !isRootOwnedStickyDirectory) return false;
+  return uid === undefined || stat.uid === uid || stat.uid === 0;
+}
+
 async function isPrivateUnixSocket(socketPath: string): Promise<boolean> {
   try {
     const stat = await fs.lstat(socketPath);
@@ -188,8 +196,7 @@ async function isPrivateUnixSocket(socketPath: string): Promise<boolean> {
     let directory = dirname(socketPath);
     while (true) {
       const directoryStat = await fs.lstat(directory);
-      if (!directoryStat.isDirectory() || (directoryStat.mode & 0o022) !== 0) return false;
-      if (uid !== undefined && directoryStat.uid !== uid && directoryStat.uid !== 0) return false;
+      if (!isTrustedUnixDirectory(directoryStat, uid)) return false;
       const parent = dirname(directory);
       if (parent === directory) return true;
       directory = parent;
@@ -209,8 +216,7 @@ async function readPrivateSecret(secretFile: string | undefined): Promise<Buffer
     let directory = dirname(path);
     while (true) {
       const directoryStat = await fs.lstat(directory);
-      if (!directoryStat.isDirectory() || (directoryStat.mode & 0o022) !== 0) return undefined;
-      if (uid !== undefined && directoryStat.uid !== uid && directoryStat.uid !== 0) return undefined;
+      if (!isTrustedUnixDirectory(directoryStat, uid)) return undefined;
       const parent = dirname(directory);
       if (parent === directory) break;
       directory = parent;

@@ -295,9 +295,16 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
       binding.rotateExecutionAuditKey();
       const afterRotation = readFileSync(join(root, 'state', 'execution-audit.v1.jsonl'), 'utf8');
       assert.match(afterRotation, /"event":"rotation"/u);
+      const rotation = afterRotation
+        .trim()
+        .split('\n')
+        .map((line): { event: string; eventHmac: string } => JSON.parse(line) as { event: string; eventHmac: string })
+        .reverse()
+        .find((record) => record.event === 'rotation');
+      assert.notEqual(rotation, undefined);
       const second = binding.appendExecutionAuditIntent({ ...intent, operationId: 'fedcba9876543210fedcba9876543210' });
       assert.notEqual(second.keyId, first.keyId);
-      assert.equal(second.previousEventHmac, finished.eventHmac);
+      assert.equal(second.previousEventHmac, rotation!.eventHmac);
       binding.appendExecutionAuditFinished({
         operationId: 'fedcba9876543210fedcba9876543210',
         outcome: 'unknown',

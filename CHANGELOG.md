@@ -18,6 +18,10 @@ publish a release.
 - Bound the POSIX production execution factory to the same validated
   authorization lease used for readiness, and preserved native Windows
   host-key, authentication, connection, and remote failure classifications.
+- Added approval gating for common privilege-escalation executables, preserved
+  `outcome-unknown` after an interrupted SSH session, kept fallback approvals
+  on immutable profile snapshots, and redacted compact password flags such as
+  `-psecret` from local audit records.
 - Bound sudo approval tokens to the validated execution authorization lease and
   report missing approval infrastructure as `failure` with
   `approval-unavailable` before transport.

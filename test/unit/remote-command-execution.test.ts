@@ -126,6 +126,15 @@ test('reports unavailable sudo approval as a failure before transport', async ()
   assert.equal(transport.calls.length, 0);
 });
 
+test('requires approval for common privilege-escalation executables', async () => {
+  for (const command of ['doas', 'pkexec', 'runuser', 'su']) {
+    const { provider, transport } = createProvider(undefined, { humanApproval: false });
+    const result = await provider.execute({ profileId: profile.profileId, command, args: ['id'] });
+    assert.equal(result.code, 'approval-unavailable');
+    assert.equal(transport.calls.length, 0);
+  }
+});
+
 test('binds sudo approval to exact request, expiry and one-time use', async () => {
   let now = 1_000;
   const approvals = new SudoApprovalStore();
@@ -179,6 +188,16 @@ test('enforces the output limit and transport deadline at the provider boundary'
   assert.equal(cancelled.code, 'cancelled');
 });
 
+test('preserves unknown outcome when the transport cannot establish completion', async () => {
+  const transport = new FakeTransport();
+  transport.error = new RemoteExecutionError('outcome-unknown', 'unknown');
+  const { provider } = createProvider(transport);
+  const result = await provider.execute(command);
+  assert.equal(result.outcome, 'unknown');
+  assert.equal(result.code, 'outcome-unknown');
+  assert.equal(result.exitCode, null);
+});
+
 test('rejects shell interpreters and control syntax but leaves remote wrappers to the target', async () => {
   const { provider, transport } = createProvider();
   for (const request of [
@@ -207,6 +226,7 @@ test('redacts separated flags, headers, URL credentials, and shell assignments i
     args: [
       '--password',
       'super-secret',
+      '-psecret',
       '--header',
       'Authorization: Bearer bearer-secret',
       'https://user:password@example.invalid/api',
@@ -317,6 +337,26 @@ test('uses the approved sudo lease when the profile source changes', async () =>
   const sudo = { profileId: profile.profileId, command: 'sudo', args: ['id'] };
   const approval = await provider.requestSudoApproval(sudo);
   current = changed;
+  const result = await provider.execute({ ...sudo, approvalToken: approval.token });
+  assert.equal(result.code, 'success');
+  assert.equal((transport.calls[0] as { profile: ConnectionProfile }).profile.host, profile.host);
+});
+
+test('keeps the approved profile snapshot when no explicit authorization provider is injected', async () => {
+  let current = profile;
+  const transport = new FakeTransport();
+  const provider = new RemoteCommandExecutionProvider({
+    profiles: { getProfile: async () => current },
+    connectionValidation: {
+      validateConnection: async () => ({ profileId: profile.profileId, ready: true as const }),
+      authorizeExecution: async () => ({ profile: current }),
+    },
+    transport,
+    humanApproval: { approve: async () => true },
+  });
+  const sudo = { profileId: profile.profileId, command: 'sudo', args: ['id'] };
+  const approval = await provider.requestSudoApproval(sudo);
+  current = { ...profile, host: 'changed.internal.example' };
   const result = await provider.execute({ ...sudo, approvalToken: approval.token });
   assert.equal(result.code, 'success');
   assert.equal((transport.calls[0] as { profile: ConnectionProfile }).profile.host, profile.host);

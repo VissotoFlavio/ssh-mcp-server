@@ -277,9 +277,10 @@ limit. The response contains `stdout` and `stderr` only up to `maxOutputBytes`.
 ```
 
 The bounded defaults are 30 seconds and 64 KiB; the maximums are 60 seconds
-and 1 MiB. A command that uses `sudo` returns `approval-required` until the
-host-injected `HumanSudoApprovalProvider` issues an opaque one-use capability
-through `request_sudo_approval`. The capability expires after one minute,
+and 1 MiB. Commands that use `sudo`, `sudoedit`, `su`, `doas`, `runuser`, or
+`pkexec` return `approval-required` until the host-injected
+`HumanSudoApprovalProvider` issues an opaque one-use capability through
+`request_sudo_approval`. The capability expires after one minute,
 cannot be reused, and fails if the command or the immutable approved profile
 identity changes. A boolean such as `approved: true` is not accepted as
 authorization. A standalone CLI without a host approval callback returns

@@ -335,9 +335,10 @@ function canonicalRequest(request: SudoApprovalRequest, identity: ApprovedProfil
 }
 
 function requiresSudo(command: string, args: readonly string[]): boolean {
+  const privilegeExecutables = new Set(['doas', 'dzdo', 'pkexec', 'runuser', 'su', 'sudo', 'sudoedit']);
   const isSudo = (value: string): boolean => {
     const basename = value.slice(Math.max(value.lastIndexOf('/'), value.lastIndexOf('\\')) + 1).toLowerCase();
-    return basename === 'sudo' || basename === 'sudo.exe' || basename === 'sudoedit' || basename === 'sudoedit.exe';
+    return privilegeExecutables.has(basename.replace(/\.exe$/u, ''));
   };
   return isSudo(command) || args.some(isSudo);
 }
@@ -653,6 +654,7 @@ export class RemoteCommandExecutionProvider {
         profile = authorization.profile;
       } else {
         profile = await this.dependencies.profiles.getProfile(request.profileId, signal);
+        if (profile !== undefined) authorization = createExecutionAuthorization(profile, this.now() + APPROVAL_TTL_MS, this.now);
       }
     } catch {
       await authorization?.release?.();
@@ -838,7 +840,8 @@ export class RemoteCommandExecutionProvider {
       return finish(safe);
     } catch (error) {
       const code = signal?.aborted ? 'cancelled' : mapTransportError(error);
-      const outcome: RemoteExecutionOutcome = code === 'timeout' ? 'timeout' : code === 'cancelled' ? 'cancelled' : 'failure';
+      const outcome: RemoteExecutionOutcome =
+        code === 'outcome-unknown' ? 'unknown' : code === 'timeout' ? 'timeout' : code === 'cancelled' ? 'cancelled' : 'failure';
       return finish(safeResult(request.profileId, outcome, code, { operationId }));
     } finally {
       try {
@@ -892,6 +895,7 @@ export class Ssh2RemoteCommandTransport implements RemoteCommandTransport {
       let hostKeyRejected = false;
       let authenticationStarted = false;
       let ready = false;
+      let commandStarted = false;
       let channel: ClientChannel | undefined;
       let timedOut = false;
       const finish = (error?: RemoteExecutionError, exitCode: number | null = null) => {
@@ -938,17 +942,20 @@ export class Ssh2RemoteCommandTransport implements RemoteCommandTransport {
       const timer = setTimeout(timeout, request.timeoutMs);
       signal?.addEventListener('abort', abort, { once: true });
       client.on('error', () => {
-        const code = ready
-          ? 'connection-failure'
-          : hostKeyRejected
-            ? 'host-key-failure'
-            : authenticationStarted
-              ? 'authentication-failure'
-              : 'connection-failure';
+        const code = commandStarted
+          ? 'outcome-unknown'
+          : ready
+            ? 'connection-failure'
+            : hostKeyRejected
+              ? 'host-key-failure'
+              : authenticationStarted
+                ? 'authentication-failure'
+                : 'connection-failure';
         finish(new RemoteExecutionError(code, 'Remote SSH connection failed'));
       });
       client.on('close', () => {
         if (!finished && timedOut) finish(new RemoteExecutionError('timeout', 'Remote command timed out'));
+        else if (!finished && commandStarted) finish(new RemoteExecutionError('outcome-unknown', 'Remote command outcome is unknown'));
       });
       try {
         const authHandler: AuthHandlerMiddleware = (_methodsLeft, _partialSuccess, callback: NextAuthHandler) => {
@@ -974,6 +981,7 @@ export class Ssh2RemoteCommandTransport implements RemoteCommandTransport {
         };
         client.on('ready', () => {
           ready = true;
+          commandStarted = true;
           client.exec(remoteCommand(request.command, request.args), (error, execChannel) => {
             if (error !== undefined) return finish(new RemoteExecutionError('remote-failure', 'Remote command failed'));
             channel = execChannel;
@@ -1049,6 +1057,7 @@ export function redactRemoteAuditArguments(values: readonly string[]): readonly 
   return values.slice(0, MAX_ARGUMENTS).map((value) => {
     if (typeof value !== 'string' || value.length === 0) return '[ARG]';
     if (!value.startsWith('-')) return '[ARG]';
+    if (/^-p.+/iu.test(value)) return '-p[REDACTED]';
     const flag = value.split('=', 1)[0].slice(0, 64);
     return /^-{1,2}[A-Za-z0-9][A-Za-z0-9_-]*$/u.test(flag) ? flag : '[FLAG]';
   });

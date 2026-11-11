@@ -13,8 +13,9 @@ cannot supply any of those values.
    `validate_connection`.
 3. Call `execute_remote_command` with `profileId`, one executable `command`,
    and an `args` array. Do not put an entire shell script in `command`.
-4. For a command containing `sudo`, call `request_sudo_approval`. A trusted
-   `HumanSudoApprovalProvider` callback injected by the host/runtime must
+4. For a command containing a privilege-escalation executable such as `sudo`,
+   `sudoedit`, `su`, `doas`, `runuser`, or `pkexec`, call
+   `request_sudo_approval`. A trusted `HumanSudoApprovalProvider` callback injected by the host/runtime must
    confirm the exact request. The MCP caller cannot provide an approval
    boolean. Use the returned opaque one-time capability only with the
    unchanged request. The supported local integration is the typed
