@@ -243,6 +243,7 @@ export class PosixExecutionAuditJournal implements ExecutionAuditJournal {
   }
 
   private async verifyChain(key: Buffer): Promise<string | null> {
+    this.unfinished.clear();
     let previous: string | null = null;
     let contents: Buffer;
     try {

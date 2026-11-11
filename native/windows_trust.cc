@@ -1449,7 +1449,9 @@ bool WriteAtomicAuditFile(const std::wstring& root, const std::wstring& leaf, PS
   }
   temporary.reset();
   const std::wstring target_path = root + L"\\" + leaf;
-  if (!ReplaceFileW(target_path.c_str(), temporary_path.c_str(), nullptr, REPLACEFILE_WRITE_THROUGH, nullptr, nullptr)) {
+  // MoveFileEx performs the same-volume replacement atomically while also
+  // working with the protected files created by CreatePrivateRelative.
+  if (!MoveFileExW(temporary_path.c_str(), target_path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
     DeleteFileW(temporary_path.c_str());
     return false;
   }
