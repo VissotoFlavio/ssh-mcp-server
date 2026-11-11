@@ -1531,7 +1531,7 @@ bool VerifyExecutionAuditManifest(const std::wstring& root, PSID operator_sid, c
   return manifest == ExecutionAuditManifestText(leaves);
 }
 
-bool WriteExecutionAuditManifest(const ExecutionAuditState& state) {
+bool WriteExecutionAuditManifest(ExecutionAuditState& state) {
   std::vector<std::wstring> leaves;
   if (!ListExecutionAuditLeaves(state.root, state.operator_sid.data(), &leaves)) return false;
   const std::string text = ExecutionAuditManifestText(leaves);
