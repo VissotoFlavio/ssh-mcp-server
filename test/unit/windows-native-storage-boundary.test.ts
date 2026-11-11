@@ -758,17 +758,28 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
         timeoutMs: 5_000,
         maxOutputBytes: 1_024,
       };
-      const execute = async (request: object, signal?: AbortSignal): Promise<{ readonly exitCode: number; readonly stdout: string }> => {
+      const execute = async (
+        request: object,
+        signal?: AbortSignal,
+      ): Promise<{
+        readonly exitCode: number;
+        readonly stdout: string;
+        readonly stderr: string;
+      }> => {
         const snapshot = binding.captureKnownHostsSnapshot('production-api');
         try {
-          return (await binding.execute(snapshot.capability, request, signal)) as { readonly exitCode: number; readonly stdout: string };
+          return (await binding.execute(snapshot.capability, request, signal)) as {
+            readonly exitCode: number;
+            readonly stdout: string;
+            readonly stderr: string;
+          };
         } finally {
           binding.disposeKnownHostsSnapshot(snapshot.capability);
         }
       };
 
       const success = await execute(baseRequest);
-      assert.equal(success.exitCode, 0);
+      assert.equal(success.exitCode, 0, success.stderr);
       assert.match(success.stdout, /ssh-mcp-e2e-success/u);
       await assert.rejects(
         execute({ ...baseRequest, args: ['ssh-mcp-e2e-failure'] }),
