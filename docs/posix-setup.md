@@ -134,7 +134,11 @@ Create the audit key and approver secret out of band as the operator. Keep
 both files owner-only (`0600`); the audit key contains `v1:` followed by 64
 lowercase hexadecimal characters, and the approver secret is exactly 32 random
 bytes shared only with the separate `ssh-mcp-approver` component. The server
-never generates either secret during execution.
+never generates either secret during execution. Run the MCP server and
+approver as a dedicated OS identity. This HMAC IPC contract authenticates the
+message envelope but does not distinguish another process already trusted as
+the same OS user; a native peer-credential boundary is a separate hardening
+follow-up.
 
 Restart Codex if its client requires it, then first call
 `list_approved_profiles` with `{}`. Call `validate_connection` only with a

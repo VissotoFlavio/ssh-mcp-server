@@ -31,6 +31,11 @@ cannot supply any of those values.
    known-hosts reference) so a human can confirm where the command will run;
    those fields remain inside the authenticated local IPC envelope and are not
    returned to MCP callers.
+   The POSIX socket and its secret are a local same-user trust boundary: run
+   the MCP server and approver under a dedicated OS identity, restrict the
+   socket directory and secret to that identity, and do not treat this IPC as
+   protection from another process already trusted as the same user. A native
+   peer-credential boundary remains a follow-up hardening item.
    The current Windows native addon does not expose the required
    authenticated named-pipe/SID boundary, so Windows remains unavailable until
    that explicit native dependency is supplied; it is not simulated. The

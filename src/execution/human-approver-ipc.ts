@@ -182,8 +182,8 @@ function validateSocketPath(socketPath: string): string | undefined {
 function isTrustedUnixDirectory(stat: { readonly uid: number; readonly mode: number; isDirectory(): boolean }, uid: number | undefined): boolean {
   if (!stat.isDirectory()) return false;
   const writableByOtherUsers = (stat.mode & 0o022) !== 0;
-  const isRootOwnedStickyDirectory = stat.uid === 0 && (stat.mode & 0o1000) !== 0;
-  if (writableByOtherUsers && !isRootOwnedStickyDirectory) return false;
+  const isTrustedStickyDirectory = (stat.mode & 0o1000) !== 0 && (stat.uid === 0 || stat.uid === uid);
+  if (writableByOtherUsers && !isTrustedStickyDirectory) return false;
   return uid === undefined || stat.uid === uid || stat.uid === 0;
 }
 
