@@ -18,8 +18,9 @@
     },
     {
       "target_name": "ssh-mcp-approver",
-      "type": "executable",
+      "type": "none",
       "conditions": [["OS=='win'", {
+        "type": "executable",
         "sources": ["native/windows_approver.cc"],
         "libraries": ["-ladvapi32", "-lbcrypt", "-luser32"],
         "defines": ["WIN32_LEAN_AND_MEAN", "UNICODE", "_UNICODE"]
