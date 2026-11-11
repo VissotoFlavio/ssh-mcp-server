@@ -227,7 +227,7 @@ test('POSIX IPC authenticates a fragmented response from a private Unix socket',
   await fs.writeFile(secretFile, secret, { mode: 0o600 });
   await fs.chmod(secretFile, 0o600);
   let received: Record<string, unknown> | undefined;
-  const server = createServer((socket) => {
+  const server = createServer({ allowHalfOpen: true }, (socket) => {
     let data = Buffer.alloc(0);
     socket.on('data', (chunk) => {
       data = Buffer.concat([data, chunk]);
