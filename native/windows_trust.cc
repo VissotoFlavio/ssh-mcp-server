@@ -940,6 +940,12 @@ std::wstring FixedCommandLine(const std::wstring& application, const std::vector
   return command;
 }
 
+std::wstring FixedArgumentsCommandLine(const std::vector<std::wstring>& arguments) {
+  std::wstring command;
+  for (const auto& argument : arguments) AppendQuotedArgument(&command, argument);
+  return command;
+}
+
 std::wstring PosixShellQuote(const std::wstring& value) {
   std::wstring quoted = L"'";
   for (wchar_t character : value) {
@@ -2967,7 +2973,7 @@ NativeAgentCommandRunResult RunNativeAgentCommand(SnapshotSession* snapshot, con
   std::wstring remote_command = PosixShellQuote(request.command);
   for (const std::wstring& argument : request.arguments) remote_command.append(L" ").append(PosixShellQuote(argument));
   fixed_arguments.push_back(remote_command);
-  const std::wstring command_line = FixedCommandLine(ssh, fixed_arguments);
+  const std::wstring command_line = FixedArgumentsCommandLine(fixed_arguments);
   if (command_line.size() >= 32767) return result;
 #ifdef SSH_MCP_NATIVE_TEST
   result.stderr_data = "[test-command] ";
