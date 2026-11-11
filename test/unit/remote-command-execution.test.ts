@@ -35,11 +35,15 @@ class FakeTransport implements RemoteCommandTransport {
   error: Error | undefined;
   never = false;
   startOnExecute = false;
+  settleNever: (() => void) | undefined;
 
   async execute(request: Parameters<RemoteCommandTransport['execute']>[0]): Promise<RemoteCommandTransportResult> {
     this.calls.push(request);
     if (this.startOnExecute) request.onCommandStarted?.();
-    if (this.never) return new Promise<RemoteCommandTransportResult>(() => undefined);
+    if (this.never)
+      return new Promise<RemoteCommandTransportResult>((resolve) => {
+        this.settleNever = () => resolve(this.result);
+      });
     if (this.error !== undefined) throw this.error;
     return this.result;
   }
@@ -342,6 +346,11 @@ test('rejects shell interpreters, remote wrappers, and control syntax', async ()
     { ...command, command: 'sh', args: ['-c', 'sudo id'] },
     { ...command, command: 'env', args: ['sudo', 'id'] },
     { ...command, command: 'nohup', args: ['sudo', 'id'] },
+    { ...command, command: 'ssh', args: ['-L', '8080:internal:80', 'internal'] },
+    { ...command, command: 'scp', args: ['file', 'internal:/tmp/file'] },
+    { ...command, command: 'sftp', args: ['internal'] },
+    { ...command, command: 'rsync', args: ['-e', 'ssh', 'file', 'internal:/tmp/file'] },
+    { ...command, command: 'busybox', args: ['sh', '-c', 'sudo id'] },
     { ...command, command: 'sudoedit', args: ['id'] },
     { ...command, command: '/usr/bin/sudoedit', args: ['id'] },
     { ...command, command: 'echo', args: ['ok; sudo id'] },
@@ -367,6 +376,57 @@ test('rejects new remote work when the process concurrency limit is full', async
   assert.equal(firstTransport.calls.length, 1);
   firstController.abort();
   await first.catch(() => undefined);
+});
+
+test('holds the concurrency slot until an aborted transport settles', async () => {
+  const transport = new FakeTransport();
+  transport.never = true;
+  const limiter = new RemoteCommandConcurrencyLimiter(1);
+  const { provider } = createProvider(transport, { concurrency: limiter });
+  const controller = new AbortController();
+  const first = provider.execute(command, controller.signal);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  controller.abort();
+  const cancelled = await first;
+  assert.equal(cancelled.code, 'cancelled');
+  assert.equal((await provider.execute(command)).code, 'execution-limit');
+  transport.settleNever!();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  transport.never = false;
+  assert.equal((await provider.execute(command)).code, 'success');
+});
+
+test('rejects over-limit work before creating a durable journal entry', async () => {
+  const transport = new FakeTransport();
+  transport.never = true;
+  const limiter = new RemoteCommandConcurrencyLimiter(1);
+  let journalBegins = 0;
+  const provider = new RemoteCommandExecutionProvider({
+    profiles: { getProfile: async () => profile },
+    connectionValidation: {
+      validateConnection: async () => ({ profileId: profile.profileId, ready: true as const }),
+      authorizeExecution: async () => ({ profile }),
+    },
+    transport,
+    concurrency: limiter,
+    auditJournal: {
+      async digestArguments() {
+        return '0'.repeat(64);
+      },
+      async begin() {
+        journalBegins += 1;
+        return { operationId: '0123456789abcdef0123456789abcdef', finish: async () => undefined };
+      },
+    },
+  });
+  const controller = new AbortController();
+  const first = provider.execute(command, controller.signal);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal((await provider.execute(command)).code, 'execution-limit');
+  assert.equal(journalBegins, 1);
+  controller.abort();
+  await first;
 });
 
 test('redacts separated flags, headers, URL credentials, and shell assignments in audit records', () => {

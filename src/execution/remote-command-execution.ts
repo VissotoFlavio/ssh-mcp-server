@@ -46,6 +46,14 @@ const REJECTED_EXECUTABLES = new Set([
   'perl',
   'ruby',
   'node',
+  'ssh',
+  'ssh.exe',
+  'scp',
+  'scp.exe',
+  'sftp',
+  'sftp.exe',
+  'rsync',
+  'rsync.exe',
   'env',
   'nohup',
   'setsid',
@@ -55,6 +63,7 @@ const REJECTED_EXECUTABLES = new Set([
   'find',
   'timeout',
   'watch',
+  'busybox',
 ]);
 const REJECTED_SHELL_FLAGS = new Set(['-c', '-ccommand', '--command', '-command', '-encodedcommand', '--eval', '-e', '/c', '/k']);
 const SHELL_METACHARACTERS = /[;&|<>`$(){}]/u;
@@ -527,11 +536,24 @@ function boundedTransportResult(result: RemoteCommandTransportResult, maxOutputB
   };
 }
 
-async function boundedOperation<T>(operation: (signal: AbortSignal) => Promise<T>, timeoutMs: number, signal: AbortSignal | undefined): Promise<T> {
+interface BoundedOperation<T> {
+  readonly promise: Promise<T>;
+  readonly settled: Promise<void>;
+}
+
+function createBoundedOperation<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  timeoutMs: number,
+  signal: AbortSignal | undefined,
+): BoundedOperation<T> {
   const controller = new AbortController();
   let settled = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
-  return new Promise((resolve, reject) => {
+  let resolveUnderlyingSettled!: () => void;
+  const underlyingSettled = new Promise<void>((resolve) => {
+    resolveUnderlyingSettled = resolve;
+  });
+  const promise = new Promise<T>((resolve, reject) => {
     const cleanup = (): void => {
       if (timer !== undefined) clearTimeout(timer);
       signal?.removeEventListener('abort', abort);
@@ -551,51 +573,63 @@ async function boundedOperation<T>(operation: (signal: AbortSignal) => Promise<T
       settle(() => reject(new RemoteExecutionError('timeout', 'Remote command timed out')));
     }, timeoutMs);
     signal?.addEventListener('abort', abort, { once: true });
-    if (signal?.aborted) return abort();
-    void operation(controller.signal).then(
-      (result) => settle(() => resolve(result)),
-      (error: unknown) => settle(() => reject(error)),
-    );
+    if (signal?.aborted) {
+      abort();
+      resolveUnderlyingSettled();
+      return;
+    }
+    void Promise.resolve()
+      .then(() => operation(controller.signal))
+      .then(
+        (result) => settle(() => resolve(result)),
+        (error: unknown) => settle(() => reject(error)),
+      )
+      .finally(resolveUnderlyingSettled);
   });
+  return { promise, settled: underlyingSettled };
+}
+
+async function boundedOperation<T>(operation: (signal: AbortSignal) => Promise<T>, timeoutMs: number, signal: AbortSignal | undefined): Promise<T> {
+  return createBoundedOperation(operation, timeoutMs, signal).promise;
 }
 
 function remainingTimeout(startedAt: number, timeoutMs: number): number {
   return Math.max(1, timeoutMs - (Date.now() - startedAt));
 }
 
-async function boundedTransportExecute(
+function boundedTransportExecute(
   transport: RemoteCommandTransport,
   request: RemoteCommandTransportRequest,
   signal: AbortSignal | undefined,
-): Promise<RemoteCommandTransportResult> {
+): BoundedOperation<RemoteCommandTransportResult> {
   let commandStarted = false;
   let commandHandedOff = false;
-  try {
-    return await boundedOperation(
-      (operationSignal) =>
-        transport.execute(
-          {
-            ...request,
-            onCommandHandoff: async () => {
-              await request.onCommandHandoff?.();
-              commandHandedOff = true;
-            },
-            onCommandStarted: () => {
-              commandStarted = true;
-              request.onCommandStarted?.();
-            },
+  const operation = createBoundedOperation(
+    (operationSignal) =>
+      transport.execute(
+        {
+          ...request,
+          onCommandHandoff: async () => {
+            await request.onCommandHandoff?.();
+            commandHandedOff = true;
           },
-          operationSignal,
-        ),
-      request.timeoutMs,
-      signal,
-    );
-  } catch (error) {
+          onCommandStarted: () => {
+            commandStarted = true;
+            request.onCommandStarted?.();
+          },
+        },
+        operationSignal,
+      ),
+    request.timeoutMs,
+    signal,
+  );
+  const promise = operation.promise.catch((error: unknown) => {
     const code = mapTransportError(error);
     if ((commandStarted || commandHandedOff) && (code === 'timeout' || code === 'cancelled'))
       throw new RemoteExecutionError('outcome-unknown', 'Remote command outcome is unknown');
     throw error;
-  }
+  });
+  return { promise, settled: operation.settled };
 }
 
 function mapTransportError(error: unknown): RemoteExecutionCode {
@@ -858,6 +892,11 @@ export class RemoteCommandExecutionProvider {
       writeRemoteAudit(this.dependencies.auditSink, { profileId: 'unknown', command: '[invalid]', args: [] }, 'rejected', invalid, 0);
       return invalid;
     }
+    const releaseConcurrency = this.concurrency.tryAcquire();
+    if (releaseConcurrency === undefined) {
+      const limited = safeResult(request.profileId, 'failure', 'execution-limit');
+      return auditedResult(this.dependencies.auditSink, request, 'rejected', limited, 0);
+    }
     const startedAt = this.now();
     const operationId = cryptoRandomToken().slice(0, 32);
     let argsHmac = createHmac('sha256', AUDIT_SINK_KEY).update(JSON.stringify(request.args)).digest('hex');
@@ -899,6 +938,7 @@ export class RemoteCommandExecutionProvider {
           approvalState: requiresSudo(request.command, request.args) ? 'blocked' : 'not-required',
         });
       } catch {
+        releaseConcurrency();
         return auditedResult(
           this.dependencies.auditSink,
           request,
@@ -910,11 +950,9 @@ export class RemoteCommandExecutionProvider {
       }
     }
 
-    const releaseConcurrency = this.concurrency.tryAcquire();
-    if (releaseConcurrency === undefined) return finish(safeResult(request.profileId, 'failure', 'execution-limit', { operationId }));
-
     let authorization: ExecutionAuthorization | undefined;
     let commandStarted = false;
+    let transportSettled: Promise<void> | undefined;
     try {
       if (signal?.aborted) return finish(safeResult(request.profileId, 'cancelled', 'cancelled', { operationId }));
       if (requiresSudo(request.command, request.args)) {
@@ -958,27 +996,26 @@ export class RemoteCommandExecutionProvider {
         );
       }
       const consumedAuthorization = authorization.consume();
-      const result = boundedTransportResult(
-        await boundedTransportExecute(
-          this.dependencies.transport,
-          {
-            profile: consumedAuthorization.profile,
-            authorization: consumedAuthorization,
-            command: request.command,
-            args: request.args,
-            timeoutMs: remainingTimeout(startedAt, request.timeoutMs!),
-            maxOutputBytes: request.maxOutputBytes!,
-            onCommandHandoff: async () => {
-              await journal?.handoff?.();
-            },
-            onCommandStarted: () => {
-              commandStarted = true;
-            },
+      const transportOperation = boundedTransportExecute(
+        this.dependencies.transport,
+        {
+          profile: consumedAuthorization.profile,
+          authorization: consumedAuthorization,
+          command: request.command,
+          args: request.args,
+          timeoutMs: remainingTimeout(startedAt, request.timeoutMs!),
+          maxOutputBytes: request.maxOutputBytes!,
+          onCommandHandoff: async () => {
+            await journal?.handoff?.();
           },
-          signal,
-        ),
-        request.maxOutputBytes!,
+          onCommandStarted: () => {
+            commandStarted = true;
+          },
+        },
+        signal,
       );
+      transportSettled = transportOperation.settled;
+      const result = boundedTransportResult(await transportOperation.promise, request.maxOutputBytes!);
       if (result.outputTruncated) {
         return finish(safeResult(request.profileId, 'unknown', 'outcome-unknown', { ...result, exitCode: null, operationId }));
       }
@@ -997,12 +1034,16 @@ export class RemoteCommandExecutionProvider {
         code === 'outcome-unknown' ? 'unknown' : code === 'timeout' ? 'timeout' : code === 'cancelled' ? 'cancelled' : 'failure';
       return finish(safeResult(request.profileId, outcome, code, { operationId }));
     } finally {
-      try {
-        await authorization?.release?.();
-      } catch {
-        // A failed capability release is fail-closed at the journal boundary.
-      }
-      releaseConcurrency();
+      const releaseResources = async (): Promise<void> => {
+        try {
+          await authorization?.release?.();
+        } catch {
+          // A failed capability release is fail-closed at the journal boundary.
+        }
+        releaseConcurrency();
+      };
+      if (transportSettled === undefined) void releaseResources();
+      else void transportSettled.then(releaseResources, releaseResources);
     }
   }
 }

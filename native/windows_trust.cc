@@ -945,8 +945,40 @@ std::wstring PosixShellQuote(const std::wstring& value) {
   return quoted;
 }
 
+bool IsBracketedIpv6Host(const std::wstring& host) {
+  if (host.size() < 4 || host.front() != L'[' || host.back() != L']') return false;
+  const std::wstring value = host.substr(1, host.size() - 2);
+  size_t groups = 0;
+  size_t digits = 0;
+  bool compressed = false;
+  for (size_t index = 0; index < value.size(); ++index) {
+    const wchar_t character = value[index];
+    const bool hexadecimal = (character >= L'0' && character <= L'9') || (character >= L'a' && character <= L'f') || (character >= L'A' && character <= L'F');
+    if (hexadecimal) {
+      if (++digits > 4) return false;
+      continue;
+    }
+    if (character != L':') return false;
+    if (digits > 0) {
+      ++groups;
+      digits = 0;
+      continue;
+    }
+    if (compressed || index + 1 >= value.size() || value[index + 1] != L':') return false;
+    compressed = true;
+    ++index;
+  }
+  if (digits > 0) ++groups;
+  return compressed ? groups < 8 : groups == 8;
+}
+
+std::wstring OpenSshHostName(const std::wstring& host) {
+  return IsBracketedIpv6Host(host) ? host.substr(1, host.size() - 2) : host;
+}
+
 bool IsSafeReadinessHost(const std::wstring& host) {
   if (host.empty() || host.size() > 253 || host.front() == L'-' || host.back() == L'.') return false;
+  if (host.front() == L'[' || host.back() == L']') return IsBracketedIpv6Host(host);
   for (wchar_t character : host) {
     if (!((character >= L'a' && character <= L'z') || (character >= L'A' && character <= L'Z') || (character >= L'0' && character <= L'9') || character == L'.' || character == L'-')) return false;
   }
@@ -1039,7 +1071,7 @@ NativeReadinessResult ValidateAgentKeyReadiness(SnapshotSession* snapshot, const
   const std::vector<std::wstring> master_arguments = {
       L"-F", L"none", L"-N", L"-T", L"-n", L"-M", L"-S", control_path,
       L"-o", L"ControlPersist=no", L"-o", L"CanonicalizeHostname=no", L"-o", L"ProxyCommand=none", L"-o", L"ProxyJump=none",
-      L"-o", L"HostName=" + host, L"-o", L"BatchMode=yes", L"-o", L"StrictHostKeyChecking=yes", L"-o", L"UserKnownHostsFile=" + known_hosts,
+      L"-o", L"HostName=" + OpenSshHostName(host), L"-o", L"BatchMode=yes", L"-o", L"StrictHostKeyChecking=yes", L"-o", L"UserKnownHostsFile=" + known_hosts,
       L"-o", L"GlobalKnownHostsFile=NUL", L"-o", L"PasswordAuthentication=no", L"-o", L"KbdInteractiveAuthentication=no",
       // The approved key is deliberately held only by the current-user agent;
       // no private-key path is available to this native boundary. Restricting
@@ -2631,7 +2663,9 @@ bool IsRejectedRemoteExecutable(const std::wstring& command) {
   const std::wstring executable = LowerAscii(command.substr(separator == std::wstring::npos ? 0 : separator + 1));
   static constexpr const wchar_t* rejected[] = {L"sh", L"bash", L"dash", L"zsh", L"ksh", L"csh", L"tcsh", L"fish", L"cmd", L"cmd.exe",
                                                  L"powershell", L"powershell.exe", L"pwsh", L"pwsh.exe", L"python", L"python3", L"python.exe",
-                                                 L"perl", L"ruby", L"node"};
+                                                 L"perl", L"ruby", L"node", L"ssh", L"ssh.exe", L"scp", L"scp.exe", L"sftp", L"sftp.exe",
+                                                 L"rsync", L"rsync.exe", L"env", L"nohup", L"setsid", L"daemonize", L"xargs", L"parallel",
+                                                 L"find", L"timeout", L"watch", L"busybox"};
   for (const wchar_t* candidate : rejected) if (executable == candidate) return true;
   return false;
 }
@@ -2901,7 +2935,7 @@ NativeAgentCommandRunResult RunNativeAgentCommand(SnapshotSession* snapshot, con
   }
   const std::vector<std::wstring> arguments = {
       L"-F", L"none", L"-T", L"-n", L"-o", L"CanonicalizeHostname=no", L"-o", L"ProxyCommand=none", L"-o", L"ProxyJump=none",
-      L"-o", L"HostName=" + request.host, L"-o", L"BatchMode=yes", L"-o", L"StrictHostKeyChecking=yes", L"-o", L"UserKnownHostsFile=" + known_hosts_short,
+      L"-o", L"HostName=" + OpenSshHostName(request.host), L"-o", L"BatchMode=yes", L"-o", L"StrictHostKeyChecking=yes", L"-o", L"UserKnownHostsFile=" + known_hosts_short,
       L"-o", L"GlobalKnownHostsFile=NUL", L"-o", L"PasswordAuthentication=no", L"-o", L"KbdInteractiveAuthentication=no",
       L"-o", L"NumberOfPasswordPrompts=0", L"-o", L"IdentityFile=" + identity_file, L"-o", L"IdentitiesOnly=yes", L"-p", std::to_wstring(request.port),
       L"-l", request.user, request.host};
