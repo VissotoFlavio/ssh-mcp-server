@@ -254,8 +254,24 @@ test('POSIX IPC authenticates a fragmented response from a private Unix socket',
       server.listen(socketPath, resolve);
     });
     await fs.chmod(socketPath, 0o600);
-    const provider = new IpcHumanSudoApprovalProvider(new UnixSocketHumanApproverChannel(socketPath, secretFile, 5000), 'posix');
-    assert.equal(await provider.approve(baseRequest), true);
+    const channel = new UnixSocketHumanApproverChannel(socketPath, secretFile, 5000);
+    const response = await channel.approve({
+      version: 1,
+      type: 'approval-request',
+      nonce: 'a'.repeat(64),
+      requestDigest: 'b'.repeat(64),
+      operationId: baseRequest.operationId,
+      leaseIdentityDigest: baseRequest.leaseIdentityDigest,
+      request: {
+        profileId: baseRequest.profileId,
+        command: baseRequest.command,
+        args: baseRequest.args,
+        timeoutMs: baseRequest.timeoutMs,
+        maxOutputBytes: baseRequest.maxOutputBytes,
+        presentation: baseRequest.approvedIdentity,
+      },
+    });
+    assert.equal(typeof response === 'object' && response.approved, true);
     assert.equal(received?.requestMac, requestMac(received as unknown as HumanApproverIpcRequest, secret));
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => (error === undefined ? resolve() : reject(error))));
