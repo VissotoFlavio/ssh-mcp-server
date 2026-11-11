@@ -101,10 +101,10 @@ publish a release.
 
 ### Fixed
 
-- Windows native remote execution now uses the validated destination and
-  explicit host-key alias consistently across ControlMaster startup, readiness
-  checks, command execution, and cleanup; executable denylist checks also
-  normalize .exe variants.
+- Windows native remote execution now uses the validated destination
+  consistently across ControlMaster startup, readiness checks, command
+  execution, and cleanup; executable denylist checks also normalize .exe
+  variants.
 - Automated backport retries now verify the existing pull request's source
   repository and deterministic branch before treating it as reusable or complete.
 - Package-candidate workflow metadata validation now reads the npm lockfile's

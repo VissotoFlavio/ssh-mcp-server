@@ -1057,7 +1057,7 @@ bool StopMaster(Handle* master, const std::wstring& ssh, const std::wstring& con
   const ULONGLONG deadline = GetTickCount64() + timeout;
   DWORD ignored = 1;
   const std::wstring target = OpenSshHostName(host);
-  const std::vector<std::wstring> exit_arguments = {L"-F", L"none", L"-S", control_path, L"-O", L"exit", L"-o", L"HostName=" + target, L"-l", user, target};
+  const std::vector<std::wstring> exit_arguments = {L"-F", L"none", L"-S", control_path, L"-O", L"exit", L"-l", user, target};
   if (timeout > 0) LaunchHiddenProcess(ssh, FixedCommandLine(ssh, exit_arguments), timeout, &ignored, cancelled);
   DWORD wait = WAIT_TIMEOUT;
   while (GetTickCount64() < deadline && (cancelled == nullptr || !cancelled->load())) {
@@ -1095,7 +1095,7 @@ NativeReadinessResult ValidateAgentKeyReadiness(SnapshotSession* snapshot, const
   const std::vector<std::wstring> master_arguments = {
       L"-F", L"none", L"-N", L"-T", L"-n", L"-M", L"-S", control_path,
       L"-o", L"ControlPersist=no", L"-o", L"CanonicalizeHostname=no", L"-o", L"ProxyCommand=none", L"-o", L"ProxyJump=none",
-      L"-o", L"HostName=" + OpenSshHostName(host), L"-o", L"HostKeyAlias=" + OpenSshHostName(host), L"-o", L"BatchMode=yes", L"-o", L"StrictHostKeyChecking=yes", L"-o", L"UserKnownHostsFile=" + known_hosts,
+      L"-o", L"BatchMode=yes", L"-o", L"StrictHostKeyChecking=yes", L"-o", L"UserKnownHostsFile=" + known_hosts,
       L"-o", L"GlobalKnownHostsFile=NUL", L"-o", L"PasswordAuthentication=no", L"-o", L"KbdInteractiveAuthentication=no",
       // The approved key is deliberately held only by the current-user agent;
       // no private-key path is available to this native boundary. Restricting
@@ -1110,8 +1110,7 @@ NativeReadinessResult ValidateAgentKeyReadiness(SnapshotSession* snapshot, const
     if (!GetExitCodeProcess(master.get(), &master_exit) || master_exit != STILL_ACTIVE) break;
     const DWORD remaining = static_cast<DWORD>(timeout - (GetTickCount64() - started));
     DWORD check_exit = 1;
-    const std::vector<std::wstring> check_arguments = {L"-F", L"none", L"-S", control_path, L"-O", L"check", L"-o", L"HostName=" + OpenSshHostName(host), L"-l", user,
-                                                       OpenSshHostName(host)};
+    const std::vector<std::wstring> check_arguments = {L"-F", L"none", L"-S", control_path, L"-O", L"check", L"-l", user, OpenSshHostName(host)};
     if (LaunchHiddenProcess(ssh, FixedCommandLine(ssh, check_arguments), std::max<DWORD>(1, std::min<DWORD>(remaining, 250)), &check_exit, cancelled) == LaunchResult::kCompleted && check_exit == 0) {
       ready = true;
       break;
@@ -2960,7 +2959,7 @@ NativeAgentCommandRunResult RunNativeAgentCommand(SnapshotSession* snapshot, con
   }
   const std::vector<std::wstring> arguments = {
       L"-F", L"none", L"-T", L"-n", L"-o", L"CanonicalizeHostname=no", L"-o", L"ProxyCommand=none", L"-o", L"ProxyJump=none",
-      L"-o", L"HostName=" + OpenSshHostName(request.host), L"-o", L"HostKeyAlias=" + OpenSshHostName(request.host), L"-o", L"BatchMode=yes", L"-o", L"StrictHostKeyChecking=yes", L"-o", L"UserKnownHostsFile=" + known_hosts_short,
+      L"-o", L"BatchMode=yes", L"-o", L"StrictHostKeyChecking=yes", L"-o", L"UserKnownHostsFile=" + known_hosts_short,
       L"-o", L"GlobalKnownHostsFile=NUL", L"-o", L"PasswordAuthentication=no", L"-o", L"KbdInteractiveAuthentication=no",
       L"-o", L"NumberOfPasswordPrompts=0", L"-o", L"IdentityFile=" + identity_file, L"-o", L"IdentitiesOnly=yes", L"-p", std::to_wstring(request.port),
       L"-l", request.user, OpenSshHostName(request.host)};
