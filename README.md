@@ -189,6 +189,19 @@ with `npm run windows:audit:init`; rotate it only with
 `npm run windows:audit:rotate`. See
 [the Windows audit journal procedure](docs/windows-execution-audit-journal.md).
 
+When `sudo` approval is needed, build and start the local native broker in a
+separate operator console:
+
+```powershell
+npm run windows:approver
+```
+
+Copy the printed `SSH_MCP_APPROVER_PIPE` and
+`SSH_MCP_APPROVER_SECRET` values into the trusted environment of the MCP
+server. The broker is a single-request process: start it again for the next
+approval. It never opens SSH or exposes an MCP tool; it only authenticates the
+local peer and displays the exact approval prompt.
+
 ## Register with a Codex MCP client
 
 Build first, then register the stdio server with absolute, operator-approved

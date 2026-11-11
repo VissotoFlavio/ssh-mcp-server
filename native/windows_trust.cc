@@ -1580,7 +1580,7 @@ bool ParseAuditRecord(const std::string& line, ExecutionAuditRecord* record) {
   long long version = 0;
   bool exit_null = false;
   if (record == nullptr || !ReadAuditNumber(line, "version", &version) || version != 1 || !ReadAuditString(line, "event", &record->event) ||
-      (record->event != "intent" && record->event != "finished" && record->event != "rotation") || !ReadAuditString(line, "operationId", &record->operation_id) ||
+      (record->event != "intent" && record->event != "approval" && record->event != "handoff" && record->event != "finished" && record->event != "rotation") || !ReadAuditString(line, "operationId", &record->operation_id) ||
       !IsLowerHex(record->operation_id, 32) || !ReadAuditNumber(line, "timestamp", &record->timestamp) || record->timestamp < 0 ||
       !ReadAuditString(line, "keyId", &record->key_id) || !IsLowerHex(record->key_id, 32) ||
       !ReadAuditNullableString(line, "previousEventHmac", &record->has_previous, &record->previous_event_hmac) ||
@@ -1598,6 +1598,8 @@ bool ParseAuditRecord(const std::string& line, ExecutionAuditRecord* record) {
            ReadAuditStringArray(line, "args", &record->args) && ReadAuditString(line, "argsHmac", &record->args_hmac) && IsLowerHex(record->args_hmac, 64) &&
            ReadAuditString(line, "approvalState", &record->approval_state) && !record->approval_state.empty();
   }
+  if (record->event == "approval") return ReadAuditString(line, "state", &record->approval_state) && IsAuditText(record->approval_state, 64);
+  if (record->event == "handoff") return true;
   if (record->event == "rotation") return ReadAuditString(line, "newKeyId", &record->new_key_id) && IsLowerHex(record->new_key_id, 32);
   return ReadAuditString(line, "outcome", &record->outcome) &&
          (record->outcome == "success" || record->outcome == "failure" || record->outcome == "timeout" || record->outcome == "cancelled" || record->outcome == "approval-required" || record->outcome == "unknown") &&
@@ -1619,6 +1621,10 @@ std::string SerializeAuditRecord(const ExecutionAuditRecord& record, bool includ
     value += "],\"argsHmac\":" + JsonString(record.args_hmac) + ",\"approvalState\":" + JsonString(record.approval_state);
   } else if (record.event == "rotation") {
     value += ",\"newKeyId\":" + JsonString(record.new_key_id);
+  } else if (record.event == "approval") {
+    value += ",\"state\":" + JsonString(record.approval_state);
+  } else if (record.event == "handoff") {
+    // No event-specific fields.
   } else {
     value += ",\"outcome\":" + JsonString(record.outcome) + ",\"code\":" + JsonString(record.code) + ",\"exitCode\":" +
              (record.has_exit_code ? std::to_string(record.exit_code) : "null") + ",\"durationMs\":" + std::to_string(record.duration_ms);
@@ -1806,6 +1812,16 @@ bool AppendAuditFinished(const ExecutionAuditRecord& finished, ExecutionAuditApp
   return AppendExecutionAuditRecord(&state, finished, result);
 }
 
+bool AppendAuditOperationEvent(const ExecutionAuditRecord& event, ExecutionAuditAppendResult* result) {
+  ExecutionAuditMutex mutex;
+  if (!mutex.locked()) return false;
+  ExecutionAuditState state;
+  if (!LoadExecutionAuditState(&state) || std::find_if(state.unfinished.begin(), state.unfinished.end(), [&event, &state](const ExecutionAuditState::UnfinishedIntent& unfinished) {
+        return unfinished.operation_id == event.operation_id && unfinished.session_id == state.session_id;
+      }) == state.unfinished.end()) return false;
+  return AppendExecutionAuditRecord(&state, event, result);
+}
+
 bool IsCanonicalProfileId(const std::string& value) {
   if (value.empty() || value.size() > 128) return false;
   for (const char* reserved : {"con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9", "constructor", "prototype", "__proto__"}) if (value == reserved) return false;
@@ -1873,6 +1889,35 @@ bool ReadAuditFinishedValue(napi_env env, napi_value input, ExecutionAuditRecord
   record->has_exit_code = !is_null;
   record->duration_ms = static_cast<long long>(duration);
   return true;
+}
+
+napi_value AuditAppendResultValue(napi_env env, const ExecutionAuditAppendResult& result);
+
+napi_value AppendExecutionAuditApproval(napi_env env, napi_callback_info info) {
+  size_t count = 1;
+  napi_value input{};
+  ExecutionAuditRecord record;
+  ExecutionAuditAppendResult result;
+  if (napi_get_cb_info(env, info, &count, &input, nullptr, nullptr) != napi_ok || count != 1 ||
+      !ReadProvisionString(env, input, "operationId", &record.operation_id, 32) || !IsLowerHex(record.operation_id, 32) ||
+      !ReadProvisionString(env, input, "state", &record.approval_state, 64) || !IsAuditText(record.approval_state, 64) ||
+      (record.approval_state != "approval-requested" && record.approval_state != "approval-approved" &&
+       record.approval_state != "approval-rejected" && record.approval_state != "approval-unavailable") ) return Unavailable(env);
+  record.event = "approval";
+  if (!AppendAuditOperationEvent(record, &result)) return Unavailable(env);
+  return AuditAppendResultValue(env, result);
+}
+
+napi_value AppendExecutionAuditHandoff(napi_env env, napi_callback_info info) {
+  size_t count = 1;
+  napi_value input{};
+  ExecutionAuditRecord record;
+  ExecutionAuditAppendResult result;
+  if (napi_get_cb_info(env, info, &count, &input, nullptr, nullptr) != napi_ok || count != 1 ||
+      !ReadProvisionString(env, input, "operationId", &record.operation_id, 32) || !IsLowerHex(record.operation_id, 32)) return Unavailable(env);
+  record.event = "handoff";
+  if (!AppendAuditOperationEvent(record, &result)) return Unavailable(env);
+  return AuditAppendResultValue(env, result);
 }
 
 napi_value AuditAppendResultValue(napi_env env, const ExecutionAuditAppendResult& result) {
@@ -3536,6 +3581,8 @@ NAPI_MODULE_INIT() {
     {"digestExecutionAuditArguments", nullptr, DigestExecutionAuditArguments, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"appendExecutionAuditIntent", nullptr, AppendExecutionAuditIntent, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"appendExecutionAuditFinished", nullptr, AppendExecutionAuditFinished, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"appendExecutionAuditApproval", nullptr, AppendExecutionAuditApproval, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"appendExecutionAuditHandoff", nullptr, AppendExecutionAuditHandoff, nullptr, nullptr, nullptr, napi_default, nullptr},
 #ifdef SSH_MCP_NATIVE_TEST
     {"testReadReplacementRace", nullptr, TestReadReplacementRace, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"testReadStateFile", nullptr, TestReadStateFile, nullptr, nullptr, nullptr, napi_default, nullptr},

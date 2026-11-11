@@ -40,6 +40,16 @@ export interface WindowsTrustBinding {
     readonly previousEventHmac: string | null;
     readonly eventHmac: string;
   };
+  appendExecutionAuditApproval?(event: { readonly operationId: string; readonly state: string }): {
+    readonly keyId: string;
+    readonly previousEventHmac: string | null;
+    readonly eventHmac: string;
+  };
+  appendExecutionAuditHandoff?(event: { readonly operationId: string }): {
+    readonly keyId: string;
+    readonly previousEventHmac: string | null;
+    readonly eventHmac: string;
+  };
 }
 
 export class WindowsSecureStorageError extends Error {

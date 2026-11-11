@@ -56,10 +56,11 @@ export class WindowsNativeAgentCommandTransport implements RemoteCommandTranspor
       timeoutMs: request.timeoutMs,
       maxOutputBytes: request.maxOutputBytes,
     };
-    const execute = (capability: WindowsNativeAgentCapability): Promise<RemoteCommandTransportResult> => (
-      request.onCommandStarted?.(),
-      this.binding!.execute(capability, nativeRequest, signal)
-    );
+    const execute = async (capability: WindowsNativeAgentCapability): Promise<RemoteCommandTransportResult> => {
+      await request.onCommandHandoff?.();
+      request.onCommandStarted?.();
+      return this.binding!.execute(capability, nativeRequest, signal);
+    };
     const operation = Promise.resolve().then(() => request.authorization!.withTransportContext!(execute));
     return operation.catch((error: unknown) => {
       const code = (error as { code?: unknown })?.code;

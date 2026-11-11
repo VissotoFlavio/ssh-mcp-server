@@ -65,6 +65,7 @@ export type RemoteExecutionCode =
   | 'approval-altered'
   | 'approval-reused'
   | 'approval-unavailable'
+  | 'approval-busy'
   | 'approval-rejected'
   | 'execution-audit-unavailable'
   | 'outcome-unknown'
@@ -102,6 +103,8 @@ export interface RemoteCommandTransportRequest {
   readonly maxOutputBytes: number;
   /** Called once the transport has handed the command to the remote session. */
   readonly onCommandStarted?: () => void;
+  /** Called durably immediately before the first irreversible remote action. */
+  readonly onCommandHandoff?: () => Promise<void> | void;
 }
 
 export interface RemoteCommandTransportResult {
@@ -367,6 +370,7 @@ function releaseAuthorization(authorization: ExecutionAuthorization | undefined)
 
 /** In-memory, request-bound, expiring and one-shot approval capability. */
 export class SudoApprovalStore {
+  private pending = false;
   private readonly approvals = new Map<
     string,
     {
@@ -377,6 +381,16 @@ export class SudoApprovalStore {
       used: boolean;
     }
   >();
+
+  tryBeginPending(): boolean {
+    if (this.pending) return false;
+    this.pending = true;
+    return true;
+  }
+
+  endPending(): void {
+    this.pending = false;
+  }
 
   issue(
     request: SudoApprovalRequest,
@@ -523,12 +537,17 @@ async function boundedTransportExecute(
   signal: AbortSignal | undefined,
 ): Promise<RemoteCommandTransportResult> {
   let commandStarted = false;
+  let commandHandedOff = false;
   try {
     return await boundedOperation(
       (operationSignal) =>
         transport.execute(
           {
             ...request,
+            onCommandHandoff: async () => {
+              await request.onCommandHandoff?.();
+              commandHandedOff = true;
+            },
             onCommandStarted: () => {
               commandStarted = true;
               request.onCommandStarted?.();
@@ -541,7 +560,7 @@ async function boundedTransportExecute(
     );
   } catch (error) {
     const code = mapTransportError(error);
-    if (commandStarted && (code === 'timeout' || code === 'cancelled'))
+    if ((commandStarted || commandHandedOff) && (code === 'timeout' || code === 'cancelled'))
       throw new RemoteExecutionError('outcome-unknown', 'Remote command outcome is unknown');
     throw error;
   }
@@ -630,6 +649,25 @@ export class RemoteCommandExecutionProvider {
     signal?: AbortSignal,
   ): Promise<{
     readonly approved: boolean;
+    readonly code: 'approved' | 'approval-unavailable' | 'approval-rejected' | 'approval-busy' | 'cancelled';
+    readonly operationId: string;
+    readonly capability?: string;
+    readonly token?: string;
+  }> {
+    const operationId = cryptoRandomToken().slice(0, 32);
+    if (!this.approvals.tryBeginPending()) return { approved: false, code: 'approval-busy', operationId };
+    try {
+      return await this.requestSudoApprovalInternal(input, signal);
+    } finally {
+      this.approvals.endPending();
+    }
+  }
+
+  private async requestSudoApprovalInternal(
+    input: unknown,
+    signal?: AbortSignal,
+  ): Promise<{
+    readonly approved: boolean;
     readonly code: 'approved' | 'approval-unavailable' | 'approval-rejected' | 'cancelled';
     readonly operationId: string;
     readonly capability?: string;
@@ -688,6 +726,42 @@ export class RemoteCommandExecutionProvider {
       approvedIdentity: authorization?.identity ?? profileIdentity(profile),
       leaseIdentityDigest: authorization?.identityDigest ?? identityDigest(profileIdentity(profile)),
     };
+    let approvalJournal: ExecutionAuditHandle | undefined;
+    if (this.dependencies.auditJournal !== undefined) {
+      try {
+        const approvalArgsHmac = await this.dependencies.auditJournal.digestArguments(request.args);
+        approvalJournal = await this.dependencies.auditJournal.begin({
+          operationId,
+          profileId: request.profileId,
+          command: redactAuditText(request.command),
+          args: redactRemoteAuditArguments(request.args),
+          argsHmac: approvalArgsHmac,
+          approvalState: 'approval-requested',
+        });
+        await approvalJournal.approval?.('approval-requested');
+      } catch {
+        await authorization?.release?.();
+        return rejected('approval-unavailable');
+      }
+    }
+    const finishApprovalJournal = async (
+      state: 'approval-approved' | 'approval-rejected' | 'approval-unavailable',
+      code: string,
+    ): Promise<boolean> => {
+      if (approvalJournal === undefined) return true;
+      try {
+        await approvalJournal.approval?.(state);
+        await approvalJournal.finish({
+          outcome: state === 'approval-approved' ? 'success' : 'approval-required',
+          code,
+          exitCode: null,
+          durationMs: Math.max(0, this.now() - startedAt),
+        });
+        return true;
+      } catch {
+        return false;
+      }
+    };
     let approved = false;
     try {
       const decision = await boundedOperation(
@@ -697,6 +771,7 @@ export class RemoteCommandExecutionProvider {
       );
       if (decision === 'unavailable') {
         await authorization?.release?.();
+        await finishApprovalJournal('approval-unavailable', 'approval-unavailable');
         return rejected('approval-unavailable');
       }
       approved = decision === true;
@@ -704,17 +779,24 @@ export class RemoteCommandExecutionProvider {
       const approvalCode = mapTransportError(error);
       if (signal?.aborted || approvalCode === 'cancelled') {
         await authorization?.release?.();
+        await finishApprovalJournal('approval-unavailable', 'cancelled');
         return rejected('cancelled');
       }
       if (approvalCode === 'timeout') {
         await authorization?.release?.();
+        await finishApprovalJournal('approval-unavailable', 'approval-unavailable');
         return rejected('approval-unavailable');
       }
       approved = false;
     }
     if (!approved) {
       await authorization?.release?.();
+      await finishApprovalJournal('approval-rejected', 'approval-rejected');
       return rejected('approval-rejected');
+    }
+    if (!(await finishApprovalJournal('approval-approved', 'approved'))) {
+      await authorization?.release?.();
+      return { approved: false, code: 'approval-unavailable', operationId };
     }
     const approvalResult = safeResult(request.profileId, 'success', 'success', { operationId });
     if (!writeRemoteAudit(this.dependencies.auditSink, request, 'approved', approvalResult, Math.max(0, this.now() - startedAt))) {
@@ -815,6 +897,7 @@ export class RemoteCommandExecutionProvider {
           const code = consumed.status === 'expired' ? 'approval-expired' : consumed.status === 'altered' ? 'approval-altered' : 'approval-reused';
           return finish(safeResult(request.profileId, 'approval-required', code, { operationId }));
         }
+        if (journal?.approval !== undefined) await journal.approval('approval-approved');
         authorization = consumed.authorization;
         if (authorization === undefined) {
           authorization = await boundedOperation(
@@ -848,6 +931,9 @@ export class RemoteCommandExecutionProvider {
             args: request.args,
             timeoutMs: remainingTimeout(startedAt, request.timeoutMs!),
             maxOutputBytes: request.maxOutputBytes!,
+            onCommandHandoff: async () => {
+              await journal?.handoff?.();
+            },
             onCommandStarted: () => {
               commandStarted = true;
             },
@@ -1021,29 +1107,36 @@ export class Ssh2RemoteCommandTransport implements RemoteCommandTransport {
         };
         client.on('ready', () => {
           ready = true;
-          client.exec(remoteCommand(request.command, request.args), (error, execChannel) => {
-            if (error !== undefined) return finish(new RemoteExecutionError('remote-failure', 'Remote command failed'));
-            channel = execChannel;
-            commandStarted = true;
-            request.onCommandStarted?.();
-            const appendOutput = (target: Buffer[], chunk: Buffer | string): void => {
-              const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-              outputBytes += data.byteLength;
-              if (outputBytes <= request.maxOutputBytes) target.push(data);
-              else if (outputBytes - data.byteLength < request.maxOutputBytes)
-                target.push(data.subarray(0, request.maxOutputBytes - (outputBytes - data.byteLength)));
-              if (outputBytes > request.maxOutputBytes) {
-                try {
-                  execChannel.close();
-                } catch {
-                  // The close path below still owns cleanup.
-                }
-              }
-            };
-            execChannel.on('data', (chunk: Buffer | string) => appendOutput(stdout, chunk));
-            execChannel.stderr.on('data', (chunk: Buffer | string) => appendOutput(stderr, chunk));
-            execChannel.on('close', (code: number | null) => finish(undefined, code));
-          });
+          void (async () => {
+            try {
+              await request.onCommandHandoff?.();
+              client.exec(remoteCommand(request.command, request.args), (error, execChannel) => {
+                if (error !== undefined) return finish(new RemoteExecutionError('remote-failure', 'Remote command failed'));
+                channel = execChannel;
+                commandStarted = true;
+                request.onCommandStarted?.();
+                const appendOutput = (target: Buffer[], chunk: Buffer | string): void => {
+                  const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+                  outputBytes += data.byteLength;
+                  if (outputBytes <= request.maxOutputBytes) target.push(data);
+                  else if (outputBytes - data.byteLength < request.maxOutputBytes)
+                    target.push(data.subarray(0, request.maxOutputBytes - (outputBytes - data.byteLength)));
+                  if (outputBytes > request.maxOutputBytes) {
+                    try {
+                      execChannel.close();
+                    } catch {
+                      // The close path below still owns cleanup.
+                    }
+                  }
+                };
+                execChannel.on('data', (chunk: Buffer | string) => appendOutput(stdout, chunk));
+                execChannel.stderr.on('data', (chunk: Buffer | string) => appendOutput(stderr, chunk));
+                execChannel.on('close', (code: number | null) => finish(undefined, code));
+              });
+            } catch {
+              finish(new RemoteExecutionError('execution-audit-unavailable', 'Remote execution handoff is unavailable'));
+            }
+          })();
         });
         client.connect(config);
       } catch {
@@ -1127,6 +1220,7 @@ export function serializeRemoteAuditEvent(input: unknown): string {
     'approval-altered',
     'approval-reused',
     'approval-unavailable',
+    'approval-busy',
     'approval-rejected',
     'execution-audit-unavailable',
     'outcome-unknown',

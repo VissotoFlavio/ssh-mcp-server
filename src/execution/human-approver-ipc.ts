@@ -19,6 +19,8 @@ const MAX_UNIX_SOCKET_PATH_BYTES = 107;
 const MAX_IPC_TIMEOUT_MS = 60_000;
 const APPROVER_SOCKET_ENV = 'SSH_MCP_APPROVER_SOCKET';
 const APPROVER_SECRET_FILE_ENV = 'SSH_MCP_APPROVER_SECRET_FILE';
+const APPROVER_PIPE_ENV = 'SSH_MCP_APPROVER_PIPE';
+const APPROVER_SECRET_ENV = 'SSH_MCP_APPROVER_SECRET';
 const APPROVER_SECRET_BYTES = 32;
 const HEX_64 = /^[a-f0-9]{64}$/u;
 
@@ -63,6 +65,101 @@ export interface HumanApproverIpcChannel {
 export interface WindowsNamedPipeSecurityBoundary {
   /** Must be implemented by a native boundary that authenticates the peer SID and ACL. */
   approve(request: HumanApproverIpcRequest, signal?: AbortSignal): Promise<HumanApproverIpcResponse>;
+}
+
+function windowsNativeMac(secret: Buffer, domain: string, fields: readonly unknown[]): string {
+  return createHmac('sha256', secret)
+    .update(`${domain}\0${JSON.stringify(fields)}`, 'utf8')
+    .digest('hex');
+}
+
+function readWindowsSecret(environment: NodeJS.ProcessEnv): Buffer | undefined {
+  const value = environment[APPROVER_SECRET_ENV];
+  if (typeof value !== 'string' || !HEX_64.test(value)) return undefined;
+  return Buffer.from(value, 'hex');
+}
+
+/** Client side of the packaged native broker. The broker owns the pipe ACL and peer SID check. */
+export class EnvironmentWindowsNamedPipeSecurityBoundary implements WindowsNamedPipeSecurityBoundary {
+  constructor(
+    private readonly pipePath: string,
+    private readonly secret: Buffer,
+    private readonly timeoutMs = MAX_IPC_TIMEOUT_MS,
+  ) {}
+
+  approve(request: HumanApproverIpcRequest, signal?: AbortSignal): Promise<HumanApproverIpcResponse> {
+    if (!this.pipePath.startsWith('\\\\.\\pipe\\') || signal?.aborted) return Promise.reject(new Error('approver unavailable'));
+    return new Promise<HumanApproverIpcResponse>((resolve, reject) => {
+      let settled = false;
+      let data = Buffer.alloc(0);
+      const socket = createConnection({ path: this.pipePath });
+      const cleanup = (): void => {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', abort);
+      };
+      const fail = (error: unknown): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        closeSocket(socket);
+        reject(error);
+      };
+      const finish = (value: HumanApproverIpcResponse): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        closeSocket(socket);
+        resolve(value);
+      };
+      const abort = (): void => fail(new Error('approver cancelled'));
+      const timer = setTimeout(() => fail(new Error('approver timeout')), Math.min(Math.max(1, this.timeoutMs), MAX_IPC_TIMEOUT_MS));
+      signal?.addEventListener('abort', abort, { once: true });
+      socket.on('connect', () => {
+        try {
+          const requestMac = windowsNativeMac(this.secret, 'ssh-mcp-approver/native-request/v1', [
+            request.nonce,
+            request.requestDigest,
+            request.operationId,
+            request.leaseIdentityDigest,
+          ]);
+          socket.end(encodeFrame({ ...request, requestMac }));
+        } catch (error) {
+          fail(error);
+        }
+      });
+      socket.on('data', (chunk: Buffer) => {
+        data = Buffer.concat([data, chunk]);
+        if (data.length > MAX_FRAME_BYTES + 4) fail(new Error('approver protocol invalid'));
+      });
+      socket.on('end', () => {
+        try {
+          const value = decodeSingleFrame(data);
+          if (!isRecord(value) || !hasExactKeys(value, ['version', 'type', 'nonce', 'requestDigest', 'approved', 'responseMac']))
+            throw new Error('approver protocol invalid');
+          const response = validateResponse(
+            { version: value.version, type: value.type, nonce: value.nonce, requestDigest: value.requestDigest, approved: value.approved },
+            request,
+          );
+          if (
+            response === undefined ||
+            typeof value.responseMac !== 'string' ||
+            !equalMac(
+              value.responseMac,
+              windowsNativeMac(this.secret, 'ssh-mcp-approver/native-response/v1', [response.nonce, response.requestDigest, response.approved]),
+            )
+          )
+            throw new Error('approver authentication failed');
+          finish(response);
+        } catch (error) {
+          fail(error);
+        }
+      });
+      socket.on('error', fail);
+      socket.on('close', () => {
+        if (!settled) fail(new Error('approver unavailable'));
+      });
+    });
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -427,6 +524,16 @@ export function createLocalHumanSudoApprovalProvider(
   }
   if (platform === 'win32' && windowsBoundary !== undefined) {
     return new IpcHumanSudoApprovalProvider(new WindowsNamedPipeHumanApproverChannel(windowsBoundary), 'windows');
+  }
+  if (platform === 'win32') {
+    const pipe = environment[APPROVER_PIPE_ENV];
+    const secret = readWindowsSecret(environment);
+    if (pipe !== undefined && secret !== undefined) {
+      return new IpcHumanSudoApprovalProvider(
+        new WindowsNamedPipeHumanApproverChannel(new EnvironmentWindowsNamedPipeSecurityBoundary(pipe, secret)),
+        'windows',
+      );
+    }
   }
   return undefined;
 }

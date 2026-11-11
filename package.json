@@ -5,6 +5,7 @@
   "files": [
     "dist",
     "build/Release/windows_trust.node",
+    "build/Release/ssh-mcp-approver.exe",
     "README.md",
     "CHANGELOG.md",
     "docs",
@@ -28,6 +29,7 @@
     "start": "node dist/server.js",
     "windows:audit:init": "node scripts/windows-audit-journal.mjs init",
     "windows:audit:rotate": "node scripts/windows-audit-journal.mjs rotate",
+    "windows:approver": "node scripts/windows-approver.mjs",
     "test": "tsx --test \"test/unit/**/*.test.ts\"",
     "test:integration": "node -e \"if (process.env.SSH_INTEGRATION_TEST !== 'true') throw new Error('Set SSH_INTEGRATION_TEST=true to run integration tests.');\" && tsx --test \"test/integration/**/*.test.ts\""
   },

@@ -34,12 +34,14 @@ cannot supply any of those values.
    The POSIX socket and its secret are a local same-user trust boundary: run
    the MCP server and approver under a dedicated OS identity, restrict the
    socket directory and secret to that identity, and do not treat this IPC as
-   protection from another process already trusted as the same user. A native
-   peer-credential boundary remains a follow-up hardening item.
-   The current Windows native addon does not expose the required
-   authenticated named-pipe/SID boundary, so Windows remains unavailable until
-   that explicit native dependency is supplied; it is not simulated. The
-   server fails closed with `approval-unavailable` when the component is absent.
+   protection from another process already trusted as the same user.
+   On Windows, build the packaged native broker and start it with
+   `npm run windows:approver`; it creates a SID/DACL-protected named pipe,
+   validates the client process token, prompts the local operator, and uses a
+   mutual HMAC challenge/response. The server reads only
+   `SSH_MCP_APPROVER_PIPE` and `SSH_MCP_APPROVER_SECRET` from its trusted
+   process environment. If the broker is absent or its handshake fails, only
+   sudo approval is unavailable; ordinary commands remain unaffected.
 5. Inspect the redacted local audit stream on standard error when diagnosing a
    result. It contains the bounded command/arguments, profile, approval state,
    duration, exit status, outcome, and stable code, but never stdout/stderr,
@@ -62,7 +64,12 @@ cannot supply any of those values.
 - `sudo` approval is bound to profile, command, arguments, timeout, and output
   limit plus the approved host, port, user, fingerprint, authentication mode,
   credential reference, and known-hosts reference; it expires after one minute
-  and is consumed once.
+  and is consumed once. A second simultaneous approval request returns
+  `approval-busy` without opening an SSH session.
+- The durable execution journal records the intent, approval transition, and
+  handoff immediately before the irreversible SSH action. Cancellation or
+  expiry before handoff is `cancelled`; after handoff it is
+  `outcome-unknown` and must not be retried automatically.
 - If the durable audit journal cannot accept an event, the command result is
   reported as `execution-audit-unavailable`; remote success is never attempted
   without a durable intent record. A secondary diagnostic sink failure cannot

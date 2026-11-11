@@ -30,9 +30,11 @@ test('writes durable chained intent and finished events without output', async (
   const fixtureState = await fixture();
   const journal = new PosixExecutionAuditJournal({ ...fixtureState, uid: process.getuid?.() });
   const handle = await journal.begin(intent);
+  await handle.approval?.('approval-approved');
+  await handle.handoff?.();
   await handle.finish({ outcome: 'success', code: 'success', exitCode: 0, durationMs: 2 });
   const serialized = await readFile(join(fixtureState.root, 'execution-audit.v1.jsonl'), 'utf8');
-  assert.equal(serialized.split('\n').filter(Boolean).length, 2);
+  assert.equal(serialized.split('\n').filter(Boolean).length, 4);
   assert.equal(serialized.includes('stdout'), false);
   assert.equal(serialized.includes('password'), false);
 });
@@ -112,4 +114,32 @@ test('adapts the native Windows journal without receiving key material', async (
     ['digest', 'intent', 'finished'],
   );
   assert.equal('key' in (events[1] as object), false);
+});
+
+test('adapts durable approval and handoff events through the native journal boundary', async () => {
+  const events: unknown[] = [];
+  const journal = new WindowsExecutionAuditJournal({
+    digestExecutionAuditArguments: () => 'a'.repeat(64),
+    appendExecutionAuditIntent: () => ({ keyId: 'b'.repeat(32), previousEventHmac: null, eventHmac: 'c'.repeat(64) }),
+    appendExecutionAuditApproval: (event) => {
+      events.push({ kind: 'approval', event });
+      return { keyId: 'b'.repeat(32), previousEventHmac: 'c'.repeat(64), eventHmac: 'd'.repeat(64) };
+    },
+    appendExecutionAuditHandoff: (event) => {
+      events.push({ kind: 'handoff', event });
+      return { keyId: 'b'.repeat(32), previousEventHmac: 'd'.repeat(64), eventHmac: 'e'.repeat(64) };
+    },
+    appendExecutionAuditFinished: (event) => {
+      events.push({ kind: 'finished', event });
+      return { keyId: 'b'.repeat(32), previousEventHmac: 'e'.repeat(64), eventHmac: 'f'.repeat(64) };
+    },
+  });
+  const handle = await journal.begin(intent);
+  await handle.approval?.('approval-approved');
+  await handle.handoff?.();
+  await handle.finish({ outcome: 'success', code: 'success', exitCode: 0, durationMs: 1 });
+  assert.deepEqual(
+    events.map((event) => (event as { kind: string }).kind),
+    ['approval', 'handoff', 'finished'],
+  );
 });

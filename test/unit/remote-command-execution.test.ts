@@ -170,6 +170,32 @@ test('distinguishes an unavailable human approver from an explicit rejection', a
   assert.equal(result.code, 'approval-unavailable');
 });
 
+test('allows only one pending approval per process and fails the second closed', async () => {
+  const controller = new AbortController();
+  let releaseApproval!: () => void;
+  const provider = new RemoteCommandExecutionProvider({
+    profiles: { getProfile: async () => profile },
+    connectionValidation: {
+      validateConnection: async () => ({ profileId: profile.profileId, ready: true as const }),
+      authorizeExecution: async () => ({ profile }),
+    },
+    transport: new FakeTransport(),
+    humanApproval: {
+      approve: async () =>
+        new Promise<boolean>((resolve) => {
+          releaseApproval = () => resolve(true);
+        }),
+    },
+  });
+  const pending = provider.requestSudoApproval({ profileId: profile.profileId, command: 'sudo', args: ['id'] }, controller.signal);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const busy = await provider.requestSudoApproval({ profileId: profile.profileId, command: 'sudo', args: ['id'] });
+  assert.equal(busy.code, 'approval-busy');
+  controller.abort();
+  releaseApproval();
+  assert.equal((await pending).code, 'cancelled');
+});
+
 test('binds sudo approval to exact request, expiry and one-time use', async () => {
   let now = 1_000;
   const approvals = new SudoApprovalStore();

@@ -7,6 +7,13 @@ publish a release.
 
 ### Added
 
+- Added the packaged native Windows `ssh-mcp-approver` broker with a
+  SID/DACL-protected named pipe, same-user peer validation, mutual HMAC
+  handshake, explicit local confirmation, bounded one-request lifecycle, and
+  fail-closed `approval-unavailable` behavior. Added durable approval and
+  handoff journal events, a one-pending-approval limit with `approval-busy`,
+  and native broker startup documentation.
+
 - Added the native Windows execution-audit provider with Credential Manager
   HMAC keys, explicit operator initialization/rotation, session-aware recovery,
   durable rotation events, bounded mutex acquisition, stable SSH failure codes,
