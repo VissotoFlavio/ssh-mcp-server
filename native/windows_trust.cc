@@ -1447,6 +1447,7 @@ bool WriteAtomicAuditFile(const std::wstring& root, const std::wstring& leaf, PS
     DeleteFileW(temporary_path.c_str());
     return false;
   }
+  root_handle.reset();
   temporary.reset();
   const std::wstring target_path = root + L"\\" + leaf;
   // MoveFileEx performs the same-volume replacement atomically while also
