@@ -912,6 +912,11 @@ bool StartHiddenProcess(const std::wstring& application, std::wstring command, H
 
 void AppendQuotedArgument(std::wstring* command, const std::wstring& argument) {
   command->push_back(L' ');
+  const bool requires_quotes = argument.empty() || std::any_of(argument.begin(), argument.end(), [](wchar_t character) { return iswspace(character) != 0 || character == L'"'; });
+  if (!requires_quotes) {
+    command->append(argument);
+    return;
+  }
   command->push_back(L'"');
   size_t slashes = 0;
   for (wchar_t character : argument) {
