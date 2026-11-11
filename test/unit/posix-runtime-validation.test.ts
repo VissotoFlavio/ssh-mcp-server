@@ -149,6 +149,14 @@ test('production execution binds sudo approval to the validated POSIX authorizat
           return { profile };
         },
       },
+      auditJournal: {
+        digestArguments: async () => 'a'.repeat(64),
+        begin: async () => ({
+          operationId: '0123456789abcdef0123456789abcdef',
+          approval: async () => undefined,
+          finish: async () => undefined,
+        }),
+      },
     },
     {
       approve: async (request) => {

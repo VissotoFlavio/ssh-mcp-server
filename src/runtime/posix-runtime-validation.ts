@@ -5,7 +5,7 @@ import { chmod, lstat, mkdtemp, readFile, realpath, rm, writeFile } from 'node:f
 import { posix as posixPath } from 'node:path';
 
 import { createPlatformCredentialStoreResolver } from '../credentials/credential-store.js';
-import { PosixExecutionAuditJournal, UnavailableExecutionAuditJournal } from '../execution/execution-audit-journal.js';
+import { PosixExecutionAuditJournal, UnavailableExecutionAuditJournal, type ExecutionAuditJournal } from '../execution/execution-audit-journal.js';
 import {
   createProfileExecutionAuthorizationProvider,
   RemoteCommandExecutionProvider,
@@ -73,6 +73,7 @@ export interface PosixRuntimeValidationDependencies {
   readonly profileRegistry?: Pick<LocalProfileRegistry, 'getProfile'>;
   readonly timeoutMs?: number;
   readonly connectionValidationProvider?: ConnectionValidationProvider;
+  readonly auditJournal?: ExecutionAuditJournal;
 }
 
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -533,9 +534,10 @@ export function createRuntimeRemoteCommandExecutionProvider(
   const auditRoot = environment[SSH_MCP_AUDIT_ROOT_ENV];
   const auditKeyFile = environment[SSH_MCP_AUDIT_KEY_FILE_ENV];
   const auditJournal =
-    auditRoot !== undefined && auditKeyFile !== undefined
+    dependencies.auditJournal ??
+    (auditRoot !== undefined && auditKeyFile !== undefined
       ? new PosixExecutionAuditJournal({ root: auditRoot, keyFile: auditKeyFile, uid })
-      : new UnavailableExecutionAuditJournal();
+      : new UnavailableExecutionAuditJournal());
   return new RemoteCommandExecutionProvider({
     profiles: registry,
     connectionValidation: validationProvider,
