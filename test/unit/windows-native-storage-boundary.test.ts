@@ -226,6 +226,7 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
     testReleaseDeferredReaper(): void;
     testWaitForMasterStarted(timeoutMs: number): boolean;
     testDeferredReaperCompletion(): Promise<void>;
+    execute(capability: object, request: object, signal?: AbortSignal): Promise<unknown>;
   };
 
   test('keeps test-only hooks out of the production native addon', () => {
@@ -772,7 +773,7 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
       }> => {
         const snapshot = binding.captureKnownHostsSnapshot('production-api');
         try {
-          return (await binding.execute(snapshot.capability, request, signal)) as {
+          return (await testBinding.execute(snapshot.capability, request, signal)) as {
             readonly exitCode: number;
             readonly stdout: string;
             readonly stderr: string;
