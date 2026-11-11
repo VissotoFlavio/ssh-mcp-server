@@ -1,9 +1,13 @@
 import { strict as assert } from 'node:assert';
+import { EventEmitter } from 'node:events';
 import test from 'node:test';
+
+import type { Client, ClientChannel } from 'ssh2';
 
 import {
   RemoteCommandExecutionProvider,
   RemoteExecutionError,
+  Ssh2RemoteCommandTransport,
   SudoApprovalStore,
   WindowsRemoteCommandTransport,
   createExecutionAuthorization,
@@ -220,6 +224,58 @@ test('enforces the output limit and transport deadline at the provider boundary'
   setTimeout(() => controller.abort(), 5);
   const cancelled = await provider.execute({ ...command, timeoutMs: 100 }, controller.signal);
   assert.equal(cancelled.code, 'cancelled');
+});
+
+test('closes the SSH channel when stderr alone exceeds the output limit', async () => {
+  class FakeChannel extends EventEmitter {
+    readonly stderr = new EventEmitter();
+    closeCalls = 0;
+
+    close(): void {
+      if (this.closeCalls > 0) return;
+      this.closeCalls += 1;
+      this.emit('close', null);
+    }
+  }
+
+  class FakeClient extends EventEmitter {
+    readonly channel: FakeChannel;
+
+    constructor(channel: FakeChannel) {
+      super();
+      this.channel = channel;
+    }
+
+    connect(): void {
+      queueMicrotask(() => this.emit('ready'));
+    }
+
+    exec(_command: string, callback: (error: Error | undefined, channel: ClientChannel) => void): void {
+      callback(undefined, this.channel as unknown as ClientChannel);
+    }
+
+    end(): void {}
+
+    destroy(): void {}
+  }
+
+  const channel = new FakeChannel();
+  const client = new FakeClient(channel);
+  const transport = new Ssh2RemoteCommandTransport(undefined, undefined, () => client as unknown as Client);
+  const resultPromise = transport.execute({
+    profile,
+    command: 'printf',
+    args: ['stderr'],
+    timeoutMs: 1_000,
+    maxOutputBytes: 3,
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  channel.stderr.emit('data', Buffer.from('overflow'));
+
+  const result = await resultPromise;
+  assert.equal(result.outputTruncated, true);
+  assert.equal(result.stderr, 'ove');
+  assert.equal(channel.closeCalls, 1);
 });
 
 test('preserves unknown outcome when the transport cannot establish completion', async () => {

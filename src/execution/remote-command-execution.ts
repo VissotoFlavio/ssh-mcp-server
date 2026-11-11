@@ -661,17 +661,15 @@ export class RemoteCommandExecutionProvider {
     let profile: ConnectionProfile | undefined;
     let authorization: ExecutionAuthorization | undefined;
     try {
-      if (this.dependencies.authorizationProvider !== undefined) {
-        authorization = await boundedOperation(
-          (authorizationSignal) => this.dependencies.authorizationProvider!.authorize(request.profileId, authorizationSignal),
-          Math.min(APPROVAL_TTL_MS, request.timeoutMs!),
-          signal,
-        );
-        profile = authorization.profile;
-      } else {
-        profile = await this.dependencies.profiles.getProfile(request.profileId, signal);
-        if (profile !== undefined) authorization = createExecutionAuthorization(profile, this.now() + APPROVAL_TTL_MS, this.now);
-      }
+      authorization = await boundedOperation(
+        (authorizationSignal) =>
+          (
+            this.dependencies.authorizationProvider ?? createProfileExecutionAuthorizationProvider(this.dependencies.connectionValidation, this.now)
+          ).authorize(request.profileId, authorizationSignal),
+        Math.min(APPROVAL_TTL_MS, request.timeoutMs!),
+        signal,
+      );
+      profile = authorization.profile;
     } catch {
       await authorization?.release?.();
       return rejected('approval-unavailable');
@@ -1023,17 +1021,17 @@ export class Ssh2RemoteCommandTransport implements RemoteCommandTransport {
         };
         client.on('ready', () => {
           ready = true;
-          commandStarted = true;
-          request.onCommandStarted?.();
           client.exec(remoteCommand(request.command, request.args), (error, execChannel) => {
             if (error !== undefined) return finish(new RemoteExecutionError('remote-failure', 'Remote command failed'));
             channel = execChannel;
-            execChannel.on('data', (chunk: Buffer | string) => {
+            commandStarted = true;
+            request.onCommandStarted?.();
+            const appendOutput = (target: Buffer[], chunk: Buffer | string): void => {
               const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
               outputBytes += data.byteLength;
-              if (outputBytes <= request.maxOutputBytes) stdout.push(data);
+              if (outputBytes <= request.maxOutputBytes) target.push(data);
               else if (outputBytes - data.byteLength < request.maxOutputBytes)
-                stdout.push(data.subarray(0, request.maxOutputBytes - (outputBytes - data.byteLength)));
+                target.push(data.subarray(0, request.maxOutputBytes - (outputBytes - data.byteLength)));
               if (outputBytes > request.maxOutputBytes) {
                 try {
                   execChannel.close();
@@ -1041,14 +1039,9 @@ export class Ssh2RemoteCommandTransport implements RemoteCommandTransport {
                   // The close path below still owns cleanup.
                 }
               }
-            });
-            execChannel.stderr.on('data', (chunk: Buffer | string) => {
-              const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-              outputBytes += data.byteLength;
-              if (outputBytes <= request.maxOutputBytes) stderr.push(data);
-              else if (outputBytes - data.byteLength < request.maxOutputBytes)
-                stderr.push(data.subarray(0, request.maxOutputBytes - (outputBytes - data.byteLength)));
-            });
+            };
+            execChannel.on('data', (chunk: Buffer | string) => appendOutput(stdout, chunk));
+            execChannel.stderr.on('data', (chunk: Buffer | string) => appendOutput(stderr, chunk));
             execChannel.on('close', (code: number | null) => finish(undefined, code));
           });
         });
