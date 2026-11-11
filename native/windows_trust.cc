@@ -821,20 +821,40 @@ void FinalizeSnapshotCapability(napi_env, void* data, void*) {
 
 enum class LaunchResult { kCompleted, kTimedOut, kFailed };
 
+bool CreateHiddenProcessWithExplicitHandles(const std::wstring& application, std::wstring* command, HANDLE input, HANDLE output, HANDLE error,
+                                            PROCESS_INFORMATION* information) {
+  HANDLE inherited_handles[] = {input, output, error};
+  SIZE_T attribute_bytes = 0;
+  InitializeProcThreadAttributeList(nullptr, 1, 0, &attribute_bytes);
+  if (attribute_bytes == 0) return false;
+  std::vector<BYTE> attribute_storage(attribute_bytes);
+  auto* attributes = reinterpret_cast<PPROC_THREAD_ATTRIBUTE_LIST>(attribute_storage.data());
+  if (InitializeProcThreadAttributeList(attributes, 1, 0, &attribute_bytes) == FALSE) return false;
+  if (UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited_handles, sizeof(inherited_handles), nullptr, nullptr) == FALSE) {
+    DeleteProcThreadAttributeList(attributes);
+    return false;
+  }
+  STARTUPINFOEXW startup{};
+  startup.StartupInfo.cb = sizeof(startup);
+  startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+  startup.StartupInfo.hStdInput = input;
+  startup.StartupInfo.hStdOutput = output;
+  startup.StartupInfo.hStdError = error;
+  startup.lpAttributeList = attributes;
+  const BOOL created = CreateProcessW(application.c_str(), command->data(), nullptr, nullptr, TRUE,
+                                      CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr, &startup.StartupInfo, information);
+  DeleteProcThreadAttributeList(attributes);
+  return created != FALSE;
+}
+
 LaunchResult LaunchHiddenProcess(const std::wstring& application, std::wstring command, DWORD timeout, DWORD* exit_code, const std::atomic<bool>* cancelled = nullptr) {
   SECURITY_ATTRIBUTES inheritable{};
   inheritable.nLength = sizeof(inheritable);
   inheritable.bInheritHandle = TRUE;
   Handle nul(CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &inheritable, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
   if (nul.get() == INVALID_HANDLE_VALUE) return LaunchResult::kFailed;
-  STARTUPINFOW startup{};
-  startup.cb = sizeof(startup);
-  startup.dwFlags = STARTF_USESTDHANDLES;
-  startup.hStdInput = nul.get();
-  startup.hStdOutput = nul.get();
-  startup.hStdError = nul.get();
   PROCESS_INFORMATION process{};
-  if (!CreateProcessW(application.c_str(), command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) return LaunchResult::kFailed;
+  if (!CreateHiddenProcessWithExplicitHandles(application, &command, nul.get(), nul.get(), nul.get(), &process)) return LaunchResult::kFailed;
   Handle process_handle(process.hProcess);
   Handle thread_handle(process.hThread);
   const ULONGLONG started = GetTickCount64();
@@ -873,14 +893,8 @@ bool StartHiddenProcess(const std::wstring& application, std::wstring command, H
   inheritable.bInheritHandle = TRUE;
   Handle nul(CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &inheritable, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
   if (nul.get() == INVALID_HANDLE_VALUE) return false;
-  STARTUPINFOW startup{};
-  startup.cb = sizeof(startup);
-  startup.dwFlags = STARTF_USESTDHANDLES;
-  startup.hStdInput = nul.get();
-  startup.hStdOutput = nul.get();
-  startup.hStdError = nul.get();
   PROCESS_INFORMATION process{};
-  if (!CreateProcessW(application.c_str(), command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) return false;
+  if (!CreateHiddenProcessWithExplicitHandles(application, &command, nul.get(), nul.get(), nul.get(), &process)) return false;
   CloseHandle(process.hThread);
   *process_handle = Handle(process.hProcess);
 #ifdef SSH_MCP_NATIVE_TEST
@@ -1575,6 +1589,8 @@ bool ReadAuditStringArray(const std::string& line, const char* name, std::vector
   }
   return false;
 }
+
+bool IsAuditText(const std::string& value, size_t maximum);
 
 bool ParseAuditRecord(const std::string& line, ExecutionAuditRecord* record) {
   long long version = 0;
