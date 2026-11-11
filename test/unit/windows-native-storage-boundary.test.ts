@@ -771,7 +771,7 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
         readonly stdout: string;
         readonly stderr: string;
       }> => {
-        const snapshot = binding.captureKnownHostsSnapshot('production-api');
+        const snapshot = testBinding.captureKnownHostsSnapshot('production-api');
         try {
           return (await testBinding.execute(snapshot.capability, request, signal)) as {
             readonly exitCode: number;
@@ -779,7 +779,7 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
             readonly stderr: string;
           };
         } finally {
-          binding.disposeKnownHostsSnapshot(snapshot.capability);
+          testBinding.disposeKnownHostsSnapshot(snapshot.capability);
         }
       };
 
