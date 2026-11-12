@@ -110,6 +110,10 @@ function fingerprint(publicKeyPath: string): string {
 async function listenLocalSshFixture(hostKeyPath: string, agentPublicKey: Buffer): Promise<{ readonly server: SshServer; readonly port: number }> {
   const server = new Server({ hostKeys: [readFileSync(hostKeyPath)] });
   server.on('connection', (client) => {
+    client.on('error', (error: NodeJS.ErrnoException) => {
+      if (error.code === 'ECONNRESET') return;
+      throw error;
+    });
     client.on('authentication', (context) => {
       if (context.method === 'publickey' && context.key.data.equals(agentPublicKey)) context.accept();
       else context.reject();
