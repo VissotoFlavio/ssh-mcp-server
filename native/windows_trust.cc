@@ -2963,6 +2963,9 @@ NativeAgentCommandRunResult RunNativeAgentCommand(SnapshotSession* snapshot, con
       L"-o", L"NumberOfPasswordPrompts=0", L"-o", L"IdentityFile=" + identity_file, L"-o", L"IdentitiesOnly=yes", L"-p", std::to_wstring(request.port),
       L"-l", request.user, OpenSshHostName(request.host)};
   std::vector<std::wstring> fixed_arguments = arguments;
+#ifdef SSH_MCP_NATIVE_TEST
+  fixed_arguments.insert(fixed_arguments.begin(), L"-vvv");
+#endif
   std::wstring remote_command = PosixShellQuote(request.command);
   for (const std::wstring& argument : request.arguments) remote_command.append(L" ").append(PosixShellQuote(argument));
   fixed_arguments.push_back(remote_command);
