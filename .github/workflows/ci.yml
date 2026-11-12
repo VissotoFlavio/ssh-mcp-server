@@ -81,8 +81,12 @@ jobs:
       - name: Require native boundary artifact
         shell: pwsh
         run: |
-          if (-not (Test-Path 'build/Release/windows_trust.node') -or -not (Test-Path 'build/Release/windows_trust_test.node')) {
-            throw 'The production and test-only Windows native trust boundaries were not built.'
+          if (
+            -not (Test-Path 'build/Release/windows_trust.node') -or
+            -not (Test-Path 'build/Release/windows_trust_test.node') -or
+            -not (Test-Path 'build/Release/ssh-mcp-approver-test.exe')
+          ) {
+            throw 'The production and test-only Windows native boundaries were not built.'
           }
 
       - name: Start ephemeral Windows SSH agent

@@ -212,9 +212,19 @@ std::wstring PipeName() {
       MultiByteToWideChar(CP_UTF8, 0, configured, -1, value.data(), length);
       value.pop_back();
     }
-    if (value.rfind(L"\\\\.\\pipe\\", 0) == 0) return value;
+    if (value.rfind(L"\\\\.\\pipe\\", 0) == 0) {
+#ifdef SSH_MCP_APPROVER_TEST
+      if (value.rfind(L"\\\\.\\pipe\\ssh-mcp-approver-test-", 0) == 0) return value;
+#else
+      return value;
+#endif
+    }
   }
+#ifdef SSH_MCP_APPROVER_TEST
+  return {};
+#else
   return L"\\\\.\\pipe\\ssh-mcp-approver";
+#endif
 }
 
 std::wstring PromptText(const std::wstring& presentation) {
@@ -227,6 +237,7 @@ int Run() {
   const char* secret_text = std::getenv("SSH_MCP_APPROVER_SECRET");
   if (!CurrentSid(&sid) || secret_text == nullptr || !DecodeHex(secret_text, &secret)) return 2;
   const std::wstring pipe_name = PipeName();
+  if (pipe_name.empty()) return 2;
   std::wstring sid_text;
   LPWSTR raw_sid = nullptr;
   if (!ConvertSidToStringSidW(reinterpret_cast<PSID>(sid.data()), &raw_sid)) return 2;
