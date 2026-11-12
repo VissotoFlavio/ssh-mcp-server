@@ -3047,7 +3047,7 @@ NativeAgentCommandRunResult RunNativeAgentCommand(SnapshotSession* snapshot, con
   }
   if (!result.failed && !result.output_limited && result.exit_code != 0) {
     const char* failure_code = ClassifyNativeAgentFailure(result.stderr_data);
-    if (failure_code != nullptr) result.failure_code = failure_code;
+    result.failure_code = failure_code != nullptr ? failure_code : "remote-failure";
   }
   return result;
 }
