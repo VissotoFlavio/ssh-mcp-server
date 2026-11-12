@@ -7,6 +7,10 @@ publish a release.
 
 ### Fixed
 
+- Windows `ssh-mcp-approver` now keeps its named-pipe request open through the
+  authenticated response and accepts a complete verified response when Windows
+  reports `EPIPE` during the broker's normal close. Added a non-packaged native
+  test broker and real Node/named-pipe/HMAC protocol coverage.
 - Windows `ssh-mcp-approver` now displays the complete authenticated sudo
   approval target (host, port, user, fingerprint, command, and argument
   vector), escaping the rendered values and failing closed when the bounded

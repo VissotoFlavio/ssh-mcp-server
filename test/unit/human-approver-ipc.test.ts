@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { createHmac, randomBytes } from 'node:crypto';
-import { promises as fs } from 'node:fs';
+import { existsSync, promises as fs } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
 import {
+  EnvironmentWindowsNamedPipeSecurityBoundary,
   IpcHumanSudoApprovalProvider,
   UnixSocketHumanApproverChannel,
   createLocalHumanSudoApprovalProvider,
@@ -32,6 +34,8 @@ const baseRequest = {
     approvedKnownHostsReference: 'known-hosts://production-api',
   },
 };
+
+const nativeApproverTestPath = join(process.cwd(), 'build', 'Release', 'ssh-mcp-approver-test.exe');
 
 function validResponse(request: HumanApproverIpcRequest, approved = true): HumanApproverIpcResponse {
   return {
@@ -76,6 +80,29 @@ function responseMac(response: HumanApproverIpcResponse, secret: Buffer): string
   return createHmac('sha256', secret)
     .update(`ssh-mcp-approver/response/v1\0${JSON.stringify(fields)}`)
     .digest('hex');
+}
+
+function nativeApprovalRequest(): HumanApproverIpcRequest {
+  return {
+    version: 1,
+    type: 'approval-request',
+    nonce: 'a'.repeat(64),
+    requestDigest: 'b'.repeat(64),
+    operationId: baseRequest.operationId,
+    leaseIdentityDigest: baseRequest.leaseIdentityDigest,
+    request: {
+      profileId: baseRequest.profileId,
+      command: baseRequest.command,
+      args: baseRequest.args,
+      timeoutMs: baseRequest.timeoutMs,
+      maxOutputBytes: baseRequest.maxOutputBytes,
+      presentation: baseRequest.approvedIdentity,
+    },
+  };
+}
+
+async function pause(milliseconds: number): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
 }
 
 test('IPC approval carries operation and immutable destination internally', async () => {
@@ -143,6 +170,92 @@ test('Windows approval presentation binds the complete destination and escaped a
     undefined,
   );
 });
+
+test(
+  'Windows native broker authenticates the complete named-pipe approval protocol',
+  { skip: process.platform !== 'win32' || !existsSync(nativeApproverTestPath), timeout: 10_000 },
+  async () => {
+    const secret = randomBytes(32);
+    const pipe = `\\\\.\\pipe\\ssh-mcp-approver-test-${process.pid}-${randomBytes(8).toString('hex')}`;
+    const broker = spawn(nativeApproverTestPath, [], {
+      env: { ...process.env, SSH_MCP_APPROVER_PIPE: pipe, SSH_MCP_APPROVER_SECRET: secret.toString('hex') },
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    let brokerExitCode: number | null | undefined;
+    broker.once('exit', (code) => {
+      brokerExitCode = code;
+    });
+    const boundary = new EnvironmentWindowsNamedPipeSecurityBoundary(pipe, secret, 250);
+    const request = nativeApprovalRequest();
+    try {
+      let response: HumanApproverIpcResponse | undefined;
+      let lastError: unknown;
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline && response === undefined) {
+        try {
+          response = await boundary.approve(request);
+        } catch (error) {
+          if ((error as { code?: unknown }).code !== 'ENOENT') throw error;
+          lastError = error;
+          await pause(25);
+        }
+      }
+      if (response === undefined)
+        throw new Error(`native approver did not authenticate the request (exit ${brokerExitCode ?? 'unknown'}): ${String(lastError)}`);
+      assert.deepEqual(response, validResponse(request));
+    } finally {
+      if (broker.exitCode === null) {
+        await new Promise<void>((resolve) => {
+          broker.once('exit', () => resolve());
+          broker.kill();
+          setTimeout(resolve, 1_000).unref?.();
+        });
+      }
+    }
+  },
+);
+
+test(
+  'Windows native broker rejects a named-pipe request with an invalid HMAC',
+  { skip: process.platform !== 'win32' || !existsSync(nativeApproverTestPath), timeout: 10_000 },
+  async () => {
+    const secret = randomBytes(32);
+    const pipe = `\\\\.\\pipe\\ssh-mcp-approver-test-${process.pid}-${randomBytes(8).toString('hex')}`;
+    const broker = spawn(nativeApproverTestPath, [], {
+      env: { ...process.env, SSH_MCP_APPROVER_PIPE: pipe, SSH_MCP_APPROVER_SECRET: secret.toString('hex') },
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    const boundary = new EnvironmentWindowsNamedPipeSecurityBoundary(pipe, randomBytes(32), 250);
+    const deadline = Date.now() + 5_000;
+    try {
+      let rejection: unknown;
+      while (Date.now() < deadline && rejection === undefined) {
+        try {
+          await boundary.approve(nativeApprovalRequest());
+        } catch (error) {
+          if ((error as { code?: unknown }).code === 'ENOENT') {
+            await pause(25);
+            continue;
+          }
+          rejection = error;
+        }
+      }
+      assert.ok(rejection instanceof Error);
+      const exitCode = broker.exitCode ?? (await new Promise<number | null>((resolve) => broker.once('exit', resolve)));
+      assert.equal(exitCode, 4);
+    } finally {
+      if (broker.exitCode === null) {
+        await new Promise<void>((resolve) => {
+          broker.once('exit', () => resolve());
+          broker.kill();
+          setTimeout(resolve, 1_000).unref?.();
+        });
+      }
+    }
+  },
+);
 
 test('IPC approval fails closed on cancellation', async () => {
   const provider = new IpcHumanSudoApprovalProvider({ approve: async () => true }, 'windows', () => {

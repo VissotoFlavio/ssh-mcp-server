@@ -27,6 +27,16 @@
       }]]
     },
     {
+      "target_name": "ssh-mcp-approver-test",
+      "type": "none",
+      "conditions": [["OS=='win'", {
+        "type": "executable",
+        "sources": ["native/windows_approver.cc"],
+        "libraries": ["-ladvapi32", "-lbcrypt", "-lcrypt32", "-luser32"],
+        "defines": ["WIN32_LEAN_AND_MEAN", "UNICODE", "_UNICODE", "SSH_MCP_APPROVER_TEST=1"]
+      }]]
+    },
+    {
       "target_name": "posix_peer_credentials",
       "conditions": [["OS!='win'", {
         "sources": ["native/posix_peer_credentials.cc"]

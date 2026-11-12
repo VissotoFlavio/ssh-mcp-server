@@ -176,7 +176,7 @@ export class EnvironmentWindowsNamedPipeSecurityBoundary implements WindowsNamed
           const unsignedRequest = { ...request, approvalPresentation };
           const serializedRequest = JSON.stringify(unsignedRequest);
           const requestMac = windowsNativeRequestMac(this.secret, serializedRequest);
-          socket.end(encodeFrame({ ...unsignedRequest, requestMac }));
+          socket.write(encodeFrame({ ...unsignedRequest, requestMac }));
         } catch (error) {
           fail(error);
         }
@@ -185,7 +185,7 @@ export class EnvironmentWindowsNamedPipeSecurityBoundary implements WindowsNamed
         data = Buffer.concat([data, chunk]);
         if (data.length > MAX_FRAME_BYTES + 4) fail(new Error('approver protocol invalid'));
       });
-      socket.on('end', () => {
+      const finishResponse = (): void => {
         try {
           const value = decodeSingleFrame(data);
           if (!isRecord(value) || !hasExactKeys(value, ['version', 'type', 'nonce', 'requestDigest', 'approved', 'responseMac']))
@@ -207,8 +207,15 @@ export class EnvironmentWindowsNamedPipeSecurityBoundary implements WindowsNamed
         } catch (error) {
           fail(error);
         }
+      };
+      socket.on('end', finishResponse);
+      socket.on('error', (error: NodeJS.ErrnoException) => {
+        if (error.code === 'EPIPE' && data.length > 0) {
+          finishResponse();
+          return;
+        }
+        fail(error);
       });
-      socket.on('error', fail);
       socket.on('close', () => {
         if (!settled) fail(new Error('approver unavailable'));
       });

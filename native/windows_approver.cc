@@ -262,7 +262,13 @@ int Run() {
                              Hmac(secret, payload, &expected_mac) && supplied_mac == expected_mac &&
                              DecodeApprovalPresentation(JsonField(signed_request, "approvalPresentation"), &presentation);
   bool approved = false;
-  if (authenticated) approved = MessageBoxW(nullptr, PromptText(presentation).c_str(), L"ssh-mcp-approver", MB_YESNO | MB_ICONWARNING | MB_SYSTEMMODAL) == IDYES;
+  if (authenticated) {
+#ifdef SSH_MCP_APPROVER_TEST
+    approved = true;
+#else
+    approved = MessageBoxW(nullptr, PromptText(presentation).c_str(), L"ssh-mcp-approver", MB_YESNO | MB_ICONWARNING | MB_SYSTEMMODAL) == IDYES;
+#endif
+  }
   const std::string response_payload = std::string("ssh-mcp-approver/native-response/v1") + '\0' + "[\"" + nonce + "\",\"" + digest + "\"," + (approved ? "true" : "false") + "]";
   std::string response_mac;
   if (!Hmac(secret, response_payload, &response_mac)) response_mac.clear();
