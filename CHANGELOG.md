@@ -5,6 +5,13 @@ publish a release.
 
 ## Unreleased
 
+### Fixed
+
+- Windows `ssh-mcp-approver` now displays the complete authenticated sudo
+  approval target (host, port, user, fingerprint, command, and argument
+  vector), escaping the rendered values and failing closed when the bounded
+  presentation cannot include the entire request.
+
 ### Added
 
 - Added the packaged native Windows `ssh-mcp-approver` broker with a

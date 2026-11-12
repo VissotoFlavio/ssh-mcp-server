@@ -2,6 +2,7 @@
 #include <bcrypt.h>
 #include <sddl.h>
 #include <userenv.h>
+#include <wincrypt.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -75,6 +76,39 @@ std::string JsonField(const std::string& json, const char* name) {
   const size_t end = json.find('"', value_start);
   if (end == std::string::npos) return {};
   return json.substr(value_start, end - value_start);
+}
+
+bool IsLowerHex(const std::string& value) {
+  return value.size() == 64 && std::all_of(value.begin(), value.end(), [](char character) {
+    return (character >= '0' && character <= '9') || (character >= 'a' && character <= 'f');
+  });
+}
+
+bool ExtractSignedRequest(const std::string& request, std::string* signed_request, std::string* request_mac) {
+  const std::string prefix = ",\"requestMac\":\"";
+  const size_t mac_offset = request.rfind(prefix);
+  if (mac_offset == std::string::npos) return false;
+  const size_t value_offset = mac_offset + prefix.size();
+  if (request.size() != value_offset + 64 + 2 || request.compare(value_offset + 64, 2, "\"}") != 0) return false;
+  const std::string mac = request.substr(value_offset, 64);
+  if (!IsLowerHex(mac)) return false;
+  *signed_request = request.substr(0, mac_offset) + "}";
+  *request_mac = mac;
+  return true;
+}
+
+bool DecodeApprovalPresentation(const std::string& encoded, std::wstring* output) {
+  if (encoded.empty() || encoded.size() > 16 * 1024) return false;
+  DWORD byte_count = 0;
+  if (!CryptStringToBinaryA(encoded.data(), static_cast<DWORD>(encoded.size()), CRYPT_STRING_BASE64, nullptr, &byte_count, nullptr, nullptr) || byte_count == 0 ||
+      byte_count > 8 * 1024)
+    return false;
+  std::vector<BYTE> bytes(byte_count);
+  if (!CryptStringToBinaryA(encoded.data(), static_cast<DWORD>(encoded.size()), CRYPT_STRING_BASE64, bytes.data(), &byte_count, nullptr, nullptr)) return false;
+  const int characters = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, reinterpret_cast<const char*>(bytes.data()), static_cast<int>(byte_count), nullptr, 0);
+  if (characters <= 0 || characters > 8 * 1024) return false;
+  output->resize(characters);
+  return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, reinterpret_cast<const char*>(bytes.data()), static_cast<int>(byte_count), output->data(), characters) == characters;
 }
 
 bool WriteExact(HANDLE handle, const void* data, DWORD size) {
@@ -183,15 +217,8 @@ std::wstring PipeName() {
   return L"\\\\.\\pipe\\ssh-mcp-approver";
 }
 
-std::wstring PromptText(const std::string& command) {
-  int length = MultiByteToWideChar(CP_UTF8, 0, command.c_str(), -1, nullptr, 0);
-  std::wstring value(length > 0 ? length : 0, L'\0');
-  if (length > 0) {
-    MultiByteToWideChar(CP_UTF8, 0, command.c_str(), -1, value.data(), length);
-    value.pop_back();
-  }
-  if (value.size() > 512) value.resize(512);
-  return L"Allow one approved SSH sudo command?\n\n" + value;
+std::wstring PromptText(const std::wstring& presentation) {
+  return L"Allow one approved SSH sudo command?\n\n" + presentation;
 }
 
 int Run() {
@@ -225,12 +252,17 @@ int Run() {
   const std::string digest = JsonField(request, "requestDigest");
   const std::string operation = JsonField(request, "operationId");
   const std::string lease = JsonField(request, "leaseIdentityDigest");
-  const std::string supplied_mac = JsonField(request, "requestMac");
-  const std::string payload = std::string("ssh-mcp-approver/native-request/v1") + '\0' + "[\"" + nonce + "\",\"" + digest + "\",\"" + operation + "\",\"" + lease + "\"]";
+  std::string signed_request;
+  std::string supplied_mac;
+  const bool framed = ExtractSignedRequest(request, &signed_request, &supplied_mac);
+  const std::string payload = std::string("ssh-mcp-approver/native-request/v1") + '\0' + signed_request;
   std::string expected_mac;
-  const bool authenticated = received && !nonce.empty() && !digest.empty() && !operation.empty() && !lease.empty() && Hmac(secret, payload, &expected_mac) && supplied_mac == expected_mac;
+  std::wstring presentation;
+  const bool authenticated = received && framed && !nonce.empty() && !digest.empty() && !operation.empty() && !lease.empty() &&
+                             Hmac(secret, payload, &expected_mac) && supplied_mac == expected_mac &&
+                             DecodeApprovalPresentation(JsonField(signed_request, "approvalPresentation"), &presentation);
   bool approved = false;
-  if (authenticated) approved = MessageBoxW(nullptr, PromptText(JsonField(request, "command")).c_str(), L"ssh-mcp-approver", MB_YESNO | MB_ICONWARNING | MB_SYSTEMMODAL) == IDYES;
+  if (authenticated) approved = MessageBoxW(nullptr, PromptText(presentation).c_str(), L"ssh-mcp-approver", MB_YESNO | MB_ICONWARNING | MB_SYSTEMMODAL) == IDYES;
   const std::string response_payload = std::string("ssh-mcp-approver/native-response/v1") + '\0' + "[\"" + nonce + "\",\"" + digest + "\"," + (approved ? "true" : "false") + "]";
   std::string response_mac;
   if (!Hmac(secret, response_payload, &response_mac)) response_mac.clear();

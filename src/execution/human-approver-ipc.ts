@@ -24,6 +24,7 @@ const APPROVER_PIPE_ENV = 'SSH_MCP_APPROVER_PIPE';
 const APPROVER_SECRET_ENV = 'SSH_MCP_APPROVER_SECRET';
 const APPROVER_SECRET_BYTES = 32;
 const HEX_64 = /^[a-f0-9]{64}$/u;
+const MAX_WINDOWS_APPROVAL_PRESENTATION_BYTES = 8 * 1024;
 const require = createRequire(import.meta.url);
 
 interface PosixPeerCredentialsBinding {
@@ -93,6 +94,40 @@ function windowsNativeMac(secret: Buffer, domain: string, fields: readonly unkno
     .digest('hex');
 }
 
+function windowsNativeRequestMac(secret: Buffer, serializedRequest: string): string {
+  return createHmac('sha256', secret).update(`ssh-mcp-approver/native-request/v1\0${serializedRequest}`, 'utf8').digest('hex');
+}
+
+function quoteApprovalPresentation(value: string): string {
+  const escaped = value
+    .replace(/\\/gu, '\\\\')
+    .replace(/'/gu, "\\'")
+    .replace(/[\u0000-\u001F\u007F-\u009F\u2028\u2029]/gu, (character) => `\\u{${character.codePointAt(0)?.toString(16) ?? '0'}}`);
+  return `'${escaped}'`;
+}
+
+/** Renders the complete, immutable sudo request for the Windows native broker. */
+export function formatWindowsApprovalPresentation(request: Pick<HumanApproverIpcRequest, 'request'>): string | undefined {
+  const { presentation } = request.request;
+  const argumentsText =
+    request.request.args.length === 0
+      ? '  (none)'
+      : request.request.args.map((argument, index) => `  [${index}] ${quoteApprovalPresentation(argument)}`).join('\n');
+  const text = [
+    'Destination:',
+    `  Host: ${quoteApprovalPresentation(presentation.host)}`,
+    `  Port: ${presentation.port}`,
+    `  User: ${quoteApprovalPresentation(presentation.user)}`,
+    `  Fingerprint: ${quoteApprovalPresentation(presentation.expectedHostFingerprint)}`,
+    'Command:',
+    `  Executable: ${quoteApprovalPresentation(request.request.command)}`,
+    '  Arguments:',
+    argumentsText,
+  ].join('\n');
+  const encoded = Buffer.from(text, 'utf8');
+  return encoded.length > 0 && encoded.length <= MAX_WINDOWS_APPROVAL_PRESENTATION_BYTES ? encoded.toString('base64') : undefined;
+}
+
 function readWindowsSecret(environment: NodeJS.ProcessEnv): Buffer | undefined {
   const value = environment[APPROVER_SECRET_ENV];
   if (typeof value !== 'string' || !HEX_64.test(value)) return undefined;
@@ -136,13 +171,12 @@ export class EnvironmentWindowsNamedPipeSecurityBoundary implements WindowsNamed
       signal?.addEventListener('abort', abort, { once: true });
       socket.on('connect', () => {
         try {
-          const requestMac = windowsNativeMac(this.secret, 'ssh-mcp-approver/native-request/v1', [
-            request.nonce,
-            request.requestDigest,
-            request.operationId,
-            request.leaseIdentityDigest,
-          ]);
-          socket.end(encodeFrame({ ...request, requestMac }));
+          const approvalPresentation = formatWindowsApprovalPresentation(request);
+          if (approvalPresentation === undefined) throw new Error('approver presentation is unavailable');
+          const unsignedRequest = { ...request, approvalPresentation };
+          const serializedRequest = JSON.stringify(unsignedRequest);
+          const requestMac = windowsNativeRequestMac(this.secret, serializedRequest);
+          socket.end(encodeFrame({ ...unsignedRequest, requestMac }));
         } catch (error) {
           fail(error);
         }

@@ -30,7 +30,10 @@ cannot supply any of those values.
    (host, port, user, verified fingerprint, authentication mode, and approved
    known-hosts reference) so a human can confirm where the command will run;
    those fields remain inside the authenticated local IPC envelope and are not
-   returned to MCP callers.
+   returned to MCP callers. The Windows broker dialog renders the authenticated
+   host, port, user, fingerprint, command, and complete argument vector with
+   escaped values; it fails closed if that bounded presentation cannot include
+   the whole request.
    The POSIX socket and its secret are a local trust boundary: the client
    requires owner-only socket/key material and validates `SO_PEERCRED` on Linux
    or `getpeereid` on macOS in addition to HMAC. If the platform cannot expose

@@ -10,6 +10,7 @@ import {
   IpcHumanSudoApprovalProvider,
   UnixSocketHumanApproverChannel,
   createLocalHumanSudoApprovalProvider,
+  formatWindowsApprovalPresentation,
   type HumanApproverIpcRequest,
   type HumanApproverIpcResponse,
 } from '../../src/execution/human-approver-ipc.js';
@@ -109,6 +110,29 @@ test('IPC approval carries operation and immutable destination internally', asyn
     authMode: 'agent-key',
     approvedKnownHostsReference: 'known-hosts://production-api',
   });
+});
+
+test('Windows approval presentation binds the complete destination and escaped argument vector', () => {
+  const presentation = formatWindowsApprovalPresentation({
+    request: {
+      profileId: baseRequest.profileId,
+      command: baseRequest.command,
+      args: ['--target', "O'Reilly\\ops", 'line\nbreak'],
+      timeoutMs: baseRequest.timeoutMs,
+      maxOutputBytes: baseRequest.maxOutputBytes,
+      presentation: baseRequest.approvedIdentity,
+    },
+  });
+  assert.equal(
+    Buffer.from(presentation ?? '', 'base64').toString('utf8'),
+    "Destination:\n  Host: 'private.example'\n  Port: 22\n  User: 'deploy'\n  Fingerprint: 'SHA256:host'\nCommand:\n  Executable: 'sudo'\n  Arguments:\n  [0] '--target'\n  [1] 'O\\'Reilly\\\\ops'\n  [2] 'line\\u{a}break'",
+  );
+  assert.equal(
+    formatWindowsApprovalPresentation({
+      request: { ...baseRequest, args: ['x'.repeat(8 * 1024)], presentation: baseRequest.approvedIdentity },
+    }),
+    undefined,
+  );
 });
 
 test('IPC approval fails closed on cancellation', async () => {

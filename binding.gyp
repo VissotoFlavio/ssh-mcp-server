@@ -22,7 +22,7 @@
       "conditions": [["OS=='win'", {
         "type": "executable",
         "sources": ["native/windows_approver.cc"],
-        "libraries": ["-ladvapi32", "-lbcrypt", "-luser32"],
+        "libraries": ["-ladvapi32", "-lbcrypt", "-lcrypt32", "-luser32"],
         "defines": ["WIN32_LEAN_AND_MEAN", "UNICODE", "_UNICODE"]
       }]]
     },
