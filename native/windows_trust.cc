@@ -2926,7 +2926,6 @@ NativeAgentCommandRunResult RunNativeAgentCommand(SnapshotSession* snapshot, con
   if (cancellation->requested.load() || !snapshot->MatchesProfile(request.profile_id)) return result;
   std::wstring known_hosts;
   std::wstring snapshot_directory;
-  std::wstring known_hosts_short;
   std::wstring identity_file;
   std::wstring ssh;
   std::wstring ssh_add;
@@ -2935,7 +2934,7 @@ NativeAgentCommandRunResult RunNativeAgentCommand(SnapshotSession* snapshot, con
   Handle openssh_handle;
   Handle ssh_add_handle;
   Handle ssh_handle;
-  if (!snapshot->ReadyKnownHostsPath(&known_hosts, &snapshot_directory) || !ShortNtfsPath(known_hosts, &known_hosts_short) || !DedicatedAgentPublicKeyPath(&identity_file) ||
+  if (!snapshot->ReadyKnownHostsPath(&known_hosts, &snapshot_directory) || !DedicatedAgentPublicKeyPath(&identity_file) ||
       !TrustedOpenSsh(&ssh, &ssh_add, &version, &system_handle, &openssh_handle, &ssh_add_handle, &ssh_handle)) return result;
   const ULONGLONG started = GetTickCount64();
   const DWORD probe_timeout = request.timeout - static_cast<DWORD>(std::min<ULONGLONG>(request.timeout - 1, GetTickCount64() - started));
@@ -2959,7 +2958,7 @@ NativeAgentCommandRunResult RunNativeAgentCommand(SnapshotSession* snapshot, con
   }
   const std::vector<std::wstring> arguments = {
       L"-F", L"none", L"-T", L"-n", L"-o", L"CanonicalizeHostname=no", L"-o", L"ProxyCommand=none", L"-o", L"ProxyJump=none",
-      L"-o", L"BatchMode=yes", L"-o", L"StrictHostKeyChecking=yes", L"-o", L"UserKnownHostsFile=" + known_hosts_short,
+      L"-o", L"BatchMode=yes", L"-o", L"StrictHostKeyChecking=yes", L"-o", L"UserKnownHostsFile=" + known_hosts,
       L"-o", L"GlobalKnownHostsFile=NUL", L"-o", L"PasswordAuthentication=no", L"-o", L"KbdInteractiveAuthentication=no",
       L"-o", L"NumberOfPasswordPrompts=0", L"-o", L"IdentityFile=" + identity_file, L"-o", L"IdentitiesOnly=yes", L"-p", std::to_wstring(request.port),
       L"-l", request.user, OpenSshHostName(request.host)};
@@ -3015,7 +3014,7 @@ NativeAgentCommandRunResult RunNativeAgentCommand(SnapshotSession* snapshot, con
   }
   if (GetExitCodeProcess(process.process.get(), &result.exit_code) == 0) result.failed = true;
   if (cancellation->requested.load()) result.timed_out = false;
-  for (const std::wstring& sensitive_path : {known_hosts, known_hosts_short, identity_file, ssh, ssh_add}) {
+  for (const std::wstring& sensitive_path : {known_hosts, identity_file, ssh, ssh_add}) {
     RedactNativePath(&result.stdout_data, sensitive_path);
     RedactNativePath(&result.stderr_data, sensitive_path);
   }
