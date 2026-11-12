@@ -244,16 +244,29 @@ jobs:
           npm version $env:CANDIDATE_VERSION --no-git-tag-version --ignore-scripts
           $pack = npm pack --json | ConvertFrom-Json
           $result = $pack[0]
-          $allowed = @('CHANGELOG.md', 'README.md', 'package.json')
+          $allowed = @(
+            'CHANGELOG.md',
+            'README.md',
+            'package.json',
+            'build/Release/windows_trust.node',
+            'build/Release/ssh-mcp-approver.exe',
+            'scripts/windows-approver.mjs',
+            'scripts/windows-audit-journal.mjs'
+          )
           $unexpected = @($result.files.path | Where-Object {
             $_ -notin $allowed -and
             -not $_.StartsWith('dist/') -and
             -not $_.StartsWith('docs/') -and
-            $_ -ne 'build/Release/windows_trust.node'
+            -not $_.StartsWith('skills/') -and
+            -not $_.StartsWith('scripts/windows/')
           })
           if (-not $result.filename -or
               -not ($result.files.path -contains 'dist/server.js') -or
               -not ($result.files.path -contains 'build/Release/windows_trust.node') -or
+              -not ($result.files.path -contains 'build/Release/ssh-mcp-approver.exe') -or
+              -not ($result.files.path -contains 'scripts/windows-approver.mjs') -or
+              -not ($result.files.path -contains 'scripts/windows-audit-journal.mjs') -or
+              ($result.files.path -contains 'build/Release/posix_peer_credentials.node') -or
               ($result.files.path -contains 'build/Release/windows_trust_test.node') -or
               $unexpected.Count -ne 0) {
             throw 'npm pack did not produce the expected runtime-only package.'

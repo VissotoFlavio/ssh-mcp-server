@@ -53,9 +53,10 @@ described in the [automated backport guide](docs/backport-automation.md). The
 workflow fails closed with an actionable error when the secret is unavailable;
 this repository does not contain or claim to configure its value.
 
-The package contains only the compiled runtime, the production Windows addon,
-and operator documentation. It intentionally excludes source, tests, CI files,
-development configuration, and the test-only native addon.
+The package contains only the compiled runtime, production Windows trust and
+approval-broker binaries, and the operator documentation, skill, and scripts
+they require. It intentionally excludes source, tests, CI files, development
+configuration, the POSIX native addon, and the test-only native addon.
 
 Readiness is not authorization. A successful validation confirms only the
 approved connection boundary. Remote execution remains bounded and
