@@ -145,7 +145,7 @@ async function listenLocalSshFixture(hostKeyPath: string, agentPublicKey: Buffer
   });
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
-    server.listen(0, 'localhost', () => resolve());
+    server.listen(0, '127.0.0.1', () => resolve());
   });
   const address = server.address();
   if (address === null || typeof address === 'string') throw new Error('SSH fixture did not expose a TCP port');
@@ -749,7 +749,7 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
       const hostPublic = publicKeyParts(`${privateHostKey}.pub`);
       const fixture = await listenLocalSshFixture(privateHostKey, agentPublic.data);
       server = fixture.server;
-      const host = 'localhost';
+      const host = '127.0.0.1';
       const hostFingerprint = fingerprint(`${privateHostKey}.pub`);
       writeFileSync(
         join(root, 'known-hosts', 'production-api.known_hosts'),
@@ -777,7 +777,7 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
       }> => {
         const snapshot = testBinding.captureKnownHostsSnapshot('production-api');
         const snapshotText = snapshot.bytes.toString('utf8');
-        assert.match(snapshotText, /(?:^|\n)\[localhost\]:\d+ ssh-ed25519 /u, `known-hosts snapshot did not include localhost: ${snapshotText}`);
+        assert.match(snapshotText, /(?:^|\n)\[127\.0\.0\.1\]:\d+ ssh-ed25519 /u, `known-hosts snapshot did not include 127.0.0.1: ${snapshotText}`);
         try {
           return (await testBinding.execute(snapshot.capability, request, signal)) as {
             readonly exitCode: number;
