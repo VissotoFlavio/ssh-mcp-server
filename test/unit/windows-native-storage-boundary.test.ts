@@ -765,7 +765,7 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
         command: 'printf',
         args: ['ssh-mcp-e2e-success'],
         timeoutMs: 5_000,
-        maxOutputBytes: 1_024,
+        maxOutputBytes: 16_384,
       };
       const execute = async (
         request: object,
