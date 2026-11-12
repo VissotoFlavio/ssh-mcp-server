@@ -5,6 +5,8 @@ publish a release.
 
 ## Unreleased
 
+## [1.0.0] - 2026-11-12
+
 ### Fixed
 
 - Windows `ssh-mcp-approver` now keeps its named-pipe request open through the
