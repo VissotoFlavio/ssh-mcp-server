@@ -5,19 +5,22 @@
   "files": [
     "dist",
     "build/Release/windows_trust.node",
+    "build/Release/ssh-mcp-approver.exe",
+    "build/Release/posix_peer_credentials.node",
     "README.md",
     "CHANGELOG.md",
     "docs",
-    "skills"
+    "skills",
+    "scripts"
   ],
-  "description": "Secure MCP server for approved SSH profile discovery and connection readiness checks. No remote command execution or agent-supplied credentials.",
+  "description": "Secure MCP server for approved SSH profile discovery, validation, and bounded remote command execution without agent-supplied credentials.",
   "type": "module",
   "engines": {
     "node": ">=22"
   },
   "scripts": {
     "build": "tsc --project tsconfig.json",
-    "build:native": "node -e \"if (process.platform !== 'win32') process.exit(0)\" && node-gyp rebuild",
+    "build:native": "node-gyp rebuild",
     "install": "node -e \"process.exit(0)\"",
     "check": "tsc --project tsconfig.test.json --noEmit",
     "lint": "npm run check && eslint src test",
@@ -25,6 +28,9 @@
     "format": "prettier --write --ignore-path .gitignore .",
     "format:check": "prettier --check --ignore-path .gitignore .",
     "start": "node dist/server.js",
+    "windows:audit:init": "node scripts/windows-audit-journal.mjs init",
+    "windows:audit:rotate": "node scripts/windows-audit-journal.mjs rotate",
+    "windows:approver": "node scripts/windows-approver.mjs",
     "test": "tsx --test \"test/unit/**/*.test.ts\"",
     "test:integration": "node -e \"if (process.env.SSH_INTEGRATION_TEST !== 'true') throw new Error('Set SSH_INTEGRATION_TEST=true to run integration tests.');\" && tsx --test \"test/integration/**/*.test.ts\""
   },

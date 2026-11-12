@@ -37,6 +37,10 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Build POSIX native boundary
+        if: runner.os != 'Windows'
+        run: npm run build:native
+
       - name: Check formatting
         run: npm run format:check
 
@@ -77,9 +81,19 @@ jobs:
       - name: Require native boundary artifact
         shell: pwsh
         run: |
-          if (-not (Test-Path 'build/Release/windows_trust.node') -or -not (Test-Path 'build/Release/windows_trust_test.node')) {
-            throw 'The production and test-only Windows native trust boundaries were not built.'
+          if (
+            -not (Test-Path 'build/Release/windows_trust.node') -or
+            -not (Test-Path 'build/Release/windows_trust_test.node') -or
+            -not (Test-Path 'build/Release/ssh-mcp-approver-test.exe')
+          ) {
+            throw 'The production and test-only Windows native boundaries were not built.'
           }
+
+      - name: Start ephemeral Windows SSH agent
+        shell: pwsh
+        run: |
+          Set-Service -Name ssh-agent -StartupType Manual
+          Start-Service -Name ssh-agent
 
       - name: Validate native Windows boundary
         run: npm test

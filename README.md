@@ -1,13 +1,14 @@
 # ssh-mcp-server
 
-Policy-driven SSH profile discovery and connection-readiness checks for AI
-agents—without remote command execution or agent-supplied credentials.
+Policy-driven SSH profile discovery, connection validation, and bounded remote
+command execution for AI agents—without agent-supplied credentials.
 
 Use this MCP server when an operator wants an agent to confirm that one of the
 operator's already approved SSH profiles is ready for a subsequent,
 operator-authorized step. The server exposes a deliberately small surface:
-agents can discover safe profile identifiers and validate the readiness of one
-such identifier. It never becomes an SSH terminal.
+agents can discover safe profile identifiers, validate one approved connection,
+and execute one non-interactive command through that profile. It never becomes
+an SSH terminal.
 
 > **Status:** source-built alpha. This repository is public, but npm publishing
 > is disabled. No npm package, standalone binary, or license has been
@@ -16,12 +17,13 @@ such identifier. It never becomes an SSH terminal.
 
 ## What it does—and does not do
 
-| Supported                                                  | Explicitly not supported                                                                     |
-| ---------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| List operator-approved profile IDs                         | Execute remote commands or open an interactive shell                                         |
-| Validate SSH connection readiness for one approved profile | Transfer files, deploy, forward ports, or change remote state                                |
-| Verify approved host identity and authentication readiness | Accept a host, user, port, path, SSH option, key, password, token, or command from an agent  |
-| Return a minimal, redacted readiness result                | Reveal hostnames, usernames, credential references, known-hosts paths, host keys, or secrets |
+| Supported                                                          | Explicitly not supported                                                                          |
+| ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------- |
+| List operator-approved profile IDs                                 | Interactive or persistent shell                                                                   |
+| Validate approved host identity and authentication                 | File transfer or port forwarding                                                                  |
+| Execute one bounded, non-interactive command with limited output   | Accept a host, user, port, path, SSH option, key, password, token, or command shell from an agent |
+| Require request-bound, expiring human approval for `sudo`          | Alter remote privileges or contact a production VPS during tests                                  |
+| Return stable, structured results and redacted local audit records | Reveal credentials, host keys, or command output in audit records                                 |
 
 ## Release package candidates
 
@@ -54,33 +56,35 @@ The package contains only the compiled runtime, the production Windows addon,
 and operator documentation. It intentionally excludes source, tests, CI files,
 development configuration, and the test-only native addon.
 
-Readiness is not authorization. A successful result says only that the
-approved connection's constrained readiness check completed; it does not
-authorize a remote change, prove that a later operation is permitted, or widen
-the MCP server's capabilities.
+Readiness is not authorization. A successful validation confirms only the
+approved connection boundary. Remote execution remains bounded and
+non-interactive; commands containing `sudo` require a separate server-issued,
+one-time human approval token tied to the exact profile, command, arguments,
+timeout, and output limit.
 
 ## How the boundary works
 
 ```mermaid
 flowchart LR
-  A[AI client] -->|profileId only| B[MCP stdio server]
+  A[AI client] -->|approved profile + command args| B[MCP stdio server]
   B --> C[Operator-approved profile policy]
-  C --> D[Host identity and authentication readiness]
-  D --> E[Redacted result]
+  C --> D[Host identity and authentication validation]
+  D --> E[One non-interactive SSH exec]
+  E --> F[Bounded result + redacted audit]
 ```
 
-The agent sees only profile IDs from discovery and a small success or failure
-payload. Connection metadata, credential references, paths, known-hosts
-content, host-key material, and diagnostics stay behind the trusted boundary.
-Failures are fail-closed.
+The agent sees only profile IDs from discovery, structured command output within
+the requested limit, and stable failure codes. Connection metadata, credential
+references, paths, known-hosts content, host-key material, and diagnostics stay
+behind the trusted boundary. Failures are fail-closed.
 
 ## Platform support
 
-| Platform                                            | Discovery                                         | `validate_connection`                                                                                                                      | Authentication readiness                                                                                                                                                                                  |
-| --------------------------------------------------- | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Linux and macOS                                     | Available when the POSIX state root is configured | Available when the POSIX runtime is composed; unsafe or incomplete state fails closed at call time                                         | `agent-key` only, using a private known-hosts snapshot and a bounded OpenSSH ControlMaster check                                                                                                          |
-| Native Windows alpha                                | Available only on the supported native envelope   | Advertised only when the required native runtime and provider-composition boundaries are available; individual calls can still fail closed | `agent-key` uses a bounded noninteractive TypeScript SSH runner with native trust preparation; `password` uses the in-memory transport and Windows Credential Manager, which are checked during each call |
-| Other platforms or unsupported Windows environments | Not advertised                                    | Not advertised                                                                                                                             | Not supported                                                                                                                                                                                             |
+| Platform                                            | Discovery                                         | `validate_connection`                                                                                                                      | Authentication readiness                                                                                                                                                                                                  |
+| --------------------------------------------------- | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Linux and macOS                                     | Available when the POSIX state root is configured | Available when the POSIX runtime is composed; unsafe or incomplete state fails closed at call time                                         | `agent-key` only, using a private known-hosts snapshot and a bounded OpenSSH ControlMaster check                                                                                                                          |
+| Native Windows alpha                                | Available only on the supported native envelope   | Advertised only when the required native runtime and provider-composition boundaries are available; individual calls can still fail closed | Password profiles retain host verification and Credential Manager ordering; agent-key commands use the native verified OpenSSH/snapshot boundary. Remote execution additionally requires the native trusted audit journal |
+| Other platforms or unsupported Windows environments | Not advertised                                    | Not advertised                                                                                                                             | Not supported                                                                                                                                                                                                             |
 
 The Windows alpha supports only 64-bit Windows 11 23H2 or later, or Windows
 Server 2022 or later, with 64-bit Node.js 22 or later and Microsoft OpenSSH
@@ -121,6 +125,8 @@ Set both absolute roots for the process that starts the MCP server:
 ```sh
 export SSH_MCP_STATE_ROOT="/absolute/path/to/state"
 export SSH_MCP_KNOWN_HOSTS_ROOT="/absolute/path/to/known-hosts"
+export SSH_MCP_AUDIT_ROOT="/absolute/path/to/audit"
+export SSH_MCP_AUDIT_KEY_FILE="/absolute/path/to/private/audit-key"
 ```
 
 `SSH_MCP_STATE_ROOT` contains the fixed `connection-profiles.json` file.
@@ -129,6 +135,12 @@ each `known-hosts://<profile-id>` reference. Both roots and their files must be
 owned by the MCP process user, must not be group- or world-writable, and must
 not contain symbolic links. An unsafe or incomplete configuration fails
 closed.
+
+`SSH_MCP_AUDIT_ROOT` must be a separate operator-owned absolute directory with
+no group/other write permission. `SSH_MCP_AUDIT_KEY_FILE` must be a separate
+operator-owned `0600` file containing exactly `v1:` followed by 64 lowercase
+hexadecimal characters. The server never generates this key; missing, invalid,
+rotated, or chain-invalid audit state fails closed before an SSH connection.
 
 This illustrative `connection-profiles.json` entry is suitable for the POSIX
 `agent-key` flow; it does not name a real host or credential:
@@ -172,17 +184,41 @@ fingerprint before writing, and explains the conditional `agent-key` and
 than substituting environment variables, shared locations, `PATH`, WSL, or
 administrator execution.
 
+Before the first Windows remote command, initialize the protected audit key
+with `npm run windows:audit:init`; rotate it only with
+`npm run windows:audit:rotate`. See
+[the Windows audit journal procedure](docs/windows-execution-audit-journal.md).
+
+When `sudo` approval is needed, build and start the local native broker in a
+separate operator console:
+
+```powershell
+npm run windows:approver
+```
+
+Copy the printed `SSH_MCP_APPROVER_PIPE` and
+`SSH_MCP_APPROVER_SECRET` values into the trusted environment of the MCP
+server. The broker is a single-request process: start it again for the next
+approval. It never opens SSH or exposes an MCP tool; it only authenticates the
+local peer and displays the exact approval prompt.
+
 ## Register with a Codex MCP client
 
 Build first, then register the stdio server with absolute, operator-approved
 paths. On Linux and macOS, register the two state roots with the server so the
-configuration remains available when Codex starts it later. The following is
+configuration remains available when Codex starts it later. Remote execution
+also requires the operator-owned audit root/key; configure the optional local
+approver socket and secret when `sudo` approval is needed. The following is
 illustrative; replace all paths with local trusted values:
 
 ```sh
 codex mcp add ssh-mcp-server \
   --env SSH_MCP_STATE_ROOT=/absolute/path/to/state \
   --env SSH_MCP_KNOWN_HOSTS_ROOT=/absolute/path/to/known-hosts \
+  --env SSH_MCP_AUDIT_ROOT=/absolute/path/to/audit \
+  --env SSH_MCP_AUDIT_KEY_FILE=/absolute/path/to/audit.key \
+  --env SSH_MCP_APPROVER_SOCKET=/absolute/path/to/ssh-mcp-approver.sock \
+  --env SSH_MCP_APPROVER_SECRET_FILE=/absolute/path/to/ssh-mcp-approver.secret \
   -- /absolute/path/to/node /absolute/path/to/ssh-mcp-server/dist/server.js
 codex mcp list
 ```
@@ -235,6 +271,46 @@ The response never exposes the host, username, credential reference,
 known-hosts reference, path, or host key. If the tool is advertised but
 discovery cannot safely access its provider, the error result is the fixed
 text `Approved profile discovery is unavailable.`
+
+### `execute_remote_command`
+
+Execute one command on an approved profile. `command` is one executable token;
+pass parameters in `args`. The local implementation never starts a shell, and
+the SSH session is closed on success, failure, timeout, cancellation, or output
+limit. The response contains `stdout` and `stderr` only up to `maxOutputBytes`.
+
+```json
+{
+  "profileId": "staging-api",
+  "command": "systemctl",
+  "args": ["status", "api"],
+  "timeoutMs": 30000,
+  "maxOutputBytes": 65536
+}
+```
+
+The bounded defaults are 30 seconds and 64 KiB; the maximums are 60 seconds
+and 1 MiB. Commands that use `sudo`, `sudoedit`, `su`, `doas`, `runuser`, or
+`pkexec` return `approval-required` until the host-injected
+`HumanSudoApprovalProvider` issues an opaque one-use capability through
+`request_sudo_approval`. The capability expires after one minute,
+cannot be reused, and fails if the command or the immutable approved profile
+identity changes. A boolean such as `approved: true` is not accepted as
+authorization. A standalone CLI without a host approval callback returns
+`approval-unavailable`. Production hosts may connect the typed
+`ssh-mcp-approver` boundary: Unix socket on POSIX or SID-protected named pipe
+on Windows. Destination, verified identity, and canonical command remain local
+to that approver.
+
+### `request_sudo_approval`
+
+Requests human confirmation for one exact `sudo` command. The tool is state
+changing and requires confirmation. It returns only `approved`, a stable
+`code`, an opaque `operationId`, and an opaque one-use `capability` when the
+configured trusted approval boundary confirms the request. It accepts no
+caller token or boolean. The capability must be sent back only as
+`approvalToken` on the exact matching
+`execute_remote_command` request.
 
 ### `validate_connection`
 
@@ -291,15 +367,34 @@ When an operator asks to check a connection:
    code as a hard stop.
 
 Never invent a profile ID, request or paste keys/secrets, accept a dynamic
-host or path, turn readiness into permission for remote work, or attempt a
-shell, command, file transfer, deployment, or a bypass of a failed check.
+host or path, bypass the human `sudo` approval flow, open a persistent shell,
+transfer files, forward ports, or retry a failed host/authentication check
+with weaker settings.
 
 ## Security, diagnostics, and troubleshooting
 
 The server is fail-closed and sends only JSON-RPC on standard output. Redacted
-audit events and diagnostics are written to standard error; support material
-must omit hosts, usernames, profile IDs, credential references, paths, and
-secrets. For platform-specific troubleshooting, start with:
+Every remote command execution attempt first writes a durable versioned
+intent/finished event to the separate HMAC-chained audit journal, then emits
+redacted audit events and
+diagnostics to standard error. The local audit record contains the command,
+allowlisted argument shapes, and an HMAC digest of the original argument
+vector; raw positional values, flag values, headers, URL credentials, shell
+assignments, stdout, and stderr are never written to audit. Sudo approval
+requests are audited separately from command execution attempts. If the durable
+journal is unavailable, the remote result is returned as
+`execution-audit-unavailable`. A secondary audit sink failure returns
+`provider-failure` only when the result is not already `outcome-unknown`. An
+interrupted or missing finished event is exposed as `outcome-unknown` with a
+null exit code and empty output; clients must not retry automatically. Timeout
+or cancellation closes the server-controlled SSH channel/session but does not
+promise to kill an already detached remote process. The first delivery targets
+POSIX VPS hosts from POSIX or Windows clients; remote Windows-host quoting is
+future work. Interactive persistent shells, scripts, free-form redirection or
+pipes, file transfer, and port forwarding are excluded; file transfer belongs
+to issue #94. Support
+material must omit hosts, usernames, profile IDs, credential references, paths,
+and secrets. For platform-specific troubleshooting, start with:
 
 - [Windows SSH MCP Codex skill](skills/windows-ssh-mcp/SKILL.md)
 - [Windows installation and Codex setup](docs/windows-codex-setup.md)

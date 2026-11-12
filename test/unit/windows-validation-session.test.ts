@@ -105,6 +105,48 @@ test('uses cancellable native readiness for an approved agent-key profile', asyn
   assert.equal(signal, undefined);
 });
 
+test('retains the exact validated Windows snapshot for the execution lease', async () => {
+  const capability = { opaque: true };
+  let capturedCapability: object | undefined;
+  let validatedCapability: object | undefined;
+  let consumedCapability: object | undefined;
+  let disposals = 0;
+  const candidate = new WindowsValidationSession({
+    storage: {
+      getProfile: () => ({ ...profile, authMode: 'agent-key' }),
+      readKnownHosts: () => knownHosts,
+      withKnownHostsSnapshot: async (_reference, work) => work(knownHosts, capability),
+      captureKnownHostsSnapshot: () => {
+        capturedCapability = capability;
+        return { bytes: knownHosts, capability };
+      },
+      disposeKnownHostsSnapshot: (value) => {
+        assert.equal(value, capability);
+        disposals += 1;
+      },
+    },
+    agentIdentity: { isAvailable: async () => true },
+    agentReadiness: {
+      validate: async (value) => {
+        validatedCapability = value;
+      },
+    },
+    createPasswordTransport: () => ({ connect: async () => assert.fail('password must not start') }),
+  });
+
+  const lease = await candidate.authorize({ profileId: profile.profileId });
+  await lease.withTransportContext!(async (value) => {
+    consumedCapability = value;
+  });
+  await lease.release!();
+  await lease.release!();
+
+  assert.equal(capturedCapability, capability);
+  assert.equal(validatedCapability, capability);
+  assert.equal(consumedCapability, capability);
+  assert.equal(disposals, 1);
+});
+
 test('does not start native readiness when the trusted ssh-add identity probe is unavailable', async () => {
   const candidate = session({ profile: { ...profile, authMode: 'agent-key' }, agentAvailable: false });
   await assert.rejects(candidate.candidate.validate({ profileId: profile.profileId }));
