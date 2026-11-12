@@ -183,6 +183,7 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
   const testBinding = nativeRequire(testAddonPath) as {
     captureKnownHostsSnapshot(profileId: string): { bytes: Buffer; capability: object };
     disposeKnownHostsSnapshot(capability: unknown): void;
+    prepareAgentKeyReadiness(capability: object): { readonly knownHostsPath: string; readonly identityFile: string };
     startAgentKeyReadiness(
       capability: object,
       descriptor: { readonly host: string; readonly port: number; readonly user: string },
@@ -779,6 +780,7 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
         const snapshotText = snapshot.bytes.toString('utf8');
         assert.match(snapshotText, /(?:^|\n)\[127\.0\.0\.1\]:\d+ ssh-ed25519 /u, `known-hosts snapshot did not include 127.0.0.1: ${snapshotText}`);
         try {
+          testBinding.prepareAgentKeyReadiness(snapshot.capability);
           return (await testBinding.execute(snapshot.capability, request, signal)) as {
             readonly exitCode: number;
             readonly stdout: string;
