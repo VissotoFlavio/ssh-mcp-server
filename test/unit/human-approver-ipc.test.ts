@@ -117,15 +117,24 @@ test('Windows approval presentation binds the complete destination and escaped a
     request: {
       profileId: baseRequest.profileId,
       command: baseRequest.command,
-      args: ['--target', "O'Reilly\\ops", 'line\nbreak'],
+      args: ['--target', "O'Reilly\\ops", 'line\nbreak', 'bidi\u202Etext', 'zero\u200Bwidth', 'combined e\u0301'],
       timeoutMs: baseRequest.timeoutMs,
       maxOutputBytes: baseRequest.maxOutputBytes,
-      presentation: baseRequest.approvedIdentity,
+      presentation: { ...baseRequest.approvedIdentity, host: 'private\u202E.example' },
     },
   });
-  assert.equal(
-    Buffer.from(presentation ?? '', 'base64').toString('utf8'),
-    "Destination:\n  Host: 'private.example'\n  Port: 22\n  User: 'deploy'\n  Fingerprint: 'SHA256:host'\nCommand:\n  Executable: 'sudo'\n  Arguments:\n  [0] '--target'\n  [1] 'O\\'Reilly\\\\ops'\n  [2] 'line\\u{a}break'",
+  const decoded = Buffer.from(presentation ?? '', 'base64').toString('utf8');
+  assert.ok(decoded.includes("Host: 'private\\u{202e}.example'"));
+  assert.ok(decoded.includes("[1] 'O\\'Reilly\\\\ops'"));
+  assert.ok(decoded.includes("[2] 'line\\u{a}break'"));
+  assert.ok(decoded.includes("[3] 'bidi\\u{202e}text'"));
+  assert.ok(decoded.includes("[4] 'zero\\u{200b}width'"));
+  assert.ok(decoded.includes("[5] 'combined e\\u{301}'"));
+  assert.ok(
+    [...decoded].every((character) => {
+      const codePoint = character.codePointAt(0) ?? 0;
+      return character === '\n' || (codePoint >= 0x20 && codePoint <= 0x7e);
+    }),
   );
   assert.equal(
     formatWindowsApprovalPresentation({

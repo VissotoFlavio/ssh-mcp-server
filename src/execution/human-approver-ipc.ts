@@ -102,7 +102,7 @@ function quoteApprovalPresentation(value: string): string {
   const escaped = value
     .replace(/\\/gu, '\\\\')
     .replace(/'/gu, "\\'")
-    .replace(/[\u0000-\u001F\u007F-\u009F\u2028\u2029]/gu, (character) => `\\u{${character.codePointAt(0)?.toString(16) ?? '0'}}`);
+    .replace(/[^\x20-\x7E]/gu, (character) => `\\u{${character.codePointAt(0)?.toString(16) ?? '0'}}`);
   return `'${escaped}'`;
 }
 
