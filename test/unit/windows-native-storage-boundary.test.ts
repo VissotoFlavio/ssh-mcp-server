@@ -753,7 +753,7 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
       const hostFingerprint = fingerprint(`${privateHostKey}.pub`);
       writeFileSync(
         join(root, 'known-hosts', 'production-api.known_hosts'),
-        `[${host}]:${fixture.port} ${hostPublic.algorithm} ${hostPublic.encoded}\n`,
+        `[${host}]:${fixture.port} ${hostPublic.algorithm} ${hostPublic.encoded}\n${host} ${hostPublic.algorithm} ${hostPublic.encoded}\n`,
         'utf8',
       );
       const baseRequest = {
