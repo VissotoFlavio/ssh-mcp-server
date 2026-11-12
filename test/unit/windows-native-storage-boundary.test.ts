@@ -776,6 +776,8 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
         readonly stderr: string;
       }> => {
         const snapshot = testBinding.captureKnownHostsSnapshot('production-api');
+        const snapshotText = snapshot.bytes.toString('utf8');
+        assert.match(snapshotText, /(?:^|\n)\[localhost\]:\d+ ssh-ed25519 /u, `known-hosts snapshot did not include localhost: ${snapshotText}`);
         try {
           return (await testBinding.execute(snapshot.capability, request, signal)) as {
             readonly exitCode: number;
