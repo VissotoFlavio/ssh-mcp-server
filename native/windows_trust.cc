@@ -664,7 +664,9 @@ class SnapshotSession final {
   bool Write(const std::vector<BYTE>& data) {
     if (ConsumeSnapshotFailure(SnapshotFailure::kWrite)) return false;
     DWORD bytes_written = 0;
-    return WriteFile(file_.get(), data.data(), static_cast<DWORD>(data.size()), &bytes_written, nullptr) && bytes_written == data.size() && !ConsumeSnapshotFailure(SnapshotFailure::kFlush) && FlushFileBuffers(file_.get());
+    if (!WriteFile(file_.get(), data.data(), static_cast<DWORD>(data.size()), &bytes_written, nullptr) || bytes_written != data.size() || ConsumeSnapshotFailure(SnapshotFailure::kFlush) || !FlushFileBuffers(file_.get())) return false;
+    snapshot_bytes_ = data;
+    return true;
   }
 
   HANDLE parent_handle() const { return parent_.get(); }
@@ -684,9 +686,10 @@ class SnapshotSession final {
   bool ReadyKnownHostsPath(std::wstring* path, std::wstring* directory) {
     if (!IsValidCapability() || !parent_identity_known_ || !directory_identity_known_ || !file_identity_known_ ||
         !HasIdentity(parent_.get(), parent_identity_) || !HasIdentity(directory_.get(), directory_identity_) ||
-        !HasIdentity(file_.get(), file_identity_) || !VerifyFile(parent_.get(), operator_sid(), true) ||
-        !VerifyFile(directory_.get(), operator_sid(), true) || !VerifyFile(file_.get(), operator_sid(), false))
+        !VerifyFile(parent_.get(), operator_sid(), true) || !VerifyFile(directory_.get(), operator_sid(), true))
       return false;
+    if (file_.get() == INVALID_HANDLE_VALUE && (!file_sealed_ || !ReopenSealedFile())) return false;
+    if (!HasIdentity(file_.get(), file_identity_) || !VerifyFile(file_.get(), operator_sid(), false)) return false;
     std::wstring final_directory;
     std::wstring final_file;
     if (!FinalPath(directory_.get(), &final_directory) || !FinalPath(file_.get(), &final_file)) return false;
@@ -703,7 +706,8 @@ class SnapshotSession final {
     if (file_.get() == INVALID_HANDLE_VALUE || snapshot_file_path_.empty() || !file_identity_known_ ||
         !HasIdentity(file_.get(), file_identity_) || !VerifyFile(file_.get(), operator_sid(), false)) return false;
     file_.reset();
-    return true;
+    file_sealed_ = true;
+    return ReopenSealedFile();
   }
 
   bool Dispose() {
@@ -717,7 +721,7 @@ class SnapshotSession final {
   bool HasArtifacts() const { return directory_.get() != INVALID_HANDLE_VALUE || file_.get() != INVALID_HANDLE_VALUE; }
 
   bool Rollback() {
-    if (file_.get() != INVALID_HANDLE_VALUE) {
+    if (file_.get() != INVALID_HANDLE_VALUE && !file_sealed_) {
       const bool file_verified = file_identity_known_ ? HasIdentity(file_.get(), file_identity_) && VerifyFile(file_.get(), operator_sid(), false) : RevalidateFreshFile();
       if (!file_verified || ConsumeSnapshotFailure(SnapshotFailure::kFileDisposition)) return false;
       FILE_DISPOSITION_INFO delete_info{};
@@ -726,15 +730,23 @@ class SnapshotSession final {
       file_.reset();
       snapshot_file_path_.clear();
     } else if (!snapshot_file_path_.empty()) {
+      if (file_.get() != INVALID_HANDLE_VALUE) {
+        if (!file_identity_known_ || !HasIdentity(file_.get(), file_identity_) || !VerifyFile(file_.get(), operator_sid(), false)) return false;
+        file_.reset();
+      }
       Handle reopened(CreateFileW(snapshot_file_path_.c_str(), DELETE | FILE_READ_ATTRIBUTES | READ_CONTROL,
                                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
                                   FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+      std::wstring reopened_final;
       if (reopened.get() == INVALID_HANDLE_VALUE || !file_identity_known_ || !HasIdentity(reopened.get(), file_identity_) ||
-          !VerifyFile(reopened.get(), operator_sid(), false)) return false;
+          !VerifyFile(reopened.get(), operator_sid(), false) || !FinalPath(reopened.get(), &reopened_final) ||
+          _wcsicmp(StripExtendedPrefix(reopened_final).c_str(), snapshot_file_path_.c_str()) != 0)
+        return false;
       FILE_DISPOSITION_INFO delete_info{};
       delete_info.DeleteFile = TRUE;
       if (!SetFileInformationByHandle(reopened.get(), FileDispositionInfo, &delete_info, sizeof(delete_info))) return false;
       snapshot_file_path_.clear();
+      file_sealed_ = false;
     }
     if (directory_.get() != INVALID_HANDLE_VALUE) {
       const bool directory_verified = directory_identity_known_ ? parent_identity_known_ && HasIdentity(parent_.get(), parent_identity_) && HasIdentity(directory_.get(), directory_identity_) && VerifyFile(parent_.get(), operator_sid(), true) && VerifyFile(directory_.get(), operator_sid(), true) : RevalidateFreshDirectory();
@@ -766,6 +778,24 @@ class SnapshotSession final {
     return true;
   }
 
+  bool ReopenSealedFile() {
+    if (!file_sealed_ || snapshot_file_path_.empty() || snapshot_bytes_.empty()) return false;
+    Handle reopened(CreateFileW(snapshot_file_path_.c_str(), GENERIC_READ | FILE_READ_ATTRIBUTES | READ_CONTROL, FILE_SHARE_READ,
+                                nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+    std::wstring reopened_final;
+    LARGE_INTEGER size{};
+    DWORD bytes_read = 0;
+    std::vector<BYTE> bytes(snapshot_bytes_.size());
+    if (reopened.get() == INVALID_HANDLE_VALUE || !HasIdentity(reopened.get(), file_identity_) || !VerifyFile(reopened.get(), operator_sid(), false) ||
+        !FinalPath(reopened.get(), &reopened_final) || _wcsicmp(StripExtendedPrefix(reopened_final).c_str(), snapshot_file_path_.c_str()) != 0 ||
+        !GetFileSizeEx(reopened.get(), &size) || size.QuadPart != static_cast<LONGLONG>(snapshot_bytes_.size()) ||
+        !ReadFile(reopened.get(), bytes.data(), static_cast<DWORD>(bytes.size()), &bytes_read, nullptr) || bytes_read != bytes.size() ||
+        memcmp(bytes.data(), snapshot_bytes_.data(), bytes.size()) != 0)
+      return false;
+    file_ = std::move(reopened);
+    return true;
+  }
+
   PSID operator_sid() const { return static_cast<PSID>(const_cast<BYTE*>(operator_sid_.data())); }
 
   std::vector<BYTE> operator_sid_;
@@ -775,6 +805,7 @@ class SnapshotSession final {
   Handle directory_;
   Handle file_;
   std::wstring snapshot_file_path_;
+  std::vector<BYTE> snapshot_bytes_;
   FILE_ID_INFO parent_identity_{};
   FILE_ID_INFO directory_identity_{};
   FILE_ID_INFO file_identity_{};
@@ -783,6 +814,7 @@ class SnapshotSession final {
   bool file_identity_known_ = false;
   bool directory_fresh_ = false;
   bool file_fresh_ = false;
+  bool file_sealed_ = false;
   bool disposed_ = false;
   std::atomic<bool> busy_{false};
 };
@@ -2963,29 +2995,11 @@ NativeAgentCommandRunResult RunNativeAgentCommand(SnapshotSession* snapshot, con
       L"-o", L"NumberOfPasswordPrompts=0", L"-o", L"IdentityFile=" + identity_file, L"-o", L"IdentitiesOnly=yes", L"-p", std::to_wstring(request.port),
       L"-l", request.user, OpenSshHostName(request.host)};
   std::vector<std::wstring> fixed_arguments = arguments;
-#ifdef SSH_MCP_NATIVE_TEST
-  fixed_arguments.insert(fixed_arguments.begin(), L"-vvv");
-#endif
   std::wstring remote_command = PosixShellQuote(request.command);
   for (const std::wstring& argument : request.arguments) remote_command.append(L" ").append(PosixShellQuote(argument));
   fixed_arguments.push_back(remote_command);
   const std::wstring command_line = FixedCommandLine(L"ssh.exe", fixed_arguments);
   if (command_line.size() >= 32767) return result;
-#ifdef SSH_MCP_NATIVE_TEST
-  result.stderr_data = "[test-command] ";
-  for (wchar_t character : command_line) result.stderr_data.push_back(character >= 0 && character <= 0x7f ? static_cast<char>(character) : '?');
-  result.stderr_data.push_back('\n');
-  Handle debug_file(CreateFileW(known_hosts.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
-  if (debug_file.get() != INVALID_HANDLE_VALUE) {
-    std::array<char, 4096> debug_bytes{};
-    DWORD debug_read = 0;
-    if (ReadFile(debug_file.get(), debug_bytes.data(), static_cast<DWORD>(debug_bytes.size()), &debug_read, nullptr)) {
-      result.stderr_data.append("[test-snapshot] ");
-      result.stderr_data.append(debug_bytes.data(), debug_read);
-      result.stderr_data.push_back('\n');
-    }
-  }
-#endif
   NativeAgentCommandProcess process;
   if (!StartNativeAgentCommandProcess(ssh, command_line, &process)) return result;
   result.launched = true;
@@ -3038,7 +3052,7 @@ NativeAgentCommandRunResult RunNativeAgentCommand(SnapshotSession* snapshot, con
   return result;
 }
 
-napi_value NativeAgentCommandError(napi_env env, const char* code, const std::string* debug_stderr = nullptr) {
+napi_value NativeAgentCommandError(napi_env env, const char* code) {
   const char* message = "Windows agent command is unavailable";
   if (strcmp(code, "timeout") == 0) message = "Windows agent command timed out";
   else if (strcmp(code, "cancelled") == 0) message = "Windows agent command cancelled";
@@ -3047,13 +3061,6 @@ napi_value NativeAgentCommandError(napi_env env, const char* code, const std::st
   else if (strcmp(code, "host-key-failure") == 0) message = "Windows agent command host verification failed";
   else if (strcmp(code, "authentication-failure") == 0) message = "Windows agent command authentication failed";
   else if (strcmp(code, "connection-failure") == 0) message = "Windows agent command connection failed";
-#ifdef SSH_MCP_NATIVE_TEST
-  std::string debug_message;
-  if (debug_stderr != nullptr && debug_stderr->rfind("[test-command]", 0) == 0) {
-    debug_message = std::string(message) + "\n" + *debug_stderr;
-    message = debug_message.c_str();
-  }
-#endif
   napi_value message_value{};
   napi_value error{};
   napi_value code_value{};
@@ -3117,13 +3124,7 @@ void CompleteNativeAgentCommand(napi_env env, napi_status, void* data) {
   else if (job->result.launched && job->result.failed) error_code = "outcome-unknown";
   else if (!job->result.launched || job->result.failed) error_code = "windows-agent-command-unavailable";
   if (error_code != nullptr) {
-    napi_value error = NativeAgentCommandError(env, error_code,
-#ifdef SSH_MCP_NATIVE_TEST
-                                                &job->result.stderr_data
-#else
-                                                nullptr
-#endif
-    );
+    napi_value error = NativeAgentCommandError(env, error_code);
     napi_reject_deferred(env, job->deferred, error);
     return;
   }

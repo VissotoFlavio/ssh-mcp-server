@@ -766,7 +766,7 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
         command: 'printf',
         args: ['ssh-mcp-e2e-success'],
         timeoutMs: 5_000,
-        maxOutputBytes: 16_384,
+        maxOutputBytes: 1_024,
       };
       const execute = async (
         request: object,
@@ -780,7 +780,8 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
         const snapshotText = snapshot.bytes.toString('utf8');
         assert.match(snapshotText, /(?:^|\n)\[127\.0\.0\.1\]:\d+ ssh-ed25519 /u, `known-hosts snapshot did not include 127.0.0.1: ${snapshotText}`);
         try {
-          testBinding.prepareAgentKeyReadiness(snapshot.capability);
+          const prepared = testBinding.prepareAgentKeyReadiness(snapshot.capability);
+          assert.throws(() => writeFileSync(prepared.knownHostsPath, 'tampered\n', 'utf8'));
           return (await testBinding.execute(snapshot.capability, request, signal)) as {
             readonly exitCode: number;
             readonly stdout: string;
