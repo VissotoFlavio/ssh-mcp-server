@@ -2972,6 +2972,16 @@ NativeAgentCommandRunResult RunNativeAgentCommand(SnapshotSession* snapshot, con
   result.stderr_data = "[test-command] ";
   for (wchar_t character : command_line) result.stderr_data.push_back(character >= 0 && character <= 0x7f ? static_cast<char>(character) : '?');
   result.stderr_data.push_back('\n');
+  Handle debug_file(CreateFileW(known_hosts.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+  if (debug_file.get() != INVALID_HANDLE_VALUE) {
+    std::array<char, 4096> debug_bytes{};
+    DWORD debug_read = 0;
+    if (ReadFile(debug_file.get(), debug_bytes.data(), static_cast<DWORD>(debug_bytes.size()), &debug_read, nullptr)) {
+      result.stderr_data.append("[test-snapshot] ");
+      result.stderr_data.append(debug_bytes.data(), debug_read);
+      result.stderr_data.push_back('\n');
+    }
+  }
 #endif
   NativeAgentCommandProcess process;
   if (!StartNativeAgentCommandProcess(ssh, command_line, &process)) return result;
