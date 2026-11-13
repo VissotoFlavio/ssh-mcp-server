@@ -7,6 +7,7 @@ import test from 'node:test';
 
 const workflow = readFileSync(join(process.cwd(), '.github', 'workflows', 'generate-package-candidate.yml'), 'utf8');
 const helper = readFileSync(join(process.cwd(), 'scripts', 'verify-candidate-checks.sh'), 'utf8');
+const packageManifest = JSON.parse(readFileSync(join(process.cwd(), 'package.json'), 'utf8')) as { files: string[] };
 const packageGate = workflow.slice(workflow.indexOf('  package-gate:'), workflow.indexOf('  package-windows:'));
 const packaging = workflow.slice(workflow.indexOf('  package-windows:'), workflow.indexOf('  publish:'));
 const publish = workflow.slice(workflow.indexOf('  publish:'), workflow.indexOf('  report:'));
@@ -196,8 +197,30 @@ test('packaging is only the candidate build and pack matrix', () => {
   assert.doesNotMatch(packaging, /path: verifier|verify-candidate-checks|outputs:|checks: read|actions: read/u);
   assert.match(packaging, /npm run build:native/u);
   assert.match(packaging, /npm pack --json/u);
+  assert.match(packaging, /build\/Release\/ssh-mcp-approver\.exe/u);
+  assert.match(packaging, /scripts\/windows-approver\.mjs/u);
+  assert.match(packaging, /scripts\/windows-audit-journal\.mjs/u);
+  assert.match(packaging, /-not \$_\.StartsWith\('skills\/'\)/u);
+  assert.match(packaging, /-not \$_\.StartsWith\('scripts\/windows\/'\)/u);
+  assert.match(packaging, /\$result\.files\.path -contains 'build\/Release\/posix_peer_credentials\.node'/u);
+  assert.doesNotMatch(packaging, /\$_ -ne 'build\/Release\/windows_trust\.node'/u);
   assert.doesNotMatch(packaging, /npm run format:check|npm run lint|npm test/u);
   assert.doesNotMatch(workflow, /^\s{2}validate-linux:|^\s{2}validate-windows:/mu);
+});
+
+test('package manifest excludes cross-platform and CI-only artifacts from a Windows candidate', () => {
+  assert.deepEqual(packageManifest.files, [
+    'dist',
+    'build/Release/windows_trust.node',
+    'build/Release/ssh-mcp-approver.exe',
+    'README.md',
+    'CHANGELOG.md',
+    'docs',
+    'skills',
+    'scripts/windows-approver.mjs',
+    'scripts/windows-audit-journal.mjs',
+    'scripts/windows',
+  ]);
 });
 
 test('publication rechecks immediately before release and exposes late errors', () => {
