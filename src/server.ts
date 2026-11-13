@@ -7,30 +7,52 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 
 import { serializeAuditEvent } from './diagnostics/redacted-diagnostics-audit.js';
+import { createLocalHumanSudoApprovalProvider } from './execution/human-approver-ipc.js';
+import {
+  remoteCommandToolName,
+  requestSudoApprovalToolName,
+  type HumanSudoApprovalProvider,
+  type RemoteCommandExecutionProvider,
+  type RemoteCommandResult,
+} from './execution/remote-command-execution.js';
 import {
   APPROVED_PROFILE_CLASSIFICATION,
   createRuntimeApprovedProfileListingProvider,
   type ApprovedProfileListingProvider,
 } from './profiles/approved-profile-listing.js';
-import { createRuntimeConnectionValidationProvider } from './runtime/posix-runtime-validation.js';
+import { createRuntimeConnectionValidationProvider, createRuntimeRemoteCommandExecutionProvider } from './runtime/posix-runtime-validation.js';
 import {
   toConnectionValidationFailure,
   type ConnectionValidationOutcome,
   type ConnectionValidationProvider,
 } from './validation/trusted-connection-validation.js';
 import { WindowsOpenSshResolver } from './windows/windows-openssh.js';
+import {
+  WINDOWS_READINESS_STATUS_KIND,
+  WINDOWS_READINESS_STATUS_VERSION,
+  createWindowsReadinessStatusProvider,
+  type WindowsReadinessStatus,
+  type WindowsReadinessStatusProvider,
+} from './windows/windows-readiness-status.js';
 import { supportsWindowsAlphaRuntime } from './windows/windows-runtime-support.js';
 import { createWindowsRuntimeProviders } from './windows/windows-runtime.js';
 
 export const serverName = 'ssh-mcp-server';
-export const serverVersion = '0.1.0';
+export const serverVersion = '1.0.0';
 export const listApprovedProfilesToolName = 'list_approved_profiles';
 export const validateConnectionToolName = 'validate_connection';
+export const getWindowsReadinessStatusToolName = 'get_windows_readiness_status';
 
 const LIST_APPROVED_PROFILES_DESCRIPTION =
   'Lists operator-approved profile IDs only. Use an ID returned here for validation; connection, credential, and host details are never disclosed.';
 const VALIDATE_CONNECTION_DESCRIPTION =
   'Checks readiness for one operator-approved SSH profile ID. Use only a discovered or explicitly authorized ID; it accepts no commands, connection settings, credentials, or paths.';
+const WINDOWS_READINESS_STATUS_DESCRIPTION =
+  'Reports bounded local Windows readiness categories only. It accepts no connection settings, profile IDs, credentials, paths, or commands and never contacts a remote host.';
+const REMOTE_COMMAND_DESCRIPTION =
+  'Executes one bounded non-interactive command on an approved SSH profile. This modifies remote state, requires confirmation for destructive or sudo commands, and supports no persistent shell, file transfer, or port forwarding.';
+const SUDO_APPROVAL_DESCRIPTION =
+  'Requests a one-time human approval for one exact sudo command. Approval is request-bound, expires quickly, and cannot be supplied as a caller boolean.';
 const SAFE_PROFILE_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
 const MAX_DISCOVERABLE_PROFILES = 256;
 
@@ -41,6 +63,11 @@ export interface ServerOptions {
   readonly connectionValidationProvider?: ConnectionValidationProvider;
   /** Internal sink for already-allowlisted validation audit records. */
   readonly auditSink?: (serializedEvent: string) => void;
+  /** Local-only, redacted Windows prerequisite status provider. */
+  readonly windowsReadinessStatusProvider?: WindowsReadinessStatusProvider;
+  /** Trusted remote execution and human approval boundary. */
+  readonly remoteCommandExecutionProvider?: RemoteCommandExecutionProvider;
+  readonly humanSudoApprovalProvider?: HumanSudoApprovalProvider;
 }
 
 export interface StdioServerOptions {
@@ -50,6 +77,9 @@ export interface StdioServerOptions {
   installSignalHandlers?: boolean;
   approvedProfileListingProvider?: ApprovedProfileListingProvider;
   connectionValidationProvider?: ConnectionValidationProvider;
+  windowsReadinessStatusProvider?: WindowsReadinessStatusProvider;
+  remoteCommandExecutionProvider?: RemoteCommandExecutionProvider;
+  humanSudoApprovalProvider?: HumanSudoApprovalProvider;
 }
 
 function isEmptyDiscoveryInput(input: unknown): boolean {
@@ -161,8 +191,16 @@ function unavailableDiscoveryResult(): ReturnType<typeof textToolResult> {
   return textToolResult('Approved profile discovery is unavailable.', true);
 }
 
+function unavailableWindowsReadinessStatusResult(): ReturnType<typeof textToolResult> {
+  return textToolResult('Windows readiness status is unavailable.', true);
+}
+
 function validationResult(outcome: unknown, isError = false): ReturnType<typeof textToolResult> {
   return textToolResult(JSON.stringify(outcome), isError);
+}
+
+function remoteResult(result: RemoteCommandResult): ReturnType<typeof textToolResult> {
+  return textToolResult(JSON.stringify(result), result.outcome !== 'success' && result.outcome !== 'approval-required');
 }
 
 function unavailableConnectionValidationResult(): ReturnType<typeof textToolResult> {
@@ -201,6 +239,63 @@ function safeValidationOutcome(value: unknown, requestedProfileId: string): Conn
   return { profileId: profileId.value, ready: true };
 }
 
+function statusField(value: unknown, allowed: readonly string[]): string {
+  if (typeof value !== 'string' || !allowed.includes(value)) throw new TypeError('Trusted Windows readiness provider returned an invalid result');
+  return value;
+}
+
+/** Project the Windows status through a fixed response schema with no dynamic fields. */
+function safeWindowsReadinessStatus(value: unknown): WindowsReadinessStatus {
+  if (typeof value !== 'object' || value === null || Array.isArray(value))
+    throw new TypeError('Trusted Windows readiness provider returned an invalid result');
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) throw new TypeError('Trusted Windows readiness provider returned an invalid result');
+  const keys = Reflect.ownKeys(value);
+  const expected = [
+    'kind',
+    'version',
+    'runtime',
+    'registry',
+    'filesystem',
+    'configuration',
+    'knownHosts',
+    'credentials',
+    'validationProvider',
+    'remoteAuthentication',
+  ];
+  if (keys.length !== expected.length || !expected.every((key) => keys.includes(key))) {
+    throw new TypeError('Trusted Windows readiness provider returned an invalid result');
+  }
+  const fields = Object.fromEntries(
+    expected.map((key) => {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor === undefined || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) {
+        throw new TypeError('Trusted Windows readiness provider returned an invalid result');
+      }
+      return [key, descriptor.value];
+    }),
+  ) as Record<string, unknown>;
+  if (fields.kind !== WINDOWS_READINESS_STATUS_KIND || fields.version !== WINDOWS_READINESS_STATUS_VERSION) {
+    throw new TypeError('Trusted Windows readiness provider returned an invalid result');
+  }
+  const checkValues = ['ready', 'unavailable', 'invalid', 'not-checked'];
+  const runtime = statusField(fields.runtime, ['ready', 'unsupported']) as WindowsReadinessStatus['runtime'];
+  const credentials = statusField(fields.credentials, ['ready', 'unavailable', 'not-checked']);
+  const remoteAuthentication = statusField(fields.remoteAuthentication, ['not-checked']);
+  return {
+    kind: WINDOWS_READINESS_STATUS_KIND,
+    version: WINDOWS_READINESS_STATUS_VERSION,
+    runtime,
+    registry: statusField(fields.registry, checkValues) as WindowsReadinessStatus['registry'],
+    filesystem: statusField(fields.filesystem, checkValues) as WindowsReadinessStatus['filesystem'],
+    configuration: statusField(fields.configuration, checkValues) as WindowsReadinessStatus['configuration'],
+    knownHosts: statusField(fields.knownHosts, checkValues) as WindowsReadinessStatus['knownHosts'],
+    credentials: credentials as WindowsReadinessStatus['credentials'],
+    validationProvider: statusField(fields.validationProvider, checkValues) as WindowsReadinessStatus['validationProvider'],
+    remoteAuthentication: remoteAuthentication as 'not-checked',
+  };
+}
+
 /** Emit a fixed startup diagnostic without exposing the triggering failure. */
 export function reportEntrypointFailure(errorOutput: Pick<Writable, 'write'>, _error: unknown): void {
   errorOutput.write('MCP server failed to start\n');
@@ -219,8 +314,21 @@ function registerTools(
   server: Server,
   approvedProfileListingProvider: ApprovedProfileListingProvider | undefined,
   connectionValidationProvider: ConnectionValidationProvider | undefined,
+  windowsReadinessStatusProvider: WindowsReadinessStatusProvider | undefined,
+  remoteCommandExecutionProvider: RemoteCommandExecutionProvider | undefined,
+  humanSudoApprovalProvider: HumanSudoApprovalProvider | undefined,
   auditSink: ((serializedEvent: string) => void) | undefined,
 ): void {
+  const configuredRemoteCommandExecutionProvider =
+    remoteCommandExecutionProvider === undefined
+      ? undefined
+      : (() => {
+          const configured =
+            humanSudoApprovalProvider === undefined
+              ? remoteCommandExecutionProvider
+              : remoteCommandExecutionProvider.withHumanSudoApprovalProvider(humanSudoApprovalProvider);
+          return auditSink === undefined ? configured : configured.withAuditSink(auditSink);
+        })();
   server.setRequestHandler(ListToolsRequestSchema, () => ({
     tools: [
       ...(approvedProfileListingProvider === undefined
@@ -250,6 +358,58 @@ function registerTools(
               },
             },
           ]),
+      ...(windowsReadinessStatusProvider === undefined
+        ? []
+        : [
+            {
+              name: getWindowsReadinessStatusToolName,
+              description: WINDOWS_READINESS_STATUS_DESCRIPTION,
+              inputSchema: {
+                type: 'object',
+                properties: {},
+                additionalProperties: false,
+              },
+            },
+          ]),
+      ...(configuredRemoteCommandExecutionProvider === undefined
+        ? []
+        : [
+            {
+              name: remoteCommandToolName,
+              description: REMOTE_COMMAND_DESCRIPTION,
+              annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+              inputSchema: {
+                type: 'object',
+                properties: {
+                  profileId: { type: 'string', pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$' },
+                  command: { type: 'string', minLength: 1, maxLength: 256 },
+                  args: { type: 'array', items: { type: 'string', maxLength: 4096 }, maxItems: 64 },
+                  timeoutMs: { type: 'integer', minimum: 1, maximum: 60000 },
+                  maxOutputBytes: { type: 'integer', minimum: 1, maximum: 1048576 },
+                  approvalToken: { type: 'string', maxLength: 256 },
+                },
+                required: ['profileId', 'command', 'args'],
+                additionalProperties: false,
+              },
+            },
+            {
+              name: requestSudoApprovalToolName,
+              description: SUDO_APPROVAL_DESCRIPTION,
+              annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+              inputSchema: {
+                type: 'object',
+                properties: {
+                  profileId: { type: 'string', pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$' },
+                  command: { type: 'string', minLength: 1, maxLength: 256 },
+                  args: { type: 'array', items: { type: 'string', maxLength: 4096 }, maxItems: 64 },
+                  timeoutMs: { type: 'integer', minimum: 1, maximum: 60000 },
+                  maxOutputBytes: { type: 'integer', minimum: 1, maximum: 1048576 },
+                },
+                required: ['profileId', 'command', 'args'],
+                additionalProperties: false,
+              },
+            },
+          ]),
     ],
   }));
 
@@ -265,6 +425,44 @@ function registerTools(
         // Provider failures and malformed provider output stay inside the trusted boundary.
         return unavailableDiscoveryResult();
       }
+    }
+
+    if (request.params.name === getWindowsReadinessStatusToolName) {
+      if (!isEmptyDiscoveryInput(request.params.arguments) || windowsReadinessStatusProvider === undefined) {
+        return unavailableWindowsReadinessStatusResult();
+      }
+      try {
+        return textToolResult(JSON.stringify(safeWindowsReadinessStatus(await windowsReadinessStatusProvider.getWindowsReadinessStatus())));
+      } catch {
+        return unavailableWindowsReadinessStatusResult();
+      }
+    }
+
+    if (request.params.name === requestSudoApprovalToolName) {
+      if (configuredRemoteCommandExecutionProvider === undefined)
+        return textToolResult(JSON.stringify({ approved: false, code: 'provider-failure' }), true);
+      try {
+        const approval = await configuredRemoteCommandExecutionProvider.requestSudoApproval(request.params.arguments, extra.signal);
+        return textToolResult(JSON.stringify(approval), approval.approved !== true);
+      } catch {
+        return textToolResult(JSON.stringify({ approved: false, code: 'invalid-input' }), true);
+      }
+    }
+
+    if (request.params.name === remoteCommandToolName) {
+      if (configuredRemoteCommandExecutionProvider === undefined) {
+        return remoteResult({
+          operationId: '00000000000000000000000000000000',
+          profileId: 'unknown',
+          outcome: 'failure',
+          code: 'provider-failure',
+          exitCode: null,
+          stdout: '',
+          stderr: '',
+          outputTruncated: false,
+        });
+      }
+      return remoteResult(await configuredRemoteCommandExecutionProvider.execute(request.params.arguments, extra.signal));
     }
 
     if (request.params.name !== validateConnectionToolName) {
@@ -303,9 +501,24 @@ function registerTools(
   });
 }
 
-export function createServer({ approvedProfileListingProvider, connectionValidationProvider, auditSink }: ServerOptions = {}): Server {
+export function createServer({
+  approvedProfileListingProvider,
+  connectionValidationProvider,
+  auditSink,
+  windowsReadinessStatusProvider,
+  remoteCommandExecutionProvider,
+  humanSudoApprovalProvider,
+}: ServerOptions = {}): Server {
   const server = new Server({ name: serverName, version: serverVersion }, { capabilities: { tools: {} } });
-  registerTools(server, approvedProfileListingProvider, connectionValidationProvider, auditSink);
+  registerTools(
+    server,
+    approvedProfileListingProvider,
+    connectionValidationProvider,
+    windowsReadinessStatusProvider,
+    remoteCommandExecutionProvider,
+    humanSudoApprovalProvider,
+    auditSink,
+  );
   return server;
 }
 
@@ -320,10 +533,16 @@ export async function runStdioServer({
   installSignalHandlers = input === process.stdin,
   approvedProfileListingProvider,
   connectionValidationProvider,
+  windowsReadinessStatusProvider,
+  remoteCommandExecutionProvider,
+  humanSudoApprovalProvider,
 }: StdioServerOptions = {}): Promise<void> {
   const server = createServer({
     approvedProfileListingProvider,
     connectionValidationProvider,
+    windowsReadinessStatusProvider,
+    remoteCommandExecutionProvider,
+    humanSudoApprovalProvider,
     auditSink: (serializedEvent) => errorOutput.write(`${serializedEvent}\n`),
   });
   const transport = new StdioServerTransport(input, output);
@@ -416,20 +635,31 @@ export function createProductionRuntimeProviders(
         return false;
       }
     })(),
-  windowsRuntimeFactory: () => Pick<ServerOptions, 'approvedProfileListingProvider' | 'connectionValidationProvider'> = createWindowsRuntimeProviders,
-): Pick<ServerOptions, 'approvedProfileListingProvider' | 'connectionValidationProvider'> {
+  windowsRuntimeFactory: (
+    humanApproval?: HumanSudoApprovalProvider,
+  ) => Pick<
+    ServerOptions,
+    'approvedProfileListingProvider' | 'connectionValidationProvider' | 'windowsReadinessStatusProvider' | 'remoteCommandExecutionProvider'
+  > = (humanApproval) => createWindowsRuntimeProviders(undefined, undefined, humanApproval),
+  humanSudoApprovalProvider?: HumanSudoApprovalProvider,
+): Pick<
+  ServerOptions,
+  'approvedProfileListingProvider' | 'connectionValidationProvider' | 'windowsReadinessStatusProvider' | 'remoteCommandExecutionProvider'
+> {
   if (platform === 'win32') {
-    if (!windowsSupported) return {};
+    if (!windowsSupported) return { windowsReadinessStatusProvider: createWindowsReadinessStatusProvider(false) };
     try {
-      return windowsRuntimeFactory();
+      return windowsRuntimeFactory(humanSudoApprovalProvider);
     } catch {
-      return {};
+      return { windowsReadinessStatusProvider: createWindowsReadinessStatusProvider(true) };
     }
   }
   if (platform === 'linux' || platform === 'darwin') {
+    const connectionValidationProvider = createRuntimeConnectionValidationProvider();
     return {
       approvedProfileListingProvider: createRuntimeApprovedProfileListingProvider(),
-      connectionValidationProvider: createRuntimeConnectionValidationProvider(),
+      connectionValidationProvider,
+      remoteCommandExecutionProvider: createRuntimeRemoteCommandExecutionProvider({ connectionValidationProvider }, humanSudoApprovalProvider),
     };
   }
   return {};
@@ -437,7 +667,9 @@ export function createProductionRuntimeProviders(
 
 if (isEntrypoint) {
   const runProductionServer = async (): Promise<void> => {
-    await runStdioServer(createProductionRuntimeProviders());
+    const localApprover = createLocalHumanSudoApprovalProvider();
+    const runtime = createProductionRuntimeProviders();
+    await runStdioServer(localApprover === undefined ? runtime : { ...runtime, humanSudoApprovalProvider: localApprover });
   };
 
   runProductionServer().catch((error: unknown) => {

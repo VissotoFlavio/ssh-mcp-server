@@ -6,6 +6,7 @@ import test from 'node:test';
 import type { ApprovedProfileListingProvider } from '../../src/profiles/approved-profile-listing.js';
 import {
   listApprovedProfilesToolName,
+  getWindowsReadinessStatusToolName,
   reportEntrypointFailure,
   runStdioServer,
   serverName,
@@ -13,6 +14,7 @@ import {
   type StdioServerOptions,
 } from '../../src/server.js';
 import type { ConnectionValidationProvider } from '../../src/validation/trusted-connection-validation.js';
+import type { WindowsReadinessStatusProvider } from '../../src/windows/windows-readiness-status.js';
 
 function requestResponse(input: PassThrough, output: PassThrough, request: Record<string, unknown>): Promise<Record<string, unknown>> {
   const response = once(output, 'data');
@@ -23,6 +25,7 @@ function requestResponse(input: PassThrough, output: PassThrough, request: Recor
 function createDiscoveryRuntime(
   provider: ApprovedProfileListingProvider,
   connectionValidationProvider?: ConnectionValidationProvider,
+  windowsReadinessStatusProvider?: WindowsReadinessStatusProvider,
 ): {
   readonly input: PassThrough;
   readonly output: PassThrough;
@@ -39,9 +42,131 @@ function createDiscoveryRuntime(
     installSignalHandlers: false,
     approvedProfileListingProvider: provider,
     connectionValidationProvider,
+    windowsReadinessStatusProvider,
   };
   return { input, output, errors, runtime: runStdioServer(options) };
 }
+
+test('exposes a redacted local-only Windows readiness status without changing validation input', async () => {
+  let calls = 0;
+  const readiness: WindowsReadinessStatusProvider = {
+    getWindowsReadinessStatus() {
+      calls += 1;
+      return {
+        kind: 'windows-readiness-status',
+        version: 1,
+        runtime: 'ready',
+        registry: 'ready',
+        filesystem: 'ready',
+        configuration: 'ready',
+        knownHosts: 'unavailable',
+        credentials: 'not-checked',
+        validationProvider: 'unavailable',
+        remoteAuthentication: 'not-checked',
+        host: 'private.example',
+        credential: 'secret',
+      } as unknown as ReturnType<WindowsReadinessStatusProvider['getWindowsReadinessStatus']>;
+    },
+  };
+  const { input, output, errors, runtime } = createDiscoveryRuntime(
+    {
+      async listApprovedProfiles() {
+        return [];
+      },
+    },
+    undefined,
+    readiness,
+  );
+
+  await requestResponse(input, output, {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'initialize',
+    params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'test-client', version: '1.0.0' } },
+  });
+  const tools = await requestResponse(input, output, { jsonrpc: '2.0', id: 2, method: 'tools/list' });
+  assert.equal(
+    (tools.result as { tools: readonly { name: string }[] }).tools.some((tool) => tool.name === getWindowsReadinessStatusToolName),
+    true,
+  );
+  const response = await requestResponse(input, output, {
+    jsonrpc: '2.0',
+    id: 3,
+    method: 'tools/call',
+    params: { name: getWindowsReadinessStatusToolName, arguments: {} },
+  });
+  assert.deepEqual(response.result, {
+    content: [{ type: 'text', text: 'Windows readiness status is unavailable.' }],
+    isError: true,
+  });
+  assert.equal(JSON.stringify(response).includes('private.example'), false);
+  assert.equal(JSON.stringify(response).includes('secret'), false);
+  assert.equal(calls, 1);
+
+  input.end();
+  await runtime;
+  assert.equal(errors.readableLength, 0);
+});
+
+test('returns the fixed Windows readiness schema for a safe local status provider', async () => {
+  const readiness: WindowsReadinessStatusProvider = {
+    getWindowsReadinessStatus: () => ({
+      kind: 'windows-readiness-status',
+      version: 1,
+      runtime: 'ready',
+      registry: 'ready',
+      filesystem: 'ready',
+      configuration: 'ready',
+      knownHosts: 'unavailable',
+      credentials: 'ready',
+      validationProvider: 'unavailable',
+      remoteAuthentication: 'not-checked',
+    }),
+  };
+  const { input, output, errors, runtime } = createDiscoveryRuntime(
+    {
+      async listApprovedProfiles() {
+        return [];
+      },
+    },
+    undefined,
+    readiness,
+  );
+  await requestResponse(input, output, {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'initialize',
+    params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'test-client', version: '1.0.0' } },
+  });
+  const response = await requestResponse(input, output, {
+    jsonrpc: '2.0',
+    id: 2,
+    method: 'tools/call',
+    params: { name: getWindowsReadinessStatusToolName, arguments: {} },
+  });
+  assert.deepEqual(response.result, {
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify({
+          kind: 'windows-readiness-status',
+          version: 1,
+          runtime: 'ready',
+          registry: 'ready',
+          filesystem: 'ready',
+          configuration: 'ready',
+          knownHosts: 'unavailable',
+          credentials: 'ready',
+          validationProvider: 'unavailable',
+          remoteAuthentication: 'not-checked',
+        }),
+      },
+    ],
+  });
+  input.end();
+  await runtime;
+  assert.equal(errors.readableLength, 0);
+});
 
 test('exposes the server name', () => {
   assert.equal(serverName, 'ssh-mcp-server');

@@ -1,9 +1,11 @@
 # POSIX setup for Linux and macOS
 
 This guide prepares operator-owned SSH profile state for the Linux and macOS
-runtime. It is intentionally limited to profile discovery and connection
-readiness; it does not authorize a remote command, deployment, file transfer,
-or SSH server change.
+runtime. It defines the approved profile boundary used by discovery,
+connection validation, and bounded remote execution. It does not authorize a
+remote command by itself, and it does not cover file transfer, port
+forwarding, or SSH server changes. See [remote execution](remote-execution.md)
+for the command and `sudo` approval workflow.
 
 All paths and host details below are illustrative. Replace them only with
 operator-approved local paths and an already authorized destination. Do not
@@ -119,16 +121,32 @@ every time it starts:
 codex mcp add ssh-mcp-server \
   --env SSH_MCP_STATE_ROOT=/absolute/path/to/ssh-mcp-state \
   --env SSH_MCP_KNOWN_HOSTS_ROOT=/absolute/path/to/ssh-mcp-known-hosts \
+  --env SSH_MCP_AUDIT_ROOT=/absolute/path/to/ssh-mcp-audit \
+  --env SSH_MCP_AUDIT_KEY_FILE=/absolute/path/to/ssh-mcp-audit-key \
+  --env SSH_MCP_APPROVER_SOCKET=/absolute/path/to/ssh-mcp-approver.sock \
+  --env SSH_MCP_APPROVER_SECRET_FILE=/absolute/path/to/ssh-mcp-approver.secret \
   -- /absolute/path/to/node /absolute/path/to/ssh-mcp-server/dist/server.js
 
 codex mcp list
 ```
 
+Create the audit key and approver secret out of band as the operator. Keep
+both files owner-only (`0600`); the audit key contains `v1:` followed by 64
+lowercase hexadecimal characters, and the approver secret is exactly 32 random
+bytes shared only with the separate `ssh-mcp-approver` component. The server
+never generates either secret during execution. Run the MCP server and
+approver as a dedicated OS identity. This HMAC IPC contract authenticates the
+message envelope but does not distinguish another process already trusted as
+the same OS user; a native peer-credential boundary is a separate hardening
+follow-up.
+
 Restart Codex if its client requires it, then first call
 `list_approved_profiles` with `{}`. Call `validate_connection` only with a
 `profileId` returned by discovery (for example, `staging-api`) and only when
-the operator has authorized that readiness check. The MCP request contains no
-host, user, path, credential, SSH option, or command.
+the operator has authorized that readiness check. For remote work, use
+`execute_remote_command` with the same approved profile and provide the
+command as one executable token plus an `args` array. The MCP request still
+contains no host, user, path, credential, or SSH option.
 
 Treat an absent tool, an error result, or `ready: false` as a hard stop. Do
 not retry with a guessed profile ID or convert the result into permission for a

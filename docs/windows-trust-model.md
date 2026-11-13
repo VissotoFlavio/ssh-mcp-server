@@ -3,8 +3,10 @@
 ## Status and support boundary
 
 This document is the authoritative security model for the native Windows
-runtime released in `v0.1.0`. It is a design boundary, not a claim
-that the current POSIX runtime supports Windows.
+runtime included in `v1.0.0`. It is a design boundary, not a claim that the
+current POSIX runtime supports Windows. Production remote execution is
+available only when the trusted native audit-journal provider is installed and
+injected.
 
 The Windows runtime is **per-user only**. It never requires elevation, reads
 no machine-wide configuration, and never shares approved profile or
@@ -157,10 +159,13 @@ rotation is a fail-closed release change: it requires a reviewed update to the
 native allowlist and this evidence before the new signer is accepted.
 
 The runtime uses direct process APIs with `shell: false`, fixed executable
-paths, allowlisted arguments, bounded execution, and redacted output. It does
-not load user or global SSH configuration, proxies, host aliases, or remote
-commands. Windows OpenSSH is limited to `agent-key` readiness validation; it
-is never used to automate password prompts.
+paths, POSIX argv quoting, bounded execution, and redacted output. It does not
+load user or global SSH configuration, proxies, host aliases, or caller-supplied
+connection options. Windows OpenSSH command execution is available only through the
+native `agent-key` boundary; it is never inferred from an ambient `ssh2` agent
+and never automates password prompts. Remote command execution also requires a
+trusted native audit-journal provider and fails closed with an explicit audit
+unavailable result before transport when it is absent.
 
 ## Authentication ordering
 

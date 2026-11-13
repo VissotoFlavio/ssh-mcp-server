@@ -1,18 +1,22 @@
 import { strict as assert } from 'node:assert';
 import { execFileSync } from 'node:child_process';
-import { existsSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
+import type { Server as SshServer } from 'ssh2';
+
 const addonPath = join(process.cwd(), 'build', 'Release', 'windows_trust.node');
 const testAddonPath = join(process.cwd(), 'build', 'Release', 'windows_trust_test.node');
 const fixture = join(process.cwd(), 'test', 'helpers', 'windows-native-storage-fixture.ps1');
 const nativeRequire = createRequire(import.meta.url);
+const { Server } = nativeRequire('ssh2') as { Server: typeof SshServer };
 // Windows PowerShell 5.1 can fail to load ACL type data in isolated child
 // processes, so these Windows-only fixtures require PowerShell 7+.
 const fixtureShell = 'pwsh.exe';
+const perUserConfigurationKey = 'HKCU:\\Software\\Vissoto\\ssh-mcp-server';
 const testOnlyHookNames = [
   'testReadReplacementRace',
   'testReadStateFile',
@@ -26,6 +30,8 @@ const testOnlyHookNames = [
   'testSnapshotArtifactCount',
   'testFinalizeSnapshotCapability',
   'testReadinessDescriptor',
+  'testAgentCommandRequest',
+  'testClassifyAgentCommandFailure',
   'testBlockDeferredReaper',
   'testReleaseDeferredReaper',
   'testWaitForMasterStarted',
@@ -70,12 +76,92 @@ function uniqueRoot(suffix: string): string {
   return join(homedir(), `ssh-mcp-native-boundary-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}-${suffix}`);
 }
 
+function hasExistingPerUserConfiguration(): boolean {
+  if (process.platform !== 'win32') return false;
+  try {
+    execFileSync(
+      fixtureShell,
+      ['-NoProfile', '-NonInteractive', '-Command', `if (Test-Path -LiteralPath '${perUserConfigurationKey}') { exit 0 } else { exit 1 }`],
+      { stdio: 'ignore' },
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function runSshKeygen(output: string, comment: string): void {
+  execFileSync('ssh-keygen.exe', ['-q', '-t', 'ed25519', '-N', '', '-C', comment, '-f', output], { stdio: 'pipe' });
+}
+
+function publicKeyParts(path: string): { readonly algorithm: string; readonly encoded: string; readonly data: Buffer } {
+  const [algorithm, encoded] = readFileSync(path, 'utf8').trim().split(/\s+/u);
+  if (algorithm === undefined || encoded === undefined) throw new Error('SSH fixture public key is invalid');
+  return { algorithm, encoded, data: Buffer.from(encoded, 'base64') };
+}
+
+function fingerprint(publicKeyPath: string): string {
+  const output = execFileSync('ssh-keygen.exe', ['-lf', publicKeyPath, '-E', 'sha256'], { encoding: 'utf8' });
+  const match = /\b(SHA256:[A-Za-z0-9+/]+)\b/u.exec(output);
+  if (match === null) throw new Error('SSH fixture fingerprint is unavailable');
+  return match[1];
+}
+
+async function listenLocalSshFixture(hostKeyPath: string, agentPublicKey: Buffer): Promise<{ readonly server: SshServer; readonly port: number }> {
+  const server = new Server({ hostKeys: [readFileSync(hostKeyPath)] });
+  server.on('connection', (client) => {
+    client.on('error', (error: NodeJS.ErrnoException) => {
+      if (error.code === 'ECONNRESET') return;
+      throw error;
+    });
+    client.on('authentication', (context) => {
+      if (context.method === 'publickey' && context.key.data.equals(agentPublicKey)) context.accept();
+      else context.reject();
+    });
+    client.on('ready', () => {
+      client.on('session', (accept) => {
+        const session = accept();
+        session.on('exec', (acceptChannel, _reject, info) => {
+          const channel = acceptChannel();
+          if (info.command.includes('ssh-mcp-e2e-timeout')) return;
+          if (info.command.includes('ssh-mcp-e2e-failure')) {
+            channel.stderr.write('fixture remote failure\n');
+            channel.exit(7);
+            channel.end();
+            return;
+          }
+          if (info.command.includes('ssh-mcp-e2e-output')) {
+            channel.write('x'.repeat(128 * 1024));
+            channel.exit(0);
+            channel.end();
+            return;
+          }
+          channel.write('ssh-mcp-e2e-success\n');
+          channel.exit(0);
+          channel.end();
+        });
+      });
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => resolve());
+  });
+  const address = server.address();
+  if (address === null || typeof address === 'string') throw new Error('SSH fixture did not expose a TCP port');
+  return { server, port: address.port };
+}
+
 if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAddonPath)) {
   test.skip('requires Windows with the compiled production and test native addons', () => undefined);
+} else if (hasExistingPerUserConfiguration()) {
+  test.skip('requires an isolated Windows per-user configuration; the active profile configuration is preserved', () => undefined);
 } else {
   const binding = nativeRequire(addonPath) as {
     readProfileState(): Buffer;
+    inspectReadiness(): { readonly registry: string; readonly filesystem: string; readonly configuration: string };
     readKnownHosts(profileId: string): Buffer;
+    credentialAvailable(locator: string): boolean;
     captureKnownHostsSnapshot(profileId: string): { bytes: Buffer; capability: object };
     disposeKnownHostsSnapshot(capability: unknown): void;
     startAgentKeyReadiness(
@@ -87,10 +173,17 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
     resolveOpenSsh(): { ssh: string; sshAdd: string; version: string };
     probeSshAdd(timeoutMs: unknown): number;
     startSshAddProbe(timeoutMs: unknown): { readonly promise: Promise<boolean>; readonly cancel: () => void };
+    execute(capability: object, request: object, signal?: AbortSignal): Promise<unknown>;
+    initializeExecutionAuditKey(): void;
+    rotateExecutionAuditKey(): void;
+    digestExecutionAuditArguments(args: readonly string[]): string;
+    appendExecutionAuditIntent(intent: object): { keyId: string; previousEventHmac: string | null; eventHmac: string };
+    appendExecutionAuditFinished(event: object): { keyId: string; previousEventHmac: string | null; eventHmac: string };
   };
   const testBinding = nativeRequire(testAddonPath) as {
     captureKnownHostsSnapshot(profileId: string): { bytes: Buffer; capability: object };
     disposeKnownHostsSnapshot(capability: unknown): void;
+    prepareAgentKeyReadiness(capability: object): { readonly knownHostsPath: string; readonly identityFile: string };
     startAgentKeyReadiness(
       capability: object,
       descriptor: { readonly host: string; readonly port: number; readonly user: string },
@@ -129,10 +222,16 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
     testSnapshotArtifactCount(): number;
     testFinalizeSnapshotCapability(capability: object): void;
     testReadinessDescriptor(descriptor: unknown): boolean;
+    testAgentCommandRequest(request: unknown): boolean;
+    testClassifyAgentCommandFailure(stderr: string): string;
+    digestExecutionAuditArguments(args: readonly string[]): string;
+    appendExecutionAuditIntent(intent: object): { keyId: string; previousEventHmac: string | null; eventHmac: string };
+    appendExecutionAuditFinished(event: object): { keyId: string; previousEventHmac: string | null; eventHmac: string };
     testBlockDeferredReaper(): void;
     testReleaseDeferredReaper(): void;
     testWaitForMasterStarted(timeoutMs: number): boolean;
     testDeferredReaperCompletion(): Promise<void>;
+    execute(capability: object, request: object, signal?: AbortSignal): Promise<unknown>;
   };
 
   test('keeps test-only hooks out of the production native addon', () => {
@@ -143,11 +242,44 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
 
   test('accepts only the fixed native agent-readiness descriptor grammar', () => {
     assert.equal(testBinding.testReadinessDescriptor(Object.freeze({ host: 'api.internal.example', port: 22, user: 'deploy' })), true);
-    assert.equal(testBinding.testReadinessDescriptor(Object.freeze({ host: '2001:db8::1', port: 22, user: 'deploy' })), true);
+    assert.equal(testBinding.testReadinessDescriptor(Object.freeze({ host: '[2001:db8::1]', port: 22, user: 'deploy' })), true);
+    assert.equal(testBinding.testReadinessDescriptor(Object.freeze({ host: '2001:db8::1', port: 22, user: 'deploy' })), false);
+    assert.equal(testBinding.testReadinessDescriptor(Object.freeze({ host: '[2001:db8:zz::1]', port: 22, user: 'deploy' })), false);
     assert.equal(testBinding.testReadinessDescriptor({ host: 'api.internal.example', port: 22, user: 'deploy', command: 'id' }), false);
     assert.equal(testBinding.testReadinessDescriptor({ host: 'api.internal.example -oProxyCommand=evil', port: 22, user: 'deploy' }), false);
     assert.equal(testBinding.testReadinessDescriptor({ host: 'api.internal.example', port: 22, user: '-oProxyCommand=evil' }), false);
     assert.equal(testBinding.testReadinessDescriptor({ host: 'api.internal.example', port: 0, user: 'deploy' }), false);
+  });
+
+  test('accepts only bounded native agent-command request data', () => {
+    const valid = {
+      profileId: 'production-api',
+      host: 'api.internal.example',
+      port: 22,
+      user: 'deploy',
+      expectedHostFingerprint: `SHA256:${'a'.repeat(43)}`,
+      command: 'id',
+      args: ['--version'],
+      timeoutMs: 1_000,
+      maxOutputBytes: 1_024,
+    };
+    assert.equal(testBinding.testAgentCommandRequest(valid), true);
+    for (const command of ['sh', 'sh.exe', 'bash.exe', 'busybox.exe', 'env.exe', 'ssh.exe']) {
+      assert.equal(testBinding.testAgentCommandRequest({ ...valid, command }), false);
+    }
+    assert.equal(testBinding.testAgentCommandRequest({ ...valid, args: ['-c'] }), false);
+    assert.equal(testBinding.testAgentCommandRequest({ ...valid, args: ['echo;whoami'] }), false);
+    assert.equal(testBinding.testAgentCommandRequest({ ...valid, extra: 'rejected' }), false);
+  });
+
+  test('classifies only stable OpenSSH diagnostics and preserves remote failures', () => {
+    assert.equal(testBinding.testClassifyAgentCommandFailure('Host key verification failed.'), 'host-key-failure');
+    assert.equal(testBinding.testClassifyAgentCommandFailure('ssh: Permission denied (publickey).'), 'authentication-failure');
+    assert.equal(
+      testBinding.testClassifyAgentCommandFailure('ssh: connect to host api.internal.example port 22: Connection refused'),
+      'connection-failure',
+    );
+    assert.equal(testBinding.testClassifyAgentCommandFailure('remote command stderr: Permission denied'), 'remote-failure');
   });
 
   test('accepts only an isolated private per-user configuration and verified Windows OpenSSH', () => {
@@ -157,8 +289,10 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
       runFixture('safe', root);
       configured = true;
       assert.equal(binding.readProfileState().toString('utf8'), '{"profiles":[]}');
+      assert.deepEqual(binding.inspectReadiness(), { registry: 'ready', filesystem: 'ready', configuration: 'ready' });
       assert.match(binding.readKnownHosts('production-api').toString('utf8'), /ssh-ed25519/u);
       assert.throws(() => binding.readCredential('.'), /Windows secure storage is unavailable/u);
+      assert.equal(typeof binding.credentialAvailable, 'function');
       const ssh = binding.resolveOpenSsh();
       assert.match(ssh.ssh, /\\System32\\OpenSSH\\ssh\.exe$/iu);
       assert.match(ssh.sshAdd, /\\System32\\OpenSSH\\ssh-add\.exe$/iu);
@@ -166,6 +300,7 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
       assert.equal(typeof binding.probeSshAdd, 'function');
       assert.equal('validateAgentKeyReadiness' in binding, false);
       assert.equal(typeof binding.startSshAddProbe, 'function');
+      assert.equal(typeof binding.execute, 'function');
     } finally {
       if (configured) runFixture('cleanup', root);
     }
@@ -194,6 +329,121 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
       assert.equal(testBinding.testSnapshotArtifactCount(), 0);
       assert.throws(() => binding.disposeKnownHostsSnapshot(snapshot.capability), /Windows secure storage is unavailable/u);
       assert.equal(existsSync(sentinel), true);
+    } finally {
+      if (configured) runFixture('cleanup', root);
+    }
+  });
+
+  test('initializes, chains, flushes, and explicitly rotates the native execution audit key', () => {
+    const root = uniqueRoot('execution-audit');
+    let configured = false;
+    try {
+      runFixture('safe', root);
+      configured = true;
+      binding.initializeExecutionAuditKey();
+      assert.throws(() => binding.initializeExecutionAuditKey(), /Windows secure storage is unavailable/u);
+      const intent = {
+        operationId: '0123456789abcdef0123456789abcdef',
+        profileId: 'production-api',
+        command: 'systemctl',
+        args: ['status', 'ssh'],
+        argsHmac: binding.digestExecutionAuditArguments(['status', 'ssh']),
+        approvalState: 'not-required',
+      };
+      const first = binding.appendExecutionAuditIntent(intent);
+      assert.equal(first.previousEventHmac, null);
+      const finished = binding.appendExecutionAuditFinished({
+        operationId: intent.operationId,
+        outcome: 'success',
+        code: 'success',
+        exitCode: 0,
+        durationMs: 4,
+      });
+      assert.equal(finished.previousEventHmac, first.eventHmac);
+      const beforeRotation = readFileSync(join(root, 'state', 'execution-audit.v1.jsonl'), 'utf8');
+      assert.match(beforeRotation, /"keyId":"[0-9a-f]{32}"/u);
+      assert.doesNotMatch(beforeRotation, /secret|stdout|stderr/u);
+      assert.equal(readFileSync(join(root, 'state', 'execution-audit.v1.manifest'), 'utf8'), 'v1\nexecution-audit.v1.jsonl\n');
+      binding.rotateExecutionAuditKey();
+      const afterRotation = readFileSync(join(root, 'state', 'execution-audit.v1.jsonl'), 'utf8');
+      assert.match(afterRotation, /"event":"rotation"/u);
+      const rotation = afterRotation
+        .trim()
+        .split('\n')
+        .map((line): { event: string; eventHmac: string } => JSON.parse(line) as { event: string; eventHmac: string })
+        .reverse()
+        .find((record) => record.event === 'rotation');
+      assert.notEqual(rotation, undefined);
+      const second = binding.appendExecutionAuditIntent({ ...intent, operationId: 'fedcba9876543210fedcba9876543210' });
+      assert.notEqual(second.keyId, first.keyId);
+      assert.equal(second.previousEventHmac, rotation!.eventHmac);
+      binding.appendExecutionAuditFinished({
+        operationId: 'fedcba9876543210fedcba9876543210',
+        outcome: 'unknown',
+        code: 'outcome-unknown',
+        exitCode: null,
+        durationMs: 0,
+      });
+    } finally {
+      if (configured) runFixture('cleanup', root);
+    }
+  });
+
+  test('recovers only intents from an earlier native session', () => {
+    const root = uniqueRoot('execution-audit-session');
+    let configured = false;
+    try {
+      runFixture('safe', root);
+      configured = true;
+      binding.initializeExecutionAuditKey();
+      const makeIntent = (operationId: string, args: string[]) => ({
+        operationId,
+        profileId: 'production-api',
+        command: 'systemctl',
+        args,
+        argsHmac: binding.digestExecutionAuditArguments(args),
+        approvalState: 'not-required',
+      });
+      binding.appendExecutionAuditIntent(makeIntent('0123456789abcdef0123456789abcdef', ['status', 'ssh']));
+      binding.appendExecutionAuditIntent(makeIntent('fedcba9876543210fedcba9876543210', ['status', 'cron']));
+      let lines = readFileSync(join(root, 'state', 'execution-audit.v1.jsonl'), 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      assert.equal(lines.filter((line) => line.outcome === 'unknown').length, 0);
+      binding.appendExecutionAuditFinished({
+        operationId: '0123456789abcdef0123456789abcdef',
+        outcome: 'success',
+        code: 'success',
+        exitCode: 0,
+        durationMs: 1,
+      });
+      binding.appendExecutionAuditFinished({
+        operationId: 'fedcba9876543210fedcba9876543210',
+        outcome: 'success',
+        code: 'success',
+        exitCode: 0,
+        durationMs: 1,
+      });
+
+      const interrupted = makeIntent('abcdefabcdefabcdefabcdefabcdefab', ['status', 'sshd']);
+      interrupted.argsHmac = testBinding.digestExecutionAuditArguments(interrupted.args);
+      testBinding.appendExecutionAuditIntent(interrupted);
+      binding.appendExecutionAuditIntent(makeIntent('a1b2c3d4e5f60123456789abcdef0123', ['status', 'systemd']));
+      lines = readFileSync(join(root, 'state', 'execution-audit.v1.jsonl'), 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      const recovered = lines.find((line) => line.operationId === interrupted.operationId && line.event === 'finished');
+      assert.equal(recovered?.outcome, 'unknown');
+      assert.equal(new Set(lines.filter((line) => line.event === 'intent').map((line) => line.sessionId)).size, 2);
+      binding.appendExecutionAuditFinished({
+        operationId: 'a1b2c3d4e5f60123456789abcdef0123',
+        outcome: 'success',
+        code: 'success',
+        exitCode: 0,
+        durationMs: 1,
+      });
     } finally {
       if (configured) runFixture('cleanup', root);
     }
@@ -403,6 +653,21 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
     assert.deepEqual(testBinding.testLaunch('hang', 100), { completed: false, timedOut: true, exitCode: 0 });
   });
 
+  test('reports an unsafe root as a redacted filesystem prerequisite', () => {
+    const root = uniqueRoot('unsafe-readiness-root');
+    let configured = false;
+    try {
+      runFixture('unsafe-root', root);
+      configured = true;
+      const readiness = binding.inspectReadiness();
+      assert.deepEqual(readiness, { registry: 'ready', filesystem: 'unavailable', configuration: 'not-checked' });
+      assert.equal(JSON.stringify(readiness).includes(root), false);
+      assert.equal(JSON.stringify(readiness).includes('\\'), false);
+    } finally {
+      if (configured) runFixture('cleanup', root);
+    }
+  });
+
   const registryMutationRights: readonly RegistryMutationRight[] = [
     'SetValue',
     'CreateSubKey',
@@ -465,6 +730,96 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
     }
     for (const invalid of [0, -1, 60_001, '1000']) {
       assert.throws(() => binding.probeSshAdd(invalid), /Windows secure storage is unavailable/u);
+    }
+  });
+
+  test('executes the real native binding against a disposable local SSH fixture', { timeout: 120_000 }, async () => {
+    const root = uniqueRoot('native-command-e2e');
+    let configured = false;
+    let server: SshServer | undefined;
+    const privateAgentKey = join(root, 'state', 'agent-private');
+    const privateHostKey = join(root, 'state', 'host-private');
+    try {
+      runFixture('safe', root);
+      configured = true;
+      runSshKeygen(privateAgentKey, 'ssh-mcp-agent');
+      const agentPublic = publicKeyParts(`${privateAgentKey}.pub`);
+      writeFileSync(join(root, 'keys', 'ssh-mcp-agent-ed25519.pub'), `${agentPublic.algorithm} ${agentPublic.encoded} ssh-mcp-agent\n`, 'utf8');
+      execFileSync('ssh-add.exe', [privateAgentKey], { stdio: 'pipe' });
+      runSshKeygen(privateHostKey, 'ssh-mcp-e2e-host');
+      const hostPublic = publicKeyParts(`${privateHostKey}.pub`);
+      const fixture = await listenLocalSshFixture(privateHostKey, agentPublic.data);
+      server = fixture.server;
+      const host = '127.0.0.1';
+      const hostFingerprint = fingerprint(`${privateHostKey}.pub`);
+      writeFileSync(
+        join(root, 'known-hosts', 'production-api.known_hosts'),
+        `[${host}]:${fixture.port} ${hostPublic.algorithm} ${hostPublic.encoded}\n${host} ${hostPublic.algorithm} ${hostPublic.encoded}\n`,
+        'utf8',
+      );
+      const baseRequest = {
+        profileId: 'production-api',
+        host,
+        port: fixture.port,
+        user: 'fixture-user',
+        expectedHostFingerprint: hostFingerprint,
+        command: 'printf',
+        args: ['ssh-mcp-e2e-success'],
+        timeoutMs: 5_000,
+        maxOutputBytes: 1_024,
+      };
+      const execute = async (
+        request: object,
+        signal?: AbortSignal,
+      ): Promise<{
+        readonly exitCode: number;
+        readonly stdout: string;
+        readonly stderr: string;
+      }> => {
+        const snapshot = testBinding.captureKnownHostsSnapshot('production-api');
+        const snapshotText = snapshot.bytes.toString('utf8');
+        assert.match(snapshotText, /(?:^|\n)\[127\.0\.0\.1\]:\d+ ssh-ed25519 /u, `known-hosts snapshot did not include 127.0.0.1: ${snapshotText}`);
+        try {
+          const prepared = testBinding.prepareAgentKeyReadiness(snapshot.capability);
+          assert.throws(() => writeFileSync(prepared.knownHostsPath, 'tampered\n', 'utf8'));
+          return (await testBinding.execute(snapshot.capability, request, signal)) as {
+            readonly exitCode: number;
+            readonly stdout: string;
+            readonly stderr: string;
+          };
+        } finally {
+          testBinding.disposeKnownHostsSnapshot(snapshot.capability);
+        }
+      };
+
+      const success = await execute(baseRequest);
+      assert.equal(success.exitCode, 0, success.stderr);
+      assert.match(success.stdout, /ssh-mcp-e2e-success/u);
+      await assert.rejects(
+        execute({ ...baseRequest, args: ['ssh-mcp-e2e-failure'] }),
+        (error: unknown) => (error as { code?: string }).code === 'remote-failure' || (error as { code?: string }).code === 'outcome-unknown',
+      );
+      await assert.rejects(
+        execute({ ...baseRequest, args: ['ssh-mcp-e2e-timeout'], timeoutMs: 250 }),
+        (error: unknown) => (error as { code?: string }).code === 'timeout',
+      );
+      const controller = new AbortController();
+      const cancelled = execute({ ...baseRequest, args: ['ssh-mcp-e2e-timeout'], timeoutMs: 5_000 }, controller.signal);
+      setTimeout(() => controller.abort(), 100).unref?.();
+      await assert.rejects(cancelled, (error: unknown) => (error as { code?: string }).code === 'cancelled');
+      await assert.rejects(
+        execute({ ...baseRequest, args: ['ssh-mcp-e2e-output'], maxOutputBytes: 32 }),
+        (error: unknown) => (error as { code?: string }).code === 'output-limit',
+      );
+      assert.equal(testBinding.testSnapshotArtifactCount(), 0);
+    } finally {
+      server?.close();
+      try {
+        execFileSync('ssh-add.exe', ['-d', privateAgentKey], { stdio: 'ignore' });
+      } catch {
+        // The fixture key may already have been removed by the runner.
+      }
+      if (configured) runFixture('cleanup', root);
     }
   });
 }

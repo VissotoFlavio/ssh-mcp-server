@@ -125,7 +125,7 @@ test('does not advertise validate_connection with an incomplete native storage b
   const tools = JSON.parse(String(response)) as { result: { tools: Array<{ name: string }> } };
   assert.deepEqual(
     tools.result.tools.map(({ name }) => name),
-    ['list_approved_profiles'],
+    ['list_approved_profiles', 'get_windows_readiness_status'],
   );
   input.end();
   await server;
@@ -142,7 +142,10 @@ test('keeps unsupported and unknown platforms fail closed', () => {
     composed += 1;
     return createWindowsRuntimeProviders({ listProfiles: () => [] });
   };
-  assert.deepEqual(createProductionRuntimeProviders('win32', false, factory), {});
+  const unsupportedWindows = createProductionRuntimeProviders('win32', false, factory);
+  assert.equal(unsupportedWindows.approvedProfileListingProvider, undefined);
+  assert.equal(unsupportedWindows.connectionValidationProvider, undefined);
+  assert.notEqual(unsupportedWindows.windowsReadinessStatusProvider, undefined);
   assert.deepEqual(createProductionRuntimeProviders('freebsd', true, factory), {});
   assert.equal(composed, 0);
 });
@@ -156,6 +159,161 @@ test('selects the injected Windows runtime only on a supported host', () => {
   });
   assert.equal(selected, expected);
   assert.equal(composed, 1);
+});
+
+test('passes the explicit human sudo approval boundary through production composition', () => {
+  let received: unknown;
+  const approval = { approve: async () => true };
+  const expected = createWindowsRuntimeProviders({ listProfiles: () => [] });
+  const selected = createProductionRuntimeProviders(
+    'win32',
+    true,
+    (injected) => {
+      received = injected;
+      return expected;
+    },
+    approval,
+  );
+  assert.equal(selected, expected);
+  assert.equal(received, approval);
+});
+
+test('wires the native Windows agent command through the immutable profile snapshot lease', async () => {
+  const profile = {
+    profileId: 'production-api',
+    host: 'private.example',
+    port: 22,
+    user: 'deploy',
+    authMode: 'agent-key' as const,
+    approvedKnownHostsReference: 'known-hosts://production-api',
+    expectedHostFingerprint: 'SHA256:1111111111111111111111111111111111111111111',
+  };
+  const events: string[] = [];
+  let nativeRequest: unknown;
+  const runtime = createWindowsRuntimeProviders(
+    {
+      listProfiles: () => [profile],
+      getProfile: () => profile,
+      captureKnownHostsSnapshot: () => {
+        events.push('capture');
+        return { bytes: Buffer.from('approved'), capability: { opaque: true } };
+      },
+      disposeKnownHostsSnapshot: () => {
+        events.push('dispose');
+      },
+      withKnownHostsSnapshot: async (_reference, work) => {
+        events.push('capture');
+        return work(Buffer.from('approved'), { opaque: true });
+      },
+      executeNativeAgentCommand: async (capability, request) => {
+        events.push(capability === undefined ? 'missing-capability' : 'execute');
+        nativeRequest = request;
+        return { exitCode: 0, stdout: 'ok', stderr: '', outputTruncated: false };
+      },
+      executionAuditJournal: {
+        async digestArguments() {
+          return '0000000000000000000000000000000000000000000000000000000000000000';
+        },
+        async begin() {
+          return { operationId: '0123456789abcdef0123456789abcdef', finish: async () => undefined };
+        },
+      },
+    },
+    {
+      validate: async () => undefined,
+      authorize: async () => ({
+        profile,
+        withTransportContext: async <T>(work: (context: object) => Promise<T>) => {
+          events.push('capture');
+          return work({ opaque: true });
+        },
+        release: async () => {
+          events.push('dispose');
+        },
+      }),
+    },
+  );
+  const result = await runtime.remoteCommandExecutionProvider!.execute({ profileId: 'production-api', command: 'id', args: [] });
+  assert.equal(result.code, 'success');
+  assert.deepEqual(events, ['capture', 'execute', 'dispose']);
+  assert.equal((nativeRequest as { profileId: string }).profileId, 'production-api');
+  assert.equal((nativeRequest as { host?: string }).host, 'private.example');
+});
+
+test('uses the immutable Windows authorization after the profile source changes', async () => {
+  const profile = {
+    profileId: 'production-api',
+    host: 'private.example',
+    port: 22,
+    user: 'deploy',
+    authMode: 'agent-key' as const,
+    approvedKnownHostsReference: 'known-hosts://production-api',
+    expectedHostFingerprint: 'SHA256:1111111111111111111111111111111111111111111',
+  };
+  let current = profile;
+  let nativeCalls = 0;
+  const runtime = createWindowsRuntimeProviders(
+    {
+      listProfiles: () => [current],
+      getProfile: () => current,
+      captureKnownHostsSnapshot: () => ({ bytes: Buffer.from('approved'), capability: {} }),
+      disposeKnownHostsSnapshot: () => undefined,
+      withKnownHostsSnapshot: async (_reference, work) => work(Buffer.from('approved'), {}),
+      executeNativeAgentCommand: async () => {
+        nativeCalls += 1;
+        return { exitCode: 0, stdout: 'unexpected', stderr: '', outputTruncated: false };
+      },
+      executionAuditJournal: {
+        async digestArguments() {
+          return '0000000000000000000000000000000000000000000000000000000000000000';
+        },
+        async begin() {
+          return { operationId: '0123456789abcdef0123456789abcdef', finish: async () => undefined };
+        },
+      },
+    },
+    {
+      validate: async () => {
+        current = { ...profile, host: 'changed.example' };
+      },
+      authorize: async () => {
+        const authorizedProfile = current;
+        current = { ...profile, host: 'changed.example' };
+        return {
+          profile: authorizedProfile,
+          withTransportContext: async <T>(work: (context: object) => Promise<T>) => work({}),
+          release: async () => undefined,
+        };
+      },
+    },
+  );
+  const result = await runtime.remoteCommandExecutionProvider!.execute({ profileId: profile.profileId, command: 'id', args: [] });
+  assert.equal(result.code, 'success');
+  assert.equal(nativeCalls, 1);
+});
+
+test('fails closed with an explicit audit code when Windows journal is unavailable', async () => {
+  const profile = {
+    profileId: 'production-api',
+    host: 'private.example',
+    port: 22,
+    user: 'deploy',
+    authMode: 'agent-key' as const,
+    approvedKnownHostsReference: 'known-hosts://production-api',
+    expectedHostFingerprint: 'SHA256:1111111111111111111111111111111111111111111',
+  };
+  const runtime = createWindowsRuntimeProviders(
+    {
+      listProfiles: () => [profile],
+      getProfile: () => profile,
+      captureKnownHostsSnapshot: () => ({ bytes: Buffer.from('approved'), capability: {} }),
+      disposeKnownHostsSnapshot: () => undefined,
+      withKnownHostsSnapshot: async (_reference, work) => work(Buffer.from('approved'), {}),
+    },
+    { validate: async () => undefined },
+  );
+  const result = await runtime.remoteCommandExecutionProvider!.execute({ profileId: profile.profileId, command: 'id', args: [] });
+  assert.equal(result.code, 'execution-audit-unavailable');
 });
 
 test('does not advertise tools when Windows runtime support is unavailable', async () => {
@@ -176,8 +334,11 @@ test('does not advertise tools when Windows runtime support is unavailable', asy
   const listed = once(output, 'data');
   input.write('{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n');
   const [response] = await listed;
-  const tools = JSON.parse(String(response)) as { result: { tools: unknown[] } };
-  assert.deepEqual(tools.result.tools, []);
+  const tools = JSON.parse(String(response)) as { result: { tools: Array<{ name: string }> } };
+  assert.deepEqual(
+    tools.result.tools.map((tool) => tool.name),
+    ['get_windows_readiness_status'],
+  );
   input.end();
   await server;
 });

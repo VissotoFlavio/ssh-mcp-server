@@ -78,9 +78,12 @@ Set-Content -LiteralPath (Join-Path $root '.ssh-mcp-fixture-owned') -Value $root
 $createdRoot = $true
 $state = Join-Path $root 'state'
 $knownHosts = if ($Mode -eq 'overlap') { $state } elseif ($Mode -eq 'dot-alias') { "$state\." } else { Join-Path $root 'known-hosts' }
+$keys = Join-Path $root 'keys'
 New-Item -ItemType Directory -Path $state -ErrorAction Stop | Out-Null
+New-Item -ItemType Directory -Path $keys -ErrorAction Stop | Out-Null
 if ($knownHosts -ne $state -and $Mode -ne 'dot-alias') { New-Item -ItemType Directory -Path $knownHosts -ErrorAction Stop | Out-Null }
 Set-PrivateAcl $state $true
+Set-PrivateAcl $keys $true
 if ($knownHosts -ne $state -and $Mode -ne 'dot-alias') { Set-PrivateAcl $knownHosts $true }
 $stateFile = Join-Path $state 'connection-profiles.json'
 Set-Content -LiteralPath $stateFile -Value '{"profiles":[]}' -Encoding utf8 -NoNewline
@@ -88,6 +91,9 @@ Set-PrivateAcl $stateFile $false
 $replacementFile = "$stateFile.replacement"
 Set-Content -LiteralPath $replacementFile -Value '{"profiles":[]}' -Encoding utf8 -NoNewline
 Set-PrivateAcl $replacementFile $false
+$publicKeyFile = Join-Path $keys 'ssh-mcp-agent-ed25519.pub'
+Set-Content -LiteralPath $publicKeyFile -Value 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItest ssh-mcp-agent' -Encoding utf8 -NoNewline
+Set-PrivateAcl $publicKeyFile $false
 $knownHostsFile = Join-Path $knownHosts 'production-api.known_hosts'
 if ($Mode -ne 'overlap' -and $Mode -ne 'dot-alias') {
   Set-Content -LiteralPath $knownHostsFile -Value 'example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItest' -Encoding utf8 -NoNewline

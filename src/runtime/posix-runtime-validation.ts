@@ -4,15 +4,26 @@ import { createHash } from 'node:crypto';
 import { chmod, lstat, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { posix as posixPath } from 'node:path';
 
+import { createPlatformCredentialStoreResolver } from '../credentials/credential-store.js';
+import { PosixExecutionAuditJournal, UnavailableExecutionAuditJournal, type ExecutionAuditJournal } from '../execution/execution-audit-journal.js';
+import {
+  createProfileExecutionAuthorizationProvider,
+  RemoteCommandExecutionProvider,
+  Ssh2RemoteCommandTransport,
+  type HumanSudoApprovalProvider,
+} from '../execution/remote-command-execution.js';
 import { HostIdentityCredentialPolicy, type AuthorizedConnection, type ConnectionProfile } from '../policy/host-identity-credential-policy.js';
 import { LocalConnectionProfileRegistry, type LocalProfileRegistry } from '../profiles/local-profile-registry.js';
 import {
   createTrustedConnectionValidationProvider,
   type ConnectionReadinessAdapter,
   type ConnectionValidationProvider,
+  type ValidatedConnectionAuthorization,
 } from '../validation/trusted-connection-validation.js';
 
 export const SSH_MCP_KNOWN_HOSTS_ROOT_ENV = 'SSH_MCP_KNOWN_HOSTS_ROOT';
+export const SSH_MCP_AUDIT_ROOT_ENV = 'SSH_MCP_AUDIT_ROOT';
+export const SSH_MCP_AUDIT_KEY_FILE_ENV = 'SSH_MCP_AUDIT_KEY_FILE';
 
 export interface PosixFileStats {
   readonly uid: number;
@@ -40,7 +51,7 @@ export interface BoundedCommandRunner {
 
 /** Test seam for ControlMaster lifecycle; native implementation is the default. */
 export interface PosixControlMaster {
-  validate(authorized: AuthorizedConnection, knownHostsPath: string, timeoutMs: number): Promise<void>;
+  validate(authorized: AuthorizedConnection, knownHostsPath: string, timeoutMs: number, signal?: AbortSignal): Promise<void>;
 }
 
 /** Minimal child seam used only to prove native master cleanup behavior. */
@@ -61,6 +72,8 @@ export interface PosixRuntimeValidationDependencies {
   readonly controlMaster?: PosixControlMaster;
   readonly profileRegistry?: Pick<LocalProfileRegistry, 'getProfile'>;
   readonly timeoutMs?: number;
+  readonly connectionValidationProvider?: ConnectionValidationProvider;
+  readonly auditJournal?: ExecutionAuditJournal;
 }
 
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -180,22 +193,44 @@ class KnownHostsSource {
   }
 
   async withSnapshot<T>(reference: string, work: (path: string, remainingMs: () => number) => Promise<T>, timeoutMs: number): Promise<T> {
-    const started = Date.now();
-    const root = await this.root.verify();
-    let directory: string | undefined;
+    const snapshot = await this.acquireSnapshot(reference, timeoutMs);
     try {
-      directory = await this.fileSystem.mkdtemp(posixPath.join(root, '.ssh-mcp-'));
+      return await work(snapshot.path, () => Math.max(0, timeoutMs - (Date.now() - snapshot.startedAt)));
+    } finally {
+      await snapshot.release();
+    }
+  }
+
+  async acquireSnapshot(
+    reference: string,
+    timeoutMs: number,
+  ): Promise<{ readonly path: string; readonly startedAt: number; readonly release: () => Promise<void> }> {
+    const startedAt = Date.now();
+    const root = await this.root.verify();
+    const directory = await this.fileSystem.mkdtemp(posixPath.join(root, '.ssh-mcp-'));
+    try {
       await this.fileSystem.chmod(directory, 0o700);
       const dirStats = await this.fileSystem.lstat(directory);
       if (!operatorOwned(dirStats, this.uid, true) || !beneath(root, directory) || (await this.fileSystem.realpath(directory)) !== directory)
         unavailable();
-      const snapshot = posixPath.join(directory, 'known_hosts');
-      await this.fileSystem.writeFile(snapshot, await this.read(reference), { encoding: 'utf8', flag: 'wx', mode: 0o600 });
-      const fileStats = await this.fileSystem.lstat(snapshot);
-      if (!operatorOwned(fileStats, this.uid, false) || (await this.fileSystem.realpath(snapshot)) !== snapshot) unavailable();
-      return await work(snapshot, () => Math.max(0, timeoutMs - (Date.now() - started)));
-    } finally {
-      if (directory !== undefined) await this.fileSystem.rm(directory, { recursive: true, force: true });
+      const path = posixPath.join(directory, 'known_hosts');
+      await this.fileSystem.writeFile(path, await this.read(reference), { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+      const fileStats = await this.fileSystem.lstat(path);
+      if (!operatorOwned(fileStats, this.uid, false) || (await this.fileSystem.realpath(path)) !== path) unavailable();
+      if (timeoutMs - (Date.now() - startedAt) <= 0) unavailable();
+      let released = false;
+      return {
+        path,
+        startedAt,
+        release: async () => {
+          if (released) return;
+          released = true;
+          await this.fileSystem.rm(directory, { recursive: true, force: true });
+        },
+      };
+    } catch (error) {
+      await this.fileSystem.rm(directory, { recursive: true, force: true });
+      throw error;
     }
   }
 
@@ -319,7 +354,7 @@ export class NativePosixControlMaster implements PosixControlMaster {
     private readonly spawnMaster: PosixControlMasterSpawner = nativeControlMasterSpawner,
   ) {}
 
-  async validate(authorized: AuthorizedConnection, knownHostsPath: string, timeoutMs: number): Promise<void> {
+  async validate(authorized: AuthorizedConnection, knownHostsPath: string, timeoutMs: number, signal?: AbortSignal): Promise<void> {
     const started = Date.now();
     const remaining = (): number => Math.max(0, timeoutMs - (Date.now() - started));
     const socketPath = posixPath.join(posixPath.dirname(knownHostsPath), 'control.sock');
@@ -333,7 +368,7 @@ export class NativePosixControlMaster implements PosixControlMaster {
       failed = true;
     });
     try {
-      while (!closed && !failed && remaining() > 0) {
+      while (!closed && !failed && !signal?.aborted && remaining() > 0) {
         try {
           const status = await this.commands.run(
             '/usr/bin/ssh',
@@ -345,6 +380,7 @@ export class NativePosixControlMaster implements PosixControlMaster {
           // The master may still be negotiating; its deadline remains authoritative.
         }
       }
+      if (signal?.aborted) unavailable();
       unavailable();
     } finally {
       const cleanup = Math.max(1, remaining());
@@ -388,17 +424,28 @@ class RuntimeReadinessAdapter implements ConnectionReadinessAdapter {
     private readonly timeoutMs: number,
   ) {}
 
-  async connect(authorized: AuthorizedConnection): Promise<void> {
+  async connect(authorized: AuthorizedConnection, signal?: AbortSignal): Promise<void> {
+    const authorization = await this.authorize(authorized, signal);
+    await authorization.release?.();
+  }
+
+  async authorize(authorized: AuthorizedConnection, signal?: AbortSignal): Promise<ValidatedConnectionAuthorization> {
+    if (signal?.aborted) unavailable();
     if (authorized.authentication.mode !== 'agent-key') unavailable();
-    await this.knownHosts.withSnapshot(
-      authorized.knownHostsReference,
-      async (snapshot, remainingMs) => {
-        const remaining = remainingMs();
-        if (remaining <= 0) unavailable();
-        await this.controlMaster.validate(authorized, snapshot, remaining);
-      },
-      remainingBudget(this.timeoutMs),
-    );
+    const lease = await this.knownHosts.acquireSnapshot(authorized.knownHostsReference, remainingBudget(this.timeoutMs));
+    try {
+      const remaining = Math.max(0, this.timeoutMs - (Date.now() - lease.startedAt));
+      if (remaining <= 0) unavailable();
+      await this.controlMaster.validate(authorized, lease.path, remaining, signal);
+      return {
+        profile: authorized.profile,
+        withTransportContext: async <T>(work: (context: object) => Promise<T>): Promise<T> => work({ knownHostsPath: lease.path }),
+        release: lease.release,
+      };
+    } catch (error) {
+      await lease.release();
+      throw error;
+    }
   }
 }
 
@@ -441,10 +488,62 @@ export function createRuntimeConnectionValidationProvider(dependencies: PosixRun
     readinessAdapter: new RuntimeReadinessAdapter(knownHosts, dependencies.controlMaster ?? new NativePosixControlMaster(commands), duration),
   });
   return {
-    validateConnection: async (input) =>
+    validateConnection: async (input, signal) =>
       validationDeadline.run(Date.now() + duration, async () => {
-        if (remainingBudget(duration) <= 0) unavailable();
-        return provider.validateConnection(input);
+        if (remainingBudget(duration) <= 0 || signal?.aborted) unavailable();
+        const result = await provider.validateConnection(input, signal);
+        if (signal?.aborted) unavailable();
+        return result;
+      }),
+    authorizeExecution: async (input, signal) =>
+      validationDeadline.run(Date.now() + duration, async () => {
+        if (remainingBudget(duration) <= 0 || signal?.aborted) unavailable();
+        const authorization = provider.authorizeExecution;
+        if (authorization === undefined) unavailable();
+        const result = await authorization(input, signal);
+        if (signal?.aborted) unavailable();
+        return result;
       }),
   };
+}
+
+/**
+ * Production remote execution composition for POSIX. It reuses the same
+ * profile registry and validation boundary as readiness checks; the SSH2
+ * transport receives only the validated profile and never local shell input.
+ */
+export function createRuntimeRemoteCommandExecutionProvider(
+  dependencies: PosixRuntimeValidationDependencies = {},
+  humanApproval?: HumanSudoApprovalProvider,
+): RemoteCommandExecutionProvider {
+  const environment = dependencies.environment ?? process.env;
+  const platform = dependencies.platform ?? process.platform;
+  const uid = dependencies.uid ?? process.getuid?.();
+  if ((platform !== 'linux' && platform !== 'darwin') || uid === undefined) unavailable();
+  const stateRoot = environment.SSH_MCP_STATE_ROOT;
+  if (stateRoot === undefined) unavailable();
+  const registry = dependencies.profileRegistry ?? new LocalConnectionProfileRegistry({ stateRoot, operatorUid: uid });
+  const validationProvider = dependencies.connectionValidationProvider ?? createRuntimeConnectionValidationProvider(dependencies);
+  const credentials = {
+    async getPassword(reference: string) {
+      const resolver = createPlatformCredentialStoreResolver({ platform, approvedReferences: [reference] });
+      const store = resolver.resolve(reference);
+      return store.getPassword(reference as Parameters<typeof store.getPassword>[0]);
+    },
+  };
+  const auditRoot = environment[SSH_MCP_AUDIT_ROOT_ENV];
+  const auditKeyFile = environment[SSH_MCP_AUDIT_KEY_FILE_ENV];
+  const auditJournal =
+    dependencies.auditJournal ??
+    (auditRoot !== undefined && auditKeyFile !== undefined
+      ? new PosixExecutionAuditJournal({ root: auditRoot, keyFile: auditKeyFile, uid })
+      : new UnavailableExecutionAuditJournal());
+  return new RemoteCommandExecutionProvider({
+    profiles: registry,
+    connectionValidation: validationProvider,
+    transport: new Ssh2RemoteCommandTransport(credentials, environment.SSH_AUTH_SOCK),
+    auditJournal,
+    authorizationProvider: createProfileExecutionAuthorizationProvider(validationProvider),
+    humanApproval,
+  });
 }

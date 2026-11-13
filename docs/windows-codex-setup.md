@@ -69,113 +69,67 @@ invitation to pass hosts, credentials, paths, or commands to the MCP server.
    addons. If the build or runtime support gate fails, stop and fix that local
    prerequisite; do not use WSL, a POSIX fallback, `PATH`, or a copied binary.
 
-## Create per-user approved state
+## Provision one per-user approved profile
 
-Use local NTFS directories owned by the current user. The recommended layout
-is below the current user's Local AppData directory; it is not a shared or
-machine-wide location.
+Use the repository's [Windows provisioning helper](../scripts/windows/provision-approved-profile.ps1)
+to create exactly one approved profile, its known-hosts leaf, the fixed roots,
+and the protected registry values. It is deliberately fail-closed: it accepts
+only the fixed LocalAppData and HKCU locations, rejects an existing leaf or
+root configuration instead of replacing it, and makes no network or SSH
+connection. Run it only from the intended user's normal, non-administrative
+PowerShell session.
 
-```powershell
-$root = Join-Path $env:LOCALAPPDATA 'Vissoto\ssh-mcp-server'
-$stateRoot = Join-Path $root 'state'
-$knownHostsRoot = Join-Path $root 'known-hosts'
-New-Item -ItemType Directory -Force $stateRoot, $knownHostsRoot | Out-Null
+Before running it, obtain one complete OpenSSH known-hosts line and its
+SHA-256 fingerprint from independently approved operator material. The line
+must name the configured host exactly (or `[host]:port` for a non-22 port).
+The helper calculates the SHA-256 fingerprint from the decoded public-key
+bytes and compares it before anything is written. Never use `ssh-keyscan`, an
+interactive first-connection prompt, or TOFU to obtain this material.
 
-Import-Module Microsoft.PowerShell.Security -ErrorAction Stop
-$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-
-function Set-PrivateFileAcl([string]$Path, [bool]$Directory) {
-  $acl = Get-Acl -LiteralPath $Path
-  $acl.SetAccessRuleProtection($true, $false)
-  $acl.SetOwner($sid)
-  $inheritance = if ($Directory) {
-    [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
-  } else {
-    [System.Security.AccessControl.InheritanceFlags]::None
-  }
-  $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
-    $sid,
-    [System.Security.AccessControl.FileSystemRights]::FullControl,
-    $inheritance,
-    [System.Security.AccessControl.PropagationFlags]::None,
-    [System.Security.AccessControl.AccessControlType]::Allow
-  )
-  $acl.SetAccessRule($rule)
-  Set-Acl -LiteralPath $Path -AclObject $acl
-}
-
-Set-PrivateFileAcl $stateRoot $true
-Set-PrivateFileAcl $knownHostsRoot $true
-
-$keyPath = 'Software\Vissoto\ssh-mcp-server'
-$key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($keyPath, $true)
-try {
-  $key.SetValue('StateRoot', $stateRoot, [Microsoft.Win32.RegistryValueKind]::String)
-  $key.SetValue('KnownHostsRoot', $knownHostsRoot, [Microsoft.Win32.RegistryValueKind]::String)
-  $acl = [System.Security.AccessControl.RegistrySecurity]::new()
-  $acl.SetOwner($sid)
-  $acl.SetAccessRuleProtection($true, $false)
-  $acl.SetAccessRule([System.Security.AccessControl.RegistryAccessRule]::new(
-    $sid,
-    [System.Security.AccessControl.RegistryRights]::FullControl,
-    [System.Security.AccessControl.AccessControlType]::Allow
-  ))
-  $key.SetAccessControl($acl)
-} finally {
-  $key.Close()
-}
-```
-
-These are the only Windows root locations read by the native boundary:
-`HKCU\Software\Vissoto\ssh-mcp-server\StateRoot` and `KnownHostsRoot`.
-Environment variables, command-line arguments, the current directory, and
-other registry values cannot replace them. The native boundary verifies the
-registry key, both roots, and the files it reads. It refuses unsafe ownership,
-DACLs, reparse points, non-NTFS locations, network paths, and ambiguous state.
-The procedure above deliberately makes each terminal root and the configuration
-key current-user-owned with a protected DACL, not an inherited or broad DACL.
-It is the same narrowly scoped ACL shape exercised by the native storage test
-fixture. Run it in the intended user's normal PowerShell session; do not relax
-permissions or grant access to a group to make a rejected location work.
-
-Create exactly one `connection-profiles.json` file in `StateRoot`. It contains
-connection metadata, never a private key, password, passphrase, token, or
-host-key material. This intentionally non-working template shows the required
-shape without a real destination:
-
-```json
-{
-  "profiles": [
-    {
-      "profileId": "example-service",
-      "host": "approved.example.invalid",
-      "port": 22,
-      "user": "example-user",
-      "expectedHostFingerprint": "SHA256:REPLACE_WITH_APPROVED_FINGERPRINT",
-      "authMode": "agent-key",
-      "approvedKnownHostsReference": "known-hosts://example-service"
-    }
-  ]
-}
-```
-
-For this profile, create `KnownHostsRoot\example-service.known_hosts`. Obtain
-its host key and SHA-256 fingerprint from an independently approved operator
-source, verify the two agree, and record the approved public host-key entry in
-that file. Do not approve a key from an interactive first connection prompt or
-copy a known-hosts file from an untrusted profile.
-
-Immediately after creating or replacing either leaf, protect it before starting
-Codex or the MCP server:
+From the trusted checkout, run one of the following illustrative commands
+(replace every placeholder locally; do not place a password, passphrase,
+private key, token, or other secret in the command):
 
 ```powershell
-Set-PrivateFileAcl (Join-Path $stateRoot 'connection-profiles.json') $false
-Set-PrivateFileAcl (Join-Path $knownHostsRoot 'example-service.known_hosts') $false
+& .\scripts\windows\provision-approved-profile.ps1 `
+  -ProfileId 'example-service' `
+  -TargetHost 'approved.example.invalid' `
+  -Port 22 `
+  -User 'example-user' `
+  -AuthMode 'agent-key' `
+  -ExpectedHostFingerprint 'SHA256:REPLACE_WITH_APPROVED_FINGERPRINT' `
+  -HostKeyLine 'approved.example.invalid ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIREPLACE_WITH_APPROVED_KEY'
 ```
 
-If either ACL operation or the later MCP call fails, stop and diagnose the
-current-user ownership, protected DACL, local NTFS location, and reparse-point
-status. Never weaken the ACL or substitute a shared location.
+For a password profile, pass `-AuthMode 'password'` and a non-secret opaque
+`-CredentialLocator` that meets the helper's stated grammar. After it
+completes, create the matching **Windows Generic Credential** manually in the
+current user's Credential Manager UI with target name
+`Vissoto/ssh-mcp-server/<opaque-locator>`, then enter the password only in
+that UI. Do not use a command line, environment variable, profile JSON, or
+Codex configuration for the password.
+
+If the helper stops after creating partial local state, it intentionally does
+not delete or overwrite anything. Do not relax ACLs or attempt cleanup just to
+retry. Inspect the current-user owner, protected DACL, local NTFS location,
+and reparse-point status; remove only the specifically identified partial
+state with the environment owner's explicit authorization, then start again.
+
+### Recovery is inspection-only
+
+The helper intentionally refuses all existing provisioning roots, profile
+leaves, and configuration keys. Do not create, edit, replace, or re-ACL state
+by hand to retry it. The native boundary reads only
+`HKCU\Software\Vissoto\ssh-mcp-server\StateRoot` and `KnownHostsRoot`; it
+rejects unsafe ownership, DACLs, reparse points, non-NTFS locations, network
+paths, and ambiguous state.
+
+For a failed attempt, inspect only the named local paths and the current-user
+registry key with your approved Windows administration procedure. Record the
+failure category without copying hosts, profile IDs, credential references,
+paths, keys, or secrets into support material. Any deletion or repair is a
+separate environment-owner decision; after that decision, rerun the helper
+from a clean state rather than hand-authoring configuration JSON or ACLs.
 
 ## Configure an agent-key identity
 
@@ -185,38 +139,13 @@ key from an elevated Codex session and then attempt to use it from a normal
 session: the owner or DACL can differ, and the MCP must fail closed instead of
 relaxing the ACL.
 
-Create a dedicated private key beneath the already private per-user root. The
-following command intentionally prompts for a passphrase without placing it on
-a command line. If local policy explicitly permits a passphrase-free key for
-unattended agent loading, use the corresponding OpenSSH option only after
-ensuring the private-key ACL remains restricted to the current user.
+This helper does not create, import, or store private keys. An `agent-key`
+profile requires an identity already authorized by the environment owner and
+loaded into the same current-user OpenSSH agent that the MCP will probe. Inspect
+that agent with the fixed system executable:
 
 ```powershell
-$keyRoot = Join-Path $root 'keys'
-New-Item -ItemType Directory -Force $keyRoot | Out-Null
-Set-PrivateFileAcl $keyRoot $true
-
-$keyPath = Join-Path $keyRoot 'ssh-mcp-agent-ed25519'
-if (Test-Path -LiteralPath $keyPath) {
-  throw 'Refusing to overwrite an existing MCP agent key.'
-}
-
-& (Join-Path $openSsh 'ssh-keygen.exe') -t ed25519 -a 64 -f $keyPath -C 'ssh-mcp-agent'
-Set-PrivateFileAcl $keyPath $false
-Set-PrivateFileAcl "$keyPath.pub" $false
-```
-
-The public key may be added to the intended account's `authorized_keys` only
-with explicit authorization from that environment's owner. Never copy, upload,
-or record the private key, passphrase, key path, or a public-key fingerprint in
-an MCP profile, Codex configuration, pull request, issue, or support record.
-
-Load the key only into the same current-user OpenSSH agent that the MCP will
-probe:
-
-```powershell
-& (Join-Path $openSsh 'ssh-add.exe') $keyPath
-& (Join-Path $openSsh 'ssh-add.exe') -l
+& (Join-Path ([System.Environment]::SystemDirectory) 'OpenSSH\ssh-add.exe') -l
 ```
 
 Keep the second command's identity output local; it is a readiness check, not
@@ -224,11 +153,9 @@ evidence to paste into a ticket. If the agent service is disabled or unavailable
 have the device administrator enable the supported Windows OpenSSH service.
 Do not run Codex or the MCP elevated as a workaround.
 
-Before adding an `agent-key` profile, obtain the target host key and SHA-256
-fingerprint out of band, populate the approved known-hosts entry, and verify
-the profile's host identity matches it. The profile contains only connection
-metadata and an approved known-hosts reference; it contains no private-key
-path, passphrase, or secret.
+Before provisioning an `agent-key` profile, obtain the target host key and
+SHA-256 fingerprint out of band. The helper validates and records them; never
+hand-author the profile or known-hosts files.
 
 See the [agent-key troubleshooting runbook](windows/agent-key-troubleshooting.md)
 for fail-closed ownership, agent identity, remote authorization, and timeout
@@ -261,6 +188,10 @@ user's Windows Credential Manager with target name
 `Vissoto/ssh-mcp-server/<opaque-locator>`. Enter the secret in the Credential
 Manager UI; never use a command line, environment variable, profile JSON, or
 Codex configuration for it.
+
+For the category-by-category recovery path, see the [password-profile
+troubleshooting runbook](windows/password-profile-troubleshooting.md). Host
+identity is verified before the password provider is read.
 
 ## Register the stdio server with Codex
 
