@@ -7,6 +7,9 @@ publish a release.
 
 ### Fixed
 
+- Windows package-candidate inspection now admits only the native Windows
+  runtime boundary, approval broker, and required operator assets; it excludes
+  the POSIX native addon and CI-only scripts.
 - Windows `ssh-mcp-approver` now keeps its named-pipe request open through the
   authenticated response and accepts a complete verified response when Windows
   reports `EPIPE` during the broker's normal close. Added a non-packaged native

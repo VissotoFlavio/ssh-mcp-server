@@ -6,12 +6,13 @@
     "dist",
     "build/Release/windows_trust.node",
     "build/Release/ssh-mcp-approver.exe",
-    "build/Release/posix_peer_credentials.node",
     "README.md",
     "CHANGELOG.md",
     "docs",
     "skills",
-    "scripts"
+    "scripts/windows-approver.mjs",
+    "scripts/windows-audit-journal.mjs",
+    "scripts/windows"
   ],
   "description": "Secure MCP server for approved SSH profile discovery, validation, and bounded remote command execution without agent-supplied credentials.",
   "type": "module",
