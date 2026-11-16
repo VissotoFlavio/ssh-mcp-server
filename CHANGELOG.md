@@ -5,6 +5,8 @@ publish a release.
 
 ## Unreleased
 
+## [1.0.1] - 2026-11-16
+
 ### Changed
 
 - Aligned README, POSIX and Windows operator guides, trust-model documentation,
