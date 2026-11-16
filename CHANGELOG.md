@@ -23,6 +23,8 @@ publish a release.
   authorization. The operator documentation now includes complete readiness,
   execution, and request-bound approval examples with fictitious values.
 
+## [1.0.0] - 2026-11-12
+
 ### Fixed
 
 - Windows package-candidate inspection now admits only the native Windows
