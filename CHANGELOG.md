@@ -5,6 +5,8 @@ publish a release.
 
 ## Unreleased
 
+## [1.1.0] - 2026-11-16
+
 ### Changed
 
 - Removed the remote executable and argument-shape allowlists from the
