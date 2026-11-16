@@ -1,5 +1,7 @@
 # ssh-mcp-server
 
+![SSH MCP workflow](assets/ssh_mcp_workflow.png)
+
 Policy-driven SSH profile discovery, connection validation, and bounded remote
 command execution for AI agents—without agent-supplied credentials.
 
