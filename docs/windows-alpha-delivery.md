@@ -2,8 +2,8 @@
 
 ## Status
 
-This is an internal delivery-preparation record. It does not create, assign,
-or publish an npm package or stable release, and it does not authorize public
+This is an internal delivery-preparation record for the native Windows alpha.
+It does not itself create or publish an npm package, or authorize public
 distribution, deployment, or announcement. The authorized candidate workflow
 may generate internal Windows packages in a GitHub prerelease linked to the
 pull request's immutable head SHA.
@@ -16,11 +16,11 @@ and native-boundary condition must leave validation unavailable.
 
 ## Distribution decision
 
-The current alpha has no npm publication, stable release, or public package
-distribution. An authorized candidate workflow may attach internal Windows
-package assets to a GitHub prerelease bound to an immutable pull-request SHA;
-that prerelease is not a stable release or public distribution. Do not copy a
-build artifact into another environment as a substitute for a trusted build.
+The current alpha has no npm publication or public package distribution. An
+authorized candidate workflow may attach internal Windows package assets to a
+GitHub prerelease bound to an immutable pull-request SHA; that prerelease is
+not public distribution. Do not copy a build artifact into another environment
+as a substitute for a trusted build.
 
 No license is selected by this preparation work. Distribution beyond the
 repository's existing access controls requires separate legal direction and a
@@ -98,4 +98,4 @@ subject to protection, force-push and deletion are disabled, and conversation
 resolution is required. Changes reach `master` only through a reviewed pull
 request after the required checks pass.
 
-This preparation does not merge any pull request or publish any artifact.
+This release boundary does not authorize package or binary publication.
