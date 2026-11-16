@@ -1,4 +1,4 @@
-# ssh-mcp-server
+# SSH MCP Server
 
 ![SSH MCP workflow](assets/ssh_mcp_workflow.png)
 
