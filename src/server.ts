@@ -38,7 +38,7 @@ import { supportsWindowsAlphaRuntime } from './windows/windows-runtime-support.j
 import { createWindowsRuntimeProviders } from './windows/windows-runtime.js';
 
 export const serverName = 'ssh-mcp-server';
-export const serverVersion = '1.0.0';
+export const serverVersion = '1.0.1';
 export const listApprovedProfilesToolName = 'list_approved_profiles';
 export const validateConnectionToolName = 'validate_connection';
 export const getWindowsReadinessStatusToolName = 'get_windows_readiness_status';
@@ -46,15 +46,159 @@ export const getWindowsReadinessStatusToolName = 'get_windows_readiness_status';
 const LIST_APPROVED_PROFILES_DESCRIPTION =
   'Lists operator-approved profile IDs only. Use an ID returned here for validation; connection, credential, and host details are never disclosed.';
 const VALIDATE_CONNECTION_DESCRIPTION =
-  'Checks readiness for one operator-approved SSH profile ID. Use only a discovered or explicitly authorized ID; it accepts no commands, connection settings, credentials, or paths.';
+  'Checks readiness for one operator-approved SSH profile ID through the external SSH endpoint. It may perform authentication readiness checks and emit local audit records, but it executes no remote command and accepts no connection settings, credentials, or paths.';
 const WINDOWS_READINESS_STATUS_DESCRIPTION =
   'Reports bounded local Windows readiness categories only. It accepts no connection settings, profile IDs, credentials, paths, or commands and never contacts a remote host.';
 const REMOTE_COMMAND_DESCRIPTION =
-  'Executes one bounded non-interactive command on an approved SSH profile. This modifies remote state, requires confirmation for destructive or sudo commands, and supports no persistent shell, file transfer, or port forwarding.';
+  "Executes one bounded non-interactive command on an approved SSH profile. Recognized privilege-escalation executables require request-bound human approval; other commands use the remote account's existing permissions and may modify remote state without an additional server approval gate. Supports no persistent shell, file transfer, or port forwarding.";
 const SUDO_APPROVAL_DESCRIPTION =
   'Requests a one-time human approval for one exact sudo command. Approval is request-bound, expires quickly, and cannot be supplied as a caller boolean.';
 const SAFE_PROFILE_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
 const MAX_DISCOVERABLE_PROFILES = 256;
+
+const LIST_APPROVED_PROFILES_OUTPUT_SCHEMA = {
+  type: 'object',
+  properties: {
+    profiles: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          profileId: { type: 'string', pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$' },
+          classification: { type: 'string', enum: [APPROVED_PROFILE_CLASSIFICATION] },
+        },
+        required: ['profileId', 'classification'],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ['profiles'],
+  additionalProperties: false,
+};
+
+const WINDOWS_READINESS_STATUS_OUTPUT_SCHEMA = {
+  type: 'object',
+  properties: {
+    kind: { type: 'string', enum: [WINDOWS_READINESS_STATUS_KIND] },
+    version: { type: 'integer', enum: [WINDOWS_READINESS_STATUS_VERSION] },
+    runtime: { type: 'string', enum: ['ready', 'unsupported'] },
+    registry: { type: 'string', enum: ['ready', 'unavailable', 'invalid', 'not-checked'] },
+    filesystem: { type: 'string', enum: ['ready', 'unavailable', 'invalid', 'not-checked'] },
+    configuration: { type: 'string', enum: ['ready', 'unavailable', 'invalid', 'not-checked'] },
+    knownHosts: { type: 'string', enum: ['ready', 'unavailable', 'invalid', 'not-checked'] },
+    credentials: { type: 'string', enum: ['ready', 'unavailable', 'not-checked'] },
+    validationProvider: { type: 'string', enum: ['ready', 'unavailable', 'invalid', 'not-checked'] },
+    remoteAuthentication: { type: 'string', enum: ['not-checked'] },
+  },
+  required: [
+    'kind',
+    'version',
+    'runtime',
+    'registry',
+    'filesystem',
+    'configuration',
+    'knownHosts',
+    'credentials',
+    'validationProvider',
+    'remoteAuthentication',
+  ],
+  additionalProperties: false,
+};
+
+const VALIDATE_CONNECTION_OUTPUT_SCHEMA = {
+  type: 'object',
+  properties: {
+    profileId: { type: 'string', pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$' },
+    ready: { type: 'boolean' },
+    outcome: { type: 'string', enum: ['success', 'failure', 'timeout'] },
+    code: {
+      type: 'string',
+      enum: [
+        'success',
+        'unknown',
+        'invalid-input',
+        'provider-failure',
+        'timeout',
+        'host-key-failure',
+        'authentication-failure',
+        'connection-failure',
+      ],
+    },
+  },
+  oneOf: [
+    { required: ['profileId', 'ready'], properties: { ready: { const: true } } },
+    { required: ['ready', 'outcome', 'code'], properties: { ready: { const: false } } },
+  ],
+  additionalProperties: false,
+};
+
+const REMOTE_COMMAND_OUTPUT_SCHEMA = {
+  type: 'object',
+  properties: {
+    operationId: { type: 'string', pattern: '^[a-f0-9]{32}$' },
+    profileId: { type: 'string', pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$' },
+    outcome: { type: 'string', enum: ['success', 'failure', 'timeout', 'cancelled', 'approval-required', 'unknown'] },
+    code: {
+      type: 'string',
+      enum: [
+        'success',
+        'remote-failure',
+        'connection-failure',
+        'authentication-failure',
+        'host-key-failure',
+        'windows-agent-key-unsupported',
+        'timeout',
+        'cancelled',
+        'approval-required',
+        'approval-expired',
+        'approval-altered',
+        'approval-reused',
+        'approval-unavailable',
+        'approval-busy',
+        'approval-rejected',
+        'execution-limit',
+        'execution-audit-unavailable',
+        'outcome-unknown',
+        'invalid-input',
+        'provider-failure',
+      ],
+    },
+    exitCode: { type: ['integer', 'null'] },
+    stdout: { type: 'string' },
+    stderr: { type: 'string' },
+    outputTruncated: { type: 'boolean' },
+  },
+  required: ['operationId', 'profileId', 'outcome', 'code', 'exitCode', 'stdout', 'stderr', 'outputTruncated'],
+  additionalProperties: false,
+};
+
+const SUDO_APPROVAL_OUTPUT_SCHEMA = {
+  type: 'object',
+  properties: {
+    approved: { type: 'boolean' },
+    code: {
+      type: 'string',
+      enum: ['approved', 'approval-unavailable', 'approval-rejected', 'approval-busy', 'cancelled', 'invalid-input', 'provider-failure'],
+    },
+    operationId: { type: 'string', pattern: '^[a-f0-9]{32}$' },
+    capability: { type: 'string', maxLength: 256 },
+  },
+  oneOf: [
+    {
+      required: ['approved', 'code', 'operationId', 'capability'],
+      properties: { approved: { const: true }, code: { const: 'approved' } },
+    },
+    {
+      required: ['approved', 'code'],
+      properties: {
+        approved: { const: false },
+        code: { enum: ['approval-unavailable', 'approval-rejected', 'approval-busy', 'cancelled', 'invalid-input', 'provider-failure'] },
+      },
+      not: { required: ['capability'] },
+    },
+  ],
+  additionalProperties: false,
+};
 
 export interface ServerOptions {
   /** Trusted provider that exposes only minimized, approved profile summaries. */
@@ -177,14 +321,21 @@ function toSafeProfileResponse(profiles: unknown): {
 function textToolResult(
   text: string,
   isError = false,
+  structuredContent?: Readonly<Record<string, unknown>>,
 ): {
   readonly content: readonly [{ readonly type: 'text'; readonly text: string }];
+  readonly structuredContent?: Readonly<Record<string, unknown>>;
   readonly isError?: boolean;
 } {
   return {
     content: [{ type: 'text', text }],
+    ...(structuredContent === undefined ? {} : { structuredContent }),
     ...(isError ? { isError: true } : {}),
   };
+}
+
+function jsonToolResult(value: object, isError = false): ReturnType<typeof textToolResult> {
+  return textToolResult(JSON.stringify(value), isError, value as Readonly<Record<string, unknown>>);
 }
 
 function unavailableDiscoveryResult(): ReturnType<typeof textToolResult> {
@@ -195,12 +346,13 @@ function unavailableWindowsReadinessStatusResult(): ReturnType<typeof textToolRe
   return textToolResult('Windows readiness status is unavailable.', true);
 }
 
-function validationResult(outcome: unknown, isError = false): ReturnType<typeof textToolResult> {
-  return textToolResult(JSON.stringify(outcome), isError);
+function validationResult(outcome: object, isError = false): ReturnType<typeof textToolResult> {
+  return jsonToolResult(outcome, isError);
 }
 
 function remoteResult(result: RemoteCommandResult): ReturnType<typeof textToolResult> {
-  return textToolResult(JSON.stringify(result), result.outcome !== 'success' && result.outcome !== 'approval-required');
+  const structuredResult = { ...result, operationId: result.operationId };
+  return textToolResult(JSON.stringify(result), result.outcome !== 'success' && result.outcome !== 'approval-required', structuredResult);
 }
 
 function unavailableConnectionValidationResult(): ReturnType<typeof textToolResult> {
@@ -337,6 +489,8 @@ function registerTools(
             {
               name: listApprovedProfilesToolName,
               description: LIST_APPROVED_PROFILES_DESCRIPTION,
+              outputSchema: LIST_APPROVED_PROFILES_OUTPUT_SCHEMA,
+              annotations: { readOnlyHint: true, openWorldHint: false },
               inputSchema: {
                 type: 'object',
                 properties: {},
@@ -350,6 +504,8 @@ function registerTools(
             {
               name: validateConnectionToolName,
               description: VALIDATE_CONNECTION_DESCRIPTION,
+              outputSchema: VALIDATE_CONNECTION_OUTPUT_SCHEMA,
+              annotations: { readOnlyHint: true, openWorldHint: true },
               inputSchema: {
                 type: 'object',
                 properties: { profileId: { type: 'string', pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$' } },
@@ -364,6 +520,8 @@ function registerTools(
             {
               name: getWindowsReadinessStatusToolName,
               description: WINDOWS_READINESS_STATUS_DESCRIPTION,
+              outputSchema: WINDOWS_READINESS_STATUS_OUTPUT_SCHEMA,
+              annotations: { readOnlyHint: true, openWorldHint: false },
               inputSchema: {
                 type: 'object',
                 properties: {},
@@ -377,6 +535,7 @@ function registerTools(
             {
               name: remoteCommandToolName,
               description: REMOTE_COMMAND_DESCRIPTION,
+              outputSchema: REMOTE_COMMAND_OUTPUT_SCHEMA,
               annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
               inputSchema: {
                 type: 'object',
@@ -395,6 +554,7 @@ function registerTools(
             {
               name: requestSudoApprovalToolName,
               description: SUDO_APPROVAL_DESCRIPTION,
+              outputSchema: SUDO_APPROVAL_OUTPUT_SCHEMA,
               annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
               inputSchema: {
                 type: 'object',
@@ -420,7 +580,7 @@ function registerTools(
       }
       try {
         const profiles = await approvedProfileListingProvider.listApprovedProfiles();
-        return textToolResult(JSON.stringify(toSafeProfileResponse(profiles)));
+        return jsonToolResult(toSafeProfileResponse(profiles));
       } catch {
         // Provider failures and malformed provider output stay inside the trusted boundary.
         return unavailableDiscoveryResult();
@@ -432,20 +592,19 @@ function registerTools(
         return unavailableWindowsReadinessStatusResult();
       }
       try {
-        return textToolResult(JSON.stringify(safeWindowsReadinessStatus(await windowsReadinessStatusProvider.getWindowsReadinessStatus())));
+        return jsonToolResult(safeWindowsReadinessStatus(await windowsReadinessStatusProvider.getWindowsReadinessStatus()));
       } catch {
         return unavailableWindowsReadinessStatusResult();
       }
     }
 
     if (request.params.name === requestSudoApprovalToolName) {
-      if (configuredRemoteCommandExecutionProvider === undefined)
-        return textToolResult(JSON.stringify({ approved: false, code: 'provider-failure' }), true);
+      if (configuredRemoteCommandExecutionProvider === undefined) return jsonToolResult({ approved: false, code: 'provider-failure' }, true);
       try {
         const approval = await configuredRemoteCommandExecutionProvider.requestSudoApproval(request.params.arguments, extra.signal);
-        return textToolResult(JSON.stringify(approval), approval.approved !== true);
+        return jsonToolResult(approval, approval.approved !== true);
       } catch {
-        return textToolResult(JSON.stringify({ approved: false, code: 'invalid-input' }), true);
+        return jsonToolResult({ approved: false, code: 'invalid-input' }, true);
       }
     }
 

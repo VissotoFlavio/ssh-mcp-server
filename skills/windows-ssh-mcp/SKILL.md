@@ -6,9 +6,10 @@ description: Safely discover and validate operator-approved Windows SSH MCP prof
 # Windows SSH MCP safe operation
 
 Use this skill only for local discovery, redacted Windows readiness diagnosis,
-and readiness validation of an already approved profile. Readiness is not
-authorization to run a remote command, open a shell, transfer a file, deploy,
-change a VPS, or alter any remote state.
+and readiness validation of an already approved profile. The runtime may
+advertise separate bounded execution tools, but this skill must not call them.
+Readiness is not authorization to run a remote command, open a shell, transfer
+a file, deploy, change a VPS, or alter any remote state.
 
 ## Allowed MCP calls
 

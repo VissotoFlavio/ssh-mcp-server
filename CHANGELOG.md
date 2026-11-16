@@ -5,6 +5,24 @@ publish a release.
 
 ## Unreleased
 
+## [1.0.1] - 2026-11-16
+
+### Changed
+
+- Aligned README, POSIX and Windows operator guides, trust-model documentation,
+  and the Windows readiness-only skill with bounded remote execution,
+  conditional tool availability, mandatory audit setup, and request-bound
+  privilege-escalation approval. Documentation now states that mutating
+  commands without recognized privilege escalation may run with the remote
+  account's existing permissions and do not receive an additional mandatory
+  MCP approval gate.
+- Added output schemas and backward-compatible `structuredContent` responses
+  for the five MCP tools while preserving existing text content and
+  text-only availability errors. Added conservative advisory tool annotations
+  and MCP SDK 1.x interoperability coverage; annotations do not enforce
+  authorization. The operator documentation now includes complete readiness,
+  execution, and request-bound approval examples with fictitious values.
+
 ## [1.0.0] - 2026-11-12
 
 ### Fixed

@@ -3,10 +3,18 @@
 ## Status and support boundary
 
 This document is the authoritative security model for the native Windows
-runtime included in `v1.0.0`. It is a design boundary, not a claim that the
-current POSIX runtime supports Windows. Production remote execution is
-available only when the trusted native audit-journal provider is installed and
-injected.
+runtime included in `v1.0.1`. It is a design boundary, not a claim that the
+current POSIX runtime supports Windows. The repository includes the selected
+`build/Release/windows_trust.node` native binding for protected storage,
+trusted executable resolution, known-host snapshots, native agent-key command
+execution, and the Windows execution-audit provider. The runtime still fails
+closed when that binding, its supported platform envelope, provider
+composition, or the initialized audit journal is unavailable. When execution
+is advertised, it remains bounded, non-interactive, and subject to the same
+approved-profile, host-identity, audit, and privilege-escalation approval
+boundaries described here.
+Production remote execution is available only when the trusted native
+audit-journal provider is installed and injected.
 
 The Windows runtime is **per-user only**. It never requires elevation, reads
 no machine-wide configuration, and never shares approved profile or
@@ -67,9 +75,9 @@ they do not expose SIDs, DACLs, reparse tags, handle identity, or an
 open-by-handle no-follow guarantee. In particular, POSIX UID/mode checks and
 `O_NOFOLLOW` must not be reused as Windows security checks.
 
-Windows storage and executable trust therefore require a small, audited native
-Win32 boundary. It must operate on handles and expose only allowlisted results
-to TypeScript. The boundary is responsible for:
+Windows storage and executable trust therefore use the selected, audited
+`windows_trust.node` Win32 boundary. It operates on handles and exposes only
+allowlisted results to TypeScript. The boundary is responsible for:
 
 - opening each directory component and file with reparse-point-aware flags;
 - rejecting every reparse point, including symbolic links, junctions, mount
@@ -80,10 +88,14 @@ to TypeScript. The boundary is responsible for:
 - retaining enough identity information to detect replacement before trust is
   used.
 
-No native dependency is selected or authorized by this document. The selected
-binding and its review are required work for the owning implementation task.
-Until that boundary is available and validated, Windows discovery and
-validation remain unavailable.
+The binding is loaded only inside the supported native Windows runtime and is
+never replaced by a POSIX, PowerShell, `cmd.exe`, WSL, `PATH`, or copied-binary
+fallback. If it is missing, malformed, untrusted, or unavailable for the
+current platform, Windows discovery and validation are unavailable. The
+execution provider is composed only after the validated storage/session
+boundary is available and it uses an initialized trusted native audit journal;
+otherwise the applicable execution tools are omitted or fail closed. This
+document does not promise unconditional tool availability.
 
 ## State, ACL, and race rules
 

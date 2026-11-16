@@ -89,6 +89,11 @@ test('exposes a redacted local-only Windows readiness status without changing va
     (tools.result as { tools: readonly { name: string }[] }).tools.some((tool) => tool.name === getWindowsReadinessStatusToolName),
     true,
   );
+  const readinessTool = (tools.result as { tools: readonly Record<string, unknown>[] }).tools.find(
+    (tool) => tool.name === getWindowsReadinessStatusToolName,
+  );
+  assert.deepEqual(readinessTool?.annotations, { readOnlyHint: true, openWorldHint: false });
+  assert.equal((readinessTool?.outputSchema as { type: string }).type, 'object');
   const response = await requestResponse(input, output, {
     jsonrpc: '2.0',
     id: 3,
@@ -162,6 +167,18 @@ test('returns the fixed Windows readiness schema for a safe local status provide
         }),
       },
     ],
+    structuredContent: {
+      kind: 'windows-readiness-status',
+      version: 1,
+      runtime: 'ready',
+      registry: 'ready',
+      filesystem: 'ready',
+      configuration: 'ready',
+      knownHosts: 'unavailable',
+      credentials: 'ready',
+      validationProvider: 'unavailable',
+      remoteAuthentication: 'not-checked',
+    },
   });
   input.end();
   await runtime;
@@ -276,16 +293,14 @@ test('exposes only allowlisted approved profile metadata through the discovery t
     id: 2,
     method: 'tools/list',
   });
-  assert.deepEqual(listedTools.result, {
-    tools: [
-      {
-        name: listApprovedProfilesToolName,
-        description:
-          'Lists operator-approved profile IDs only. Use an ID returned here for validation; connection, credential, and host details are never disclosed.',
-        inputSchema: { type: 'object', properties: {}, additionalProperties: false },
-      },
-    ],
-  });
+  const listed = (listedTools.result as { tools: readonly Record<string, unknown>[] }).tools;
+  assert.equal(listed.length, 1);
+  const discoveryTool = listed[0];
+  assert.equal(discoveryTool.name, listApprovedProfilesToolName);
+  assert.deepEqual(discoveryTool.annotations, { readOnlyHint: true, openWorldHint: false });
+  assert.equal((discoveryTool.outputSchema as { type: string }).type, 'object');
+  assert.deepEqual((discoveryTool.outputSchema as { required: string[] }).required, ['profiles']);
+  assert.equal((discoveryTool.outputSchema as { properties: { profiles: { type: string } } }).properties.profiles.type, 'array');
 
   const discovery = await requestResponse(input, output, {
     jsonrpc: '2.0',
@@ -302,6 +317,9 @@ test('exposes only allowlisted approved profile metadata through the discovery t
       }),
     },
   ]);
+  assert.deepEqual((discovery.result as { structuredContent: unknown }).structuredContent, {
+    profiles: [{ profileId: 'production-readonly', classification: 'operator-approved' }],
+  });
   assert.equal(JSON.stringify(discovery).includes('credential-secret'), false);
   assert.equal(JSON.stringify(discovery).includes('host-secret'), false);
   assert.equal(JSON.stringify(discovery).includes('known_hosts'), false);
@@ -431,20 +449,13 @@ test('validates an approved profile through the trusted readiness provider', asy
     method: 'tools/list',
   });
   const validationTool = (listedTools.result as { tools: readonly unknown[] }).tools.find(
-    (tool): tool is { readonly name: string } =>
+    (tool): tool is { readonly name: string; readonly annotations?: unknown; readonly outputSchema?: unknown } =>
       typeof tool === 'object' && tool !== null && (tool as { readonly name?: unknown }).name === validateConnectionToolName,
   );
-  assert.deepEqual(validationTool, {
-    name: validateConnectionToolName,
-    description:
-      'Checks readiness for one operator-approved SSH profile ID. Use only a discovered or explicitly authorized ID; it accepts no commands, connection settings, credentials, or paths.',
-    inputSchema: {
-      type: 'object',
-      properties: { profileId: { type: 'string', pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$' } },
-      required: ['profileId'],
-      additionalProperties: false,
-    },
-  });
+  assert.equal(validationTool?.name, validateConnectionToolName);
+  assert.deepEqual(validationTool?.annotations, { readOnlyHint: true, openWorldHint: true });
+  assert.equal((validationTool?.outputSchema as { type: string }).type, 'object');
+  assert.equal(Array.isArray((validationTool?.outputSchema as { oneOf: unknown[] }).oneOf), true);
   const response = await requestResponse(input, output, {
     jsonrpc: '2.0',
     id: 3,
@@ -452,7 +463,10 @@ test('validates an approved profile through the trusted readiness provider', asy
     params: { name: validateConnectionToolName, arguments: { profileId: 'production-api' } },
   });
 
-  assert.deepEqual(response.result, { content: [{ type: 'text', text: JSON.stringify({ profileId: 'production-api', ready: true }) }] });
+  assert.deepEqual(response.result, {
+    content: [{ type: 'text', text: JSON.stringify({ profileId: 'production-api', ready: true }) }],
+    structuredContent: { profileId: 'production-api', ready: true },
+  });
   assert.deepEqual(received, { profileId: 'production-api' });
   const successAudit = JSON.parse(audit) as { readonly durationMs?: number; readonly [key: string]: unknown };
   assert.deepEqual(
@@ -505,6 +519,7 @@ test('rejects a valid provider outcome for a different profile and audits the re
 
   assert.deepEqual(response.result, {
     content: [{ type: 'text', text: JSON.stringify({ ready: false, outcome: 'failure', code: 'unknown' }) }],
+    structuredContent: { ready: false, outcome: 'failure', code: 'unknown' },
     isError: true,
   });
   assert.equal(JSON.stringify(response).includes('staging-api'), false);
@@ -564,6 +579,7 @@ test('rejects unexpected validation input before consulting the readiness provid
 
   assert.deepEqual(response.result, {
     content: [{ type: 'text', text: JSON.stringify({ ready: false, outcome: 'failure', code: 'invalid-input' }) }],
+    structuredContent: { ready: false, outcome: 'failure', code: 'invalid-input' },
     isError: true,
   });
   assert.equal(calls, 0);

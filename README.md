@@ -1,4 +1,6 @@
-# ssh-mcp-server
+# SSH MCP Server
+
+![SSH MCP workflow](assets/ssh_mcp_workflow.png)
 
 Policy-driven SSH profile discovery, connection validation, and bounded remote
 command execution for AI agents—without agent-supplied credentials.
@@ -10,7 +12,7 @@ agents can discover safe profile identifiers, validate one approved connection,
 and execute one non-interactive command through that profile. It never becomes
 an SSH terminal.
 
-> **Status:** `v1.0.0` is a source-built release. The native Windows runtime
+> **Status:** `v1.0.1` is a source-built release. The native Windows runtime
 > remains within its alpha support boundary. This repository is public,
 > but npm publishing is disabled. No npm package, standalone binary, or license
 > has been published. Distribution remains controlled from source; publishing
@@ -25,38 +27,6 @@ an SSH terminal.
 | Execute one bounded, non-interactive command with limited output   | Accept a host, user, port, path, SSH option, key, password, token, or command shell from an agent |
 | Require request-bound, expiring human approval for `sudo`          | Alter remote privileges or contact a production VPS during tests                                  |
 | Return stable, structured results and redacted local audit records | Reveal credentials, host keys, or command output in audit records                                 |
-
-## Release package candidates
-
-An authorized repository owner, member, or collaborator can comment exactly
-`/generate-candidate` on an open, same-repository `release/<version>` or
-`hotfix/<version>` pull request targeting `master`. The workflow validates the
-immutable pull-request commit, then creates or verifies a GitHub prerelease
-candidate and reports its result on the pull request.
-
-The candidate version is derived from the stable branch version and the exact
-pull-request commit. It is not an npm publication or a stable release. Because
-the native Windows addon is ABI-specific, each candidate release has separate
-Windows x64 assets for Node.js 22 and Node.js 24. Select the asset matching the
-Node.js major version used by Codex, install it from a trusted local file, and
-do not copy its addon into another environment. Before packaging, the workflow
-requires the four exact successful checks from the canonical
-`.github/workflows/ci.yml` workflow for that same commit (`validate` and
-`validate-windows-native` on Node.js 22 and 24); missing, pending, failed, or
-untrusted checks block the candidate. The prerelease is an internal delivery
-artifact, not npm publication, a stable release, or public distribution.
-
-Merged `release/*` and `hotfix/*` pull requests are backported automatically
-from `master` to `develop`. Repository maintainers must configure the
-repository-scoped `BACKPORT_TOKEN` Actions secret with the minimum permissions
-described in the [automated backport guide](docs/backport-automation.md). The
-workflow fails closed with an actionable error when the secret is unavailable;
-this repository does not contain or claim to configure its value.
-
-The package contains only the compiled runtime, production Windows trust and
-approval-broker binaries, and the operator documentation, skill, and scripts
-they require. It intentionally excludes source, tests, CI files, development
-configuration, the POSIX native addon, and the test-only native addon.
 
 Readiness is not authorization. A successful validation confirms only the
 approved connection boundary. Remote execution remains bounded and
@@ -237,7 +207,11 @@ path.
 Only advertised tools may be called. A tool can be absent because its required
 runtime boundary is unavailable; treat absence as a hard stop, not as a reason
 to supply connection details yourself. The JSON below is the text payload in
-the MCP tool result and all examples are illustrative.
+the MCP tool result and all examples are illustrative. Each tool advertises an
+`outputSchema`. JSON results are returned in both the existing text `content`
+and, where applicable, MCP `structuredContent`; legacy plain-text availability
+errors retain their existing text-only form. These schemas describe public,
+redacted fields only.
 
 ### `list_approved_profiles`
 
@@ -272,7 +246,57 @@ root, host, or credential.
 The response never exposes the host, username, credential reference,
 known-hosts reference, path, or host key. If the tool is advertised but
 discovery cannot safely access its provider, the error result is the fixed
-text `Approved profile discovery is unavailable.`
+text `Approved profile discovery is unavailable.` and remains text-only.
+
+The structured response schema requires `profiles`; each entry contains only a
+safe `profileId` and the `operator-approved` classification.
+
+### `get_windows_readiness_status`
+
+Inspect local Windows runtime prerequisites when this tool is advertised. It
+never contacts a remote host and accepts `{}` only. Its structured response
+contains the fixed `kind` and `version` plus the bounded fields `runtime`,
+`registry`, `filesystem`, `configuration`, `knownHosts`, `credentials`,
+`validationProvider`, and `remoteAuthentication`. `remoteAuthentication` is
+always `not-checked`; readiness is not remote authorization. If the provider
+is unavailable, the legacy text error is `Windows readiness status is
+unavailable.`
+
+**Call**
+
+```json
+{}
+```
+
+**Structured success response**
+
+```json
+{
+  "kind": "windows-readiness-status",
+  "version": 1,
+  "runtime": "ready",
+  "registry": "ready",
+  "filesystem": "ready",
+  "configuration": "ready",
+  "knownHosts": "ready",
+  "credentials": "not-checked",
+  "validationProvider": "ready",
+  "remoteAuthentication": "not-checked"
+}
+```
+
+**Legacy failure response**
+
+```json
+{
+  "content": [{ "type": "text", "text": "Windows readiness status is unavailable." }],
+  "isError": true
+}
+```
+
+The success JSON is present in both `content[0].text` and
+`structuredContent`. The availability failure remains text-only for clients
+that depend on the legacy response.
 
 ### `execute_remote_command`
 
@@ -280,6 +304,8 @@ Execute one command on an approved profile. `command` is one executable token;
 pass parameters in `args`. The local implementation never starts a shell, and
 the SSH session is closed on success, failure, timeout, cancellation, or output
 limit. The response contains `stdout` and `stderr` only up to `maxOutputBytes`.
+The tool is conservatively annotated as potentially destructive and open-world;
+those annotations are advisory metadata and do not enforce confirmation.
 
 ```json
 {
@@ -302,7 +328,50 @@ authorization. A standalone CLI without a host approval callback returns
 `approval-unavailable`. Production hosts may connect the typed
 `ssh-mcp-approver` boundary: Unix socket on POSIX or SID-protected named pipe
 on Windows. Destination, verified identity, and canonical command remain local
-to that approver.
+to that approver. A successful or failed call returns structured fields
+`operationId`, `profileId`, `outcome`, `code`, `exitCode`, `stdout`, `stderr`,
+and `outputTruncated` in addition to the existing text JSON. The stable codes
+include `success`, `remote-failure`, `connection-failure`,
+`authentication-failure`, `host-key-failure`, `timeout`, `cancelled`,
+`approval-required`, `approval-expired`, `approval-altered`,
+`approval-reused`, `approval-unavailable`, `approval-busy`,
+`approval-rejected`, `execution-limit`, `execution-audit-unavailable`,
+`outcome-unknown`, `invalid-input`, and `provider-failure`.
+
+**Structured success response**
+
+```json
+{
+  "operationId": "0123456789abcdef0123456789abcdef",
+  "profileId": "staging-api",
+  "outcome": "success",
+  "code": "success",
+  "exitCode": 0,
+  "stdout": "status: active\n",
+  "stderr": "",
+  "outputTruncated": false
+}
+```
+
+**Structured failure response**
+
+```json
+{
+  "operationId": "0123456789abcdef0123456789abcdef",
+  "profileId": "staging-api",
+  "outcome": "unknown",
+  "code": "outcome-unknown",
+  "exitCode": null,
+  "stdout": "",
+  "stderr": "",
+  "outputTruncated": false
+}
+```
+
+Execution failures set `isError: true` when the result is not a successful
+execution or an `approval-required` handoff. The same redacted JSON object is
+kept in `content[0].text` and `structuredContent`; clients must not retry
+`outcome-unknown` automatically.
 
 ### `request_sudo_approval`
 
@@ -312,7 +381,63 @@ changing and requires confirmation. It returns only `approved`, a stable
 configured trusted approval boundary confirms the request. It accepts no
 caller token or boolean. The capability must be sent back only as
 `approvalToken` on the exact matching
-`execute_remote_command` request.
+`execute_remote_command` request. Its destructive and non-idempotent
+annotations describe the sensitive approval action; they do not themselves
+execute a remote command or enforce authorization.
+
+The safe two-step flow is:
+
+**1. Request approval for the exact command**
+
+```json
+{
+  "profileId": "staging-api",
+  "command": "sudo",
+  "args": ["systemctl", "restart", "api"]
+}
+```
+
+**2. Approved response**
+
+The following capability is fictitious and must never be reused:
+
+```json
+{
+  "approved": true,
+  "code": "approved",
+  "operationId": "0123456789abcdef0123456789abcdef",
+  "capability": "fake-capability-for-documentation-only"
+}
+```
+
+**3. Execute the unchanged request with the fictitious capability**
+
+```json
+{
+  "profileId": "staging-api",
+  "command": "sudo",
+  "args": ["systemctl", "restart", "api"],
+  "approvalToken": "fake-capability-for-documentation-only"
+}
+```
+
+The approval result is returned in both `content[0].text` and
+`structuredContent`. On approval failure, the response keeps the structured
+fields and sets `isError: true`, for example:
+
+```json
+{
+  "approved": false,
+  "code": "approval-unavailable",
+  "operationId": "0123456789abcdef0123456789abcdef"
+}
+```
+
+`approval-unavailable`, `approval-rejected`, `approval-busy`, `cancelled`,
+altered, expired, or reused requests do not open an SSH session. The
+capability must never be copied into audit records, diagnostics, support
+tickets, or examples. No example contains a real token, credential, host, or
+destination.
 
 ### `validate_connection`
 
@@ -355,18 +480,34 @@ The stable, non-sensitive failure codes are `invalid-input`,
 uses `"outcome": "timeout"`; other failure codes use `"outcome": "failure"`.
 An unavailable validation provider returns `provider-failure`. Do not infer
 the remote host, change an SSH option, or retry with a made-up profile ID from
-one of these results.
+one of these results. Success and failure payloads are also exposed through
+`structuredContent`; the existing JSON text remains for older clients.
 
 ## Agent operating guidelines
 
-When an operator asks to check a connection:
+Use this sequence for every remote operation:
 
 1. Call `list_approved_profiles` with `{}`.
 2. Select only an ID from that response, unless the operator has explicitly
    authorized a specific already-approved ID.
-3. Call `validate_connection` with only `{ "profileId": "…" }`.
-4. Report the minimal result. Treat a missing tool, error result, or failure
-   code as a hard stop.
+3. If advertised, call `get_windows_readiness_status` with `{}` for local
+   Windows diagnostics only; it is not remote readiness or authorization.
+4. Call `validate_connection` with only `{ "profileId": "…" }` before the
+   intended remote step.
+5. Confirm that the operator's requested action is authorized. Readiness does
+   not authorize a command, and non-sudo mutating commands may execute with
+   the remote account's existing permissions without a mandatory MCP approval
+   prompt.
+6. For an allowed command, call `execute_remote_command` with one executable
+   token and a separate `args` array. Use the exact two-step `sudo` approval
+   flow when the command contains a recognized privilege-escalation executable.
+7. Interpret the structured result and report its stable fields. If the result
+   is `outcome-unknown`, do not retry automatically because the command may
+   already have run.
+
+Treat a missing tool, unknown profile, host-key or authentication failure,
+unsafe configuration, missing audit or approval infrastructure, unsupported
+platform, or request to bypass a guardrail as a hard stop.
 
 Never invent a profile ID, request or paste keys/secrets, accept a dynamic
 host or path, bypass the human `sudo` approval flow, open a persistent shell,
@@ -375,8 +516,8 @@ with weaker settings.
 
 ## Security, diagnostics, and troubleshooting
 
-The server is fail-closed and sends only JSON-RPC on standard output. Redacted
-Every remote command execution attempt first writes a durable versioned
+The server is fail-closed and sends only JSON-RPC on standard output. Every
+remote command execution attempt first writes a durable versioned
 intent/finished event to the separate HMAC-chained audit journal, then emits
 redacted audit events and
 diagnostics to standard error. The local audit record contains the command,
@@ -403,6 +544,38 @@ and secrets. For platform-specific troubleshooting, start with:
 - [Windows password-profile troubleshooting](docs/windows/password-profile-troubleshooting.md)
 - [Windows agent-key troubleshooting](docs/windows/agent-key-troubleshooting.md)
 - [Windows trust model](docs/windows-trust-model.md)
+
+## Release package candidates
+
+An authorized repository owner, member, or collaborator can comment exactly
+`/generate-candidate` on an open, same-repository `release/<version>` or
+`hotfix/<version>` pull request targeting `master`. The workflow validates the
+immutable pull-request commit, then creates or verifies a GitHub prerelease
+candidate and reports its result on the pull request.
+
+The candidate version is derived from the stable branch version and the exact
+pull-request commit. It is not an npm publication or a stable release. Because
+the native Windows addon is ABI-specific, each candidate release has separate
+Windows x64 assets for Node.js 22 and Node.js 24. Select the asset matching the
+Node.js major version used by Codex, install it from a trusted local file, and
+do not copy its addon into another environment. Before packaging, the workflow
+requires the four exact successful checks from the canonical
+`.github/workflows/ci.yml` workflow for that same commit (`validate` and
+`validate-windows-native` on Node.js 22 and 24); missing, pending, failed, or
+untrusted checks block the candidate. The prerelease is an internal delivery
+artifact, not npm publication, a stable release, or public distribution.
+
+Merged `release/*` and `hotfix/*` pull requests are backported automatically
+from `master` to `develop`. Repository maintainers must configure the
+repository-scoped `BACKPORT_TOKEN` Actions secret with the minimum permissions
+described in the [automated backport guide](docs/backport-automation.md). The
+workflow fails closed with an actionable error when the secret is unavailable;
+this repository does not contain or claim to configure its value.
+
+The package contains only the compiled runtime, production Windows trust and
+approval-broker binaries, and the operator documentation, skill, and scripts
+they require. It intentionally excludes source, tests, CI files, development
+configuration, the POSIX native addon, and the test-only native addon.
 
 ## Development checks
 
