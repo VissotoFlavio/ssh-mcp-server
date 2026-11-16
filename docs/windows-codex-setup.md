@@ -235,18 +235,29 @@ unsafe, discovery fails closed when called and returns no profile data. Do not r
 are reserved exclusively for MCP JSON-RPC.
 
 Before the first Windows remote command, initialize the protected audit journal
-from the trusted checkout and rotate it only as an explicit operator action:
+from the trusted checkout:
 
 ```powershell
 npm run windows:audit:init
-npm run windows:audit:rotate
 ```
 
-Initialization is required once per protected state root; rotation is not part
-of command execution. For a recognized privilege-escalation command, start
+Initialization is required once per protected state root. Do not run the
+rotation command during initial setup. For a recognized privilege-escalation command, start
 the one-request native approval broker with `npm run windows:approver` in a
 separate operator console and provide its protected pipe/secret values only to
 the trusted MCP process. Ordinary bounded commands do not require that broker.
+
+### Audit journal maintenance
+
+Rotate an already initialized journal only as an explicit operator maintenance
+operation, after reviewing the local recovery and retention procedure:
+
+```powershell
+npm run windows:audit:rotate
+```
+
+Rotation is never performed by `execute_remote_command` and must not be used as
+a substitute for initialization.
 
 ## Diagnostics and safe operation
 

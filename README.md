@@ -259,6 +259,42 @@ always `not-checked`; readiness is not remote authorization. If the provider
 is unavailable, the legacy text error is `Windows readiness status is
 unavailable.`
 
+**Call**
+
+```json
+{}
+```
+
+**Structured success response**
+
+```json
+{
+  "kind": "windows-readiness-status",
+  "version": 1,
+  "runtime": "ready",
+  "registry": "ready",
+  "filesystem": "ready",
+  "configuration": "ready",
+  "knownHosts": "ready",
+  "credentials": "not-checked",
+  "validationProvider": "ready",
+  "remoteAuthentication": "not-checked"
+}
+```
+
+**Legacy failure response**
+
+```json
+{
+  "content": [{ "type": "text", "text": "Windows readiness status is unavailable." }],
+  "isError": true
+}
+```
+
+The success JSON is present in both `content[0].text` and
+`structuredContent`. The availability failure remains text-only for clients
+that depend on the legacy response.
+
 ### `execute_remote_command`
 
 Execute one command on an approved profile. `command` is one executable token;
@@ -299,6 +335,41 @@ include `success`, `remote-failure`, `connection-failure`,
 `approval-rejected`, `execution-limit`, `execution-audit-unavailable`,
 `outcome-unknown`, `invalid-input`, and `provider-failure`.
 
+**Structured success response**
+
+```json
+{
+  "operationId": "0123456789abcdef0123456789abcdef",
+  "profileId": "staging-api",
+  "outcome": "success",
+  "code": "success",
+  "exitCode": 0,
+  "stdout": "status: active\n",
+  "stderr": "",
+  "outputTruncated": false
+}
+```
+
+**Structured failure response**
+
+```json
+{
+  "operationId": "0123456789abcdef0123456789abcdef",
+  "profileId": "staging-api",
+  "outcome": "unknown",
+  "code": "outcome-unknown",
+  "exitCode": null,
+  "stdout": "",
+  "stderr": "",
+  "outputTruncated": false
+}
+```
+
+Execution failures set `isError: true` when the result is not a successful
+execution or an `approval-required` handoff. The same redacted JSON object is
+kept in `content[0].text` and `structuredContent`; clients must not retry
+`outcome-unknown` automatically.
+
 ### `request_sudo_approval`
 
 Requests human confirmation for one exact `sudo` command. The tool is state
@@ -313,6 +384,8 @@ execute a remote command or enforce authorization.
 
 The safe two-step flow is:
 
+**1. Request approval for the exact command**
+
 ```json
 {
   "profileId": "staging-api",
@@ -321,12 +394,47 @@ The safe two-step flow is:
 }
 ```
 
-If approved, the response contains an opaque one-use `capability`. Pass that
-value as `approvalToken` in an unchanged `execute_remote_command` request
-within its lifetime. `approval-unavailable`, `approval-rejected`,
-`approval-busy`, `cancelled`, altered, expired, or reused requests do not open
-an SSH session. The capability must never be copied into audit records,
-diagnostics, support tickets, or examples.
+**2. Approved response**
+
+The following capability is fictitious and must never be reused:
+
+```json
+{
+  "approved": true,
+  "code": "approved",
+  "operationId": "0123456789abcdef0123456789abcdef",
+  "capability": "fake-capability-for-documentation-only"
+}
+```
+
+**3. Execute the unchanged request with the fictitious capability**
+
+```json
+{
+  "profileId": "staging-api",
+  "command": "sudo",
+  "args": ["systemctl", "restart", "api"],
+  "approvalToken": "fake-capability-for-documentation-only"
+}
+```
+
+The approval result is returned in both `content[0].text` and
+`structuredContent`. On approval failure, the response keeps the structured
+fields and sets `isError: true`, for example:
+
+```json
+{
+  "approved": false,
+  "code": "approval-unavailable",
+  "operationId": "0123456789abcdef0123456789abcdef"
+}
+```
+
+`approval-unavailable`, `approval-rejected`, `approval-busy`, `cancelled`,
+altered, expired, or reused requests do not open an SSH session. The
+capability must never be copied into audit records, diagnostics, support
+tickets, or examples. No example contains a real token, credential, host, or
+destination.
 
 ### `validate_connection`
 

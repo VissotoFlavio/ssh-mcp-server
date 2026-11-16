@@ -17,7 +17,9 @@ publish a release.
 - Added output schemas and backward-compatible `structuredContent` responses
   for the five MCP tools while preserving existing text content and
   text-only availability errors. Added conservative advisory tool annotations
-  and contract coverage; annotations do not enforce authorization.
+  and MCP SDK 1.x interoperability coverage; annotations do not enforce
+  authorization. The operator documentation now includes complete readiness,
+  execution, and request-bound approval examples with fictitious values.
 
 ### Fixed
 

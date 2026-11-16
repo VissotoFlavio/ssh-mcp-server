@@ -190,7 +190,11 @@ const SUDO_APPROVAL_OUTPUT_SCHEMA = {
     },
     {
       required: ['approved', 'code'],
-      properties: { approved: { const: false } },
+      properties: {
+        approved: { const: false },
+        code: { enum: ['approval-unavailable', 'approval-rejected', 'approval-busy', 'cancelled', 'invalid-input', 'provider-failure'] },
+      },
+      not: { required: ['capability'] },
     },
   ],
   additionalProperties: false,
