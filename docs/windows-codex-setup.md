@@ -21,12 +21,16 @@ protected profile state and verified known-hosts storage. It validates only an
 approved profile identifier; agent-key validation first uses the native
 `ssh-add -l` probe and then a cancellable native no-command readiness check
 with a private known-hosts snapshot. Password validation keeps the verified
-known-hosts bytes in memory because it launches no SSH child. A listed tool
-does not guarantee that a later validation succeeds: each call still fails
+known-hosts bytes in memory because it launches no SSH child. The Windows
+runtime may also advertise bounded `execute_remote_command` and
+`request_sudo_approval` only when the trusted native execution and audit
+providers are composed. A listed tool does not guarantee that a later
+validation or execution succeeds: each call still fails
 closed when, for example, the approved credential is unavailable, SSH
 authentication fails, or host identity verification fails. If a required
 composition boundary is unavailable, the tool is omitted; this is not an
-invitation to pass hosts, credentials, paths, or commands to the MCP server.
+invitation to pass hosts, credentials, paths, or arbitrary shell commands to
+the MCP server.
 
 ## Prerequisites
 
@@ -218,14 +222,31 @@ args = ['D:\path\to\ssh-mcp-server\dist\server.js']
 ```
 
 Restart Codex after changing its MCP configuration, then inspect the server's
-listed tools. On a supported host with complete provider composition, the
-expected tools are `list_approved_profiles` and `validate_connection`; on an
-unsupported host or when composition is incomplete, `validate_connection` is
-omitted. Its presence does not guarantee connection readiness: an individual
-call can still fail closed. If state is missing or unsafe, discovery fails
-closed when called and returns no profile data. Do not run
+listed tools. Depending on the supported native composition, the server may
+advertise `list_approved_profiles`, `get_windows_readiness_status`,
+`validate_connection`, `execute_remote_command`, and
+`request_sudo_approval`. Execution additionally requires an initialized
+protected audit journal; sudo commands also require the separate native
+approver broker. Missing providers omit the applicable tools or make calls
+fail closed. A listed tool does not guarantee connection or execution
+readiness: an individual call can still fail closed. If state is missing or
+unsafe, discovery fails closed when called and returns no profile data. Do not run
 `node dist/server.js` interactively to test it: its standard input and output
 are reserved exclusively for MCP JSON-RPC.
+
+Before the first Windows remote command, initialize the protected audit journal
+from the trusted checkout and rotate it only as an explicit operator action:
+
+```powershell
+npm run windows:audit:init
+npm run windows:audit:rotate
+```
+
+Initialization is required once per protected state root; rotation is not part
+of command execution. For a recognized privilege-escalation command, start
+the one-request native approval broker with `npm run windows:approver` in a
+separate operator console and provide its protected pipe/secret values only to
+the trusted MCP process. Ordinary bounded commands do not require that broker.
 
 ## Diagnostics and safe operation
 
@@ -234,7 +255,10 @@ events go to standard error and are redacted to approved fields. When asking
 for support, provide the failure category and runtime versions, but remove
 hosts, usernames, profile IDs, credential references, paths, and all secrets.
 
-The server accepts only approved profile identifiers. It does not accept
-commands, arbitrary connection settings, filesystem paths, private keys,
-passwords, or tokens from Codex. Keep the profile state, known-hosts data, and
-Windows Credential Manager private to the same Windows user.
+The server accepts only approved profile identifiers and bounded executable plus
+argument requests. It does not accept arbitrary connection settings,
+filesystem paths, private keys, passwords, host keys, or credentials from
+Codex. Remote commands are non-interactive and are not a persistent shell,
+script, file-transfer, or forwarding API. Keep the profile state, known-hosts
+data, audit journal, approval broker, and Windows Credential Manager private to
+the same Windows user.

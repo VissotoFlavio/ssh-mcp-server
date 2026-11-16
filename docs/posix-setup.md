@@ -15,13 +15,23 @@ issues, pull requests, logs, or chat.
 ## Prerequisites
 
 - Node.js 22 or later.
-- An approved source checkout, built with `npm ci` followed by `npm run build`.
+- An approved source checkout, built with `npm ci`, `npm run build`, and
+  `npm run build:native` when `sudo` approval is required. The native build
+  requires the C/C++ prerequisites for the pinned Node.js addon toolchain.
 - Executable OpenSSH binaries at `/usr/bin/ssh` and `/usr/bin/ssh-add`. The
   POSIX runtime invokes these fixed paths; it does not select binaries through
   `PATH`.
 - An operator-approved `agent-key` identity loaded in the same user's
   `ssh-agent`. POSIX production validation does not provide password
   readiness.
+
+Discovery and connection validation can be used after the TypeScript build
+when the approved profile and known-hosts roots are safe. Remote execution
+also requires the separate operator-owned audit root and key described below.
+The request-bound POSIX `sudo` approval path additionally requires the native
+`build/Release/posix_peer_credentials.node` addon and its trusted local
+approver socket/secret; if peer-credential inspection or the approver is
+unavailable, only commands requiring privilege escalation fail closed.
 
 In the intended non-root user session, confirm the fixed client tools exist:
 
@@ -130,15 +140,18 @@ codex mcp add ssh-mcp-server \
 codex mcp list
 ```
 
-Create the audit key and approver secret out of band as the operator. Keep
-both files owner-only (`0600`); the audit key contains `v1:` followed by 64
-lowercase hexadecimal characters, and the approver secret is exactly 32 random
+Create the mandatory audit key and the optional approver secret out of band as
+the operator. Keep both files owner-only (`0600`); the audit key contains
+`v1:` followed by 64 lowercase hexadecimal characters, and the approver secret
+is exactly 32 random
 bytes shared only with the separate `ssh-mcp-approver` component. The server
 never generates either secret during execution. Run the MCP server and
 approver as a dedicated OS identity. This HMAC IPC contract authenticates the
-message envelope but does not distinguish another process already trusted as
-the same OS user; a native peer-credential boundary is a separate hardening
-follow-up.
+message envelope and validates the native peer-credential boundary. If the
+platform cannot expose peer credentials, approval is unavailable. The audit
+root and key are mandatory for every remote execution attempt. The approver
+socket and secret are needed only when a recognized privilege-escalation
+command requests human approval.
 
 Restart Codex if its client requires it, then first call
 `list_approved_profiles` with `{}`. Call `validate_connection` only with a

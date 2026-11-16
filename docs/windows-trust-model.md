@@ -3,9 +3,12 @@
 ## Status and support boundary
 
 This document is the authoritative security model for the native Windows
-runtime proposed for `v0.1.0-alpha.1`. The native command boundary is present,
-but production remote execution remains unavailable unless the trusted native
-audit-journal provider is installed and injected.
+runtime in `v0.1.0-alpha.1`. The native command boundary is present, but
+production remote execution remains unavailable unless the trusted native
+audit-journal provider is installed and injected. When execution is advertised,
+it remains bounded, non-interactive, and subject to the same approved-profile,
+host-identity, audit, and privilege-escalation approval boundaries described
+here.
 
 The Windows runtime is **per-user only**. It never requires elevation, reads
 no machine-wide configuration, and never shares approved profile or

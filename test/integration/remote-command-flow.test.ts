@@ -59,11 +59,21 @@ test('registers and routes remote execution without a production endpoint', asyn
     params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'test', version: '1' } },
   });
   const tools = await requestResponse(input, output, { jsonrpc: '2.0', id: 2, method: 'tools/list' });
-  const listed = (tools.result as { tools: Array<{ name: string; annotations?: { destructiveHint?: boolean; readOnlyHint?: boolean } }> }).tools;
+  const listed = (
+    tools.result as {
+      tools: Array<{
+        name: string;
+        annotations?: { destructiveHint?: boolean; readOnlyHint?: boolean; idempotentHint?: boolean; openWorldHint?: boolean };
+        outputSchema?: { type?: string };
+      }>;
+    }
+  ).tools;
   const executionTool = listed.find((tool) => tool.name === 'execute_remote_command');
-  assert.equal(executionTool?.annotations?.destructiveHint, true);
+  assert.deepEqual(executionTool?.annotations, { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true });
+  assert.equal(executionTool?.outputSchema?.type, 'object');
   const approvalTool = listed.find((tool) => tool.name === 'request_sudo_approval');
-  assert.equal(approvalTool?.annotations?.readOnlyHint, false);
+  assert.deepEqual(approvalTool?.annotations, { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false });
+  assert.equal(approvalTool?.outputSchema?.type, 'object');
 
   const approval = await requestResponse(input, output, {
     jsonrpc: '2.0',
@@ -79,6 +89,7 @@ test('registers and routes remote execution without a production endpoint', asyn
   assert.equal(approvalPayload.approved, true);
   assert.equal(typeof approvalPayload.capability, 'string');
   assert.match(approvalPayload.operationId, /^[a-f0-9]{32}$/u);
+  assert.deepEqual((approval.result as { structuredContent: unknown }).structuredContent, approvalPayload);
 
   const result = await requestResponse(input, output, {
     jsonrpc: '2.0',
@@ -95,6 +106,7 @@ test('registers and routes remote execution without a production endpoint', asyn
   assert.equal(resultPayload.code, 'success');
   assert.match(String(resultPayload.operationId), /^[a-f0-9]{32}$/u);
   assert.equal(resultPayload.stdout, 'test-output');
+  assert.deepEqual((result.result as { structuredContent: unknown }).structuredContent, resultPayload);
 
   input.end();
   await runtime;
