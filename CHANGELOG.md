@@ -14,6 +14,11 @@ publish a release.
   wrappers are now available through the same request-bound human approval
   boundary as recognized privilege escalation; profile authorization, host
   verification, execution limits, and durable auditing remain mandatory.
+
+## [1.0.1] - 2026-11-16
+
+### Changed
+
 - Aligned README, POSIX and Windows operator guides, trust-model documentation,
   and the Windows readiness-only skill with bounded remote execution,
   conditional tool availability, mandatory audit setup, and request-bound
@@ -27,6 +32,8 @@ publish a release.
   and MCP SDK 1.x interoperability coverage; annotations do not enforce
   authorization. The operator documentation now includes complete readiness,
   execution, and request-bound approval examples with fictitious values.
+
+## [1.0.0] - 2026-11-12
 
 ### Fixed
 
