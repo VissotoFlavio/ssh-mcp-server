@@ -5,6 +5,20 @@ profile. The profile remains the source of truth for host identity,
 authentication mode, known-hosts data, and credential references. MCP callers
 cannot supply any of those values.
 
+The server enforces request validation, approved-profile authorization, host
+identity checks, execution bounds, mandatory durable auditing, and fail-closed
+behavior. Recognized privilege-escalation executables (`sudo`, `sudoedit`,
+`su`, `doas`, `dzdo`, `runuser`, and `pkexec`) additionally require exact,
+request-bound, one-use human approval. A command that mutates remote state
+without recognized privilege escalation is not given a second server-enforced
+human approval gate; it runs only with the remote account's existing
+permissions. The MCP does not classify every command as destructive, and
+client-side confirmation conventions are not server authorization.
+
+The five tools advertise output schemas. Structured JSON results are returned
+through `structuredContent` in addition to the existing JSON text content;
+legacy plain-text availability errors remain text-only for compatibility.
+
 ## Operator workflow
 
 1. Configure and verify a profile with the [POSIX setup guide](posix-setup.md)
