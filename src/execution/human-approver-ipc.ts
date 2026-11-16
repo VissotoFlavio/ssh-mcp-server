@@ -106,7 +106,7 @@ function quoteApprovalPresentation(value: string): string {
   return `'${escaped}'`;
 }
 
-/** Renders the complete, immutable sudo request for the Windows native broker. */
+/** Renders the complete, immutable approval request for the Windows native broker. */
 export function formatWindowsApprovalPresentation(request: Pick<HumanApproverIpcRequest, 'request'>): string | undefined {
   const { presentation } = request.request;
   const argumentsText =

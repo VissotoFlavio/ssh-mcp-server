@@ -3,7 +3,7 @@
 ## Status and support boundary
 
 This document is the authoritative security model for the native Windows
-runtime included in `v1.0.1`. It is a design boundary, not a claim that the
+runtime included in `v1.1.0`. It is a design boundary, not a claim that the
 current POSIX runtime supports Windows. The repository includes the selected
 `build/Release/windows_trust.node` native binding for protected storage,
 trusted executable resolution, known-host snapshots, native agent-key command

@@ -159,8 +159,8 @@ test('reports unavailable sudo approval as a failure before transport', async ()
   assert.equal(transport.calls.length, 0);
 });
 
-test('requires approval for common privilege-escalation executables', async () => {
-  for (const command of ['doas', 'pkexec', 'runuser', 'su']) {
+test('requires approval for recognized privilege-escalation executables', async () => {
+  for (const command of ['doas', 'dzdo', 'pkexec', 'runuser', 'su', 'sudoedit']) {
     const { provider, transport } = createProvider(undefined, { humanApproval: false });
     const result = await provider.execute({ profileId: profile.profileId, command, args: ['id'] });
     assert.equal(result.code, 'approval-unavailable');
@@ -340,29 +340,45 @@ test('reports unknown outcome when cancellation occurs after command handoff', a
   assert.equal(result.exitCode, null);
 });
 
-test('rejects shell interpreters, remote wrappers, and control syntax', async () => {
+test('allows arbitrary non-privileged executables and literal arguments', async () => {
   const { provider, transport } = createProvider();
   for (const request of [
-    { ...command, command: 'sh', args: ['-c', 'sudo id'] },
-    { ...command, command: 'sh.exe', args: ['-c', 'sudo id'] },
-    { ...command, command: 'env', args: ['sudo', 'id'] },
-    { ...command, command: 'env.exe', args: ['sudo', 'id'] },
-    { ...command, command: 'nohup', args: ['sudo', 'id'] },
-    { ...command, command: 'ssh', args: ['-L', '8080:internal:80', 'internal'] },
-    { ...command, command: 'scp', args: ['file', 'internal:/tmp/file'] },
-    { ...command, command: 'sftp', args: ['internal'] },
-    { ...command, command: 'rsync', args: ['-e', 'ssh', 'file', 'internal:/tmp/file'] },
-    { ...command, command: 'busybox', args: ['sh', '-c', 'sudo id'] },
-    { ...command, command: 'busybox.exe', args: ['sh', '-c', 'sudo id'] },
-    { ...command, command: 'sudoedit', args: ['id'] },
-    { ...command, command: '/usr/bin/sudoedit', args: ['id'] },
-    { ...command, command: 'echo', args: ['ok; sudo id'] },
-    { ...command, command: 'echo', args: ['ok &'] },
-    { ...command, command: 'bash', args: ['-c', 'id'] },
-    { ...command, command: 'bash.exe', args: ['-c', 'id'] },
+    { ...command, command: 'docker', args: ['ps', '--format={{json .}}'] },
+    { ...command, command: 'find', args: ['/', '-maxdepth', '1', '-type', 'f'] },
+    { ...command, command: 'echo', args: ['ok; still literal', '$HOME', '$(whoami)', '{{template}}'] },
+    { ...command, command: 'custom command', args: ['value'] },
   ]) {
     const result = await provider.execute(request);
-    assert.equal(result.code, request.command.includes('sudoedit') ? 'approval-required' : 'invalid-input');
+    assert.equal(result.code, 'success');
+  }
+  assert.equal(transport.calls.length, 4);
+});
+
+test('allows command evaluators after exact human approval', async () => {
+  const { provider, transport } = createProvider();
+  const request = { profileId: profile.profileId, command: 'bash', args: ['-c', 'printf approved'] };
+  const approval = await provider.requestSudoApproval(request);
+  assert.equal(approval.code, 'approved');
+
+  const result = await provider.execute({ ...request, approvalToken: approval.token });
+  assert.equal(result.code, 'success');
+  assert.equal(transport.calls.length, 1);
+});
+
+test('requires approval for command evaluators and find command execution', async () => {
+  const { provider, transport } = createProvider(undefined, { humanApproval: false });
+  for (const request of [
+    { ...command, command: 'sh', args: ['-c', 'sudo id'] },
+    { ...command, command: 'bash.exe', args: ['-c', 'id'] },
+    { ...command, command: 'python', args: ['script.py'] },
+    { ...command, command: 'env', args: ['printenv'] },
+    { ...command, command: 'nohup', args: ['sleep', '10'] },
+    { ...command, command: 'ssh', args: ['internal', 'id'] },
+    { ...command, command: 'busybox', args: ['sh', '-c', 'id'] },
+    { ...command, command: 'find', args: ['.', '-exec', 'id', ';'] },
+  ]) {
+    const result = await provider.execute(request);
+    assert.equal(result.code, 'approval-unavailable');
   }
   assert.equal(transport.calls.length, 0);
 });

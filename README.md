@@ -12,7 +12,7 @@ agents can discover safe profile identifiers, validate one approved connection,
 and execute one non-interactive command through that profile. It never becomes
 an SSH terminal.
 
-> **Status:** `v1.0.1` is a source-built release. The native Windows runtime
+> **Status:** `v1.1.0` is a source-built release. The native Windows runtime
 > remains within its alpha support boundary. This repository is public,
 > but npm publishing is disabled. No npm package, standalone binary, or license
 > has been published. Distribution remains controlled from source; publishing
@@ -20,19 +20,20 @@ an SSH terminal.
 
 ## What it does—and does not do
 
-| Supported                                                          | Explicitly not supported                                                                          |
-| ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------- |
-| List operator-approved profile IDs                                 | Interactive or persistent shell                                                                   |
-| Validate approved host identity and authentication                 | File transfer or port forwarding                                                                  |
-| Execute one bounded, non-interactive command with limited output   | Accept a host, user, port, path, SSH option, key, password, token, or command shell from an agent |
-| Require request-bound, expiring human approval for `sudo`          | Alter remote privileges or contact a production VPS during tests                                  |
-| Return stable, structured results and redacted local audit records | Reveal credentials, host keys, or command output in audit records                                 |
+| Supported                                                               | Explicitly not supported                                                                    |
+| ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| List operator-approved profile IDs                                      | Interactive or persistent shell                                                             |
+| Validate approved host identity and authentication                      | File transfer or port forwarding                                                            |
+| Execute one bounded, non-interactive command with limited output        | Accept a host, user, port, SSH option, key, password, token, or a local shell from an agent |
+| Require request-bound, expiring human approval for privileged execution | Alter remote privileges or contact a production VPS during tests                            |
+| Return stable, structured results and redacted local audit records      | Reveal credentials, host keys, or command output in audit records                           |
 
 Readiness is not authorization. A successful validation confirms only the
 approved connection boundary. Remote execution remains bounded and
-non-interactive; commands containing `sudo` require a separate server-issued,
-one-time human approval token tied to the exact profile, command, arguments,
-timeout, and output limit.
+non-interactive; it has no operational command allowlist. Recognized
+privilege-escalation commands and command evaluators require a separate
+server-issued, one-time human approval token tied to the exact profile,
+command, arguments, timeout, and output limit.
 
 ## How the boundary works
 
@@ -318,8 +319,10 @@ those annotations are advisory metadata and do not enforce confirmation.
 ```
 
 The bounded defaults are 30 seconds and 64 KiB; the maximums are 60 seconds
-and 1 MiB. Commands that use `sudo`, `sudoedit`, `su`, `doas`, `runuser`, or
-`pkexec` return `approval-required` until the host-injected
+and 1 MiB. There is no allowlist for remote executables or argument shapes.
+Commands that use `sudo`, `sudoedit`, `su`, `doas`, `dzdo`, `runuser`, or
+`pkexec`, and command evaluators such as `sh`, `bash`, PowerShell, Python,
+`env`, `xargs`, or `ssh`, return `approval-required` until the host-injected
 `HumanSudoApprovalProvider` issues an opaque one-use capability through
 `request_sudo_approval`. The capability expires after one minute,
 cannot be reused, and fails if the command or the immutable approved profile
@@ -498,9 +501,10 @@ Use this sequence for every remote operation:
    not authorize a command, and non-sudo mutating commands may execute with
    the remote account's existing permissions without a mandatory MCP approval
    prompt.
-6. For an allowed command, call `execute_remote_command` with one executable
-   token and a separate `args` array. Use the exact two-step `sudo` approval
-   flow when the command contains a recognized privilege-escalation executable.
+6. For an allowed command, call `execute_remote_command` with `command` and a
+   separate `args` array. Use the exact two-step approval flow when the command
+   contains a recognized privilege-escalation executable or is a command
+   evaluator/wrapper.
 7. Interpret the structured result and report its stable fields. If the result
    is `outcome-unknown`, do not retry automatically because the command may
    already have run.
@@ -510,9 +514,10 @@ unsafe configuration, missing audit or approval infrastructure, unsupported
 platform, or request to bypass a guardrail as a hard stop.
 
 Never invent a profile ID, request or paste keys/secrets, accept a dynamic
-host or path, bypass the human `sudo` approval flow, open a persistent shell,
-transfer files, forward ports, or retry a failed host/authentication check
-with weaker settings.
+host or path, bypass the human approval flow, open a persistent SSH session,
+or retry a failed host/authentication check with weaker settings. Do not use
+the command runner as a substitute for a dedicated file-transfer or
+forwarding workflow.
 
 ## Security, diagnostics, and troubleshooting
 
@@ -521,10 +526,10 @@ remote command execution attempt first writes a durable versioned
 intent/finished event to the separate HMAC-chained audit journal, then emits
 redacted audit events and
 diagnostics to standard error. The local audit record contains the command,
-allowlisted argument shapes, and an HMAC digest of the original argument
+redacted argument presentation, and an HMAC digest of the original argument
 vector; raw positional values, flag values, headers, URL credentials, shell
-assignments, stdout, and stderr are never written to audit. Sudo approval
-requests are audited separately from command execution attempts. If the durable
+assignments, stdout, and stderr are never written to audit. Privileged-execution
+approval requests are audited separately from command execution attempts. If the durable
 journal is unavailable, the remote result is returned as
 `execution-audit-unavailable`. A secondary audit sink failure returns
 `provider-failure` only when the result is not already `outcome-unknown`. An
@@ -533,9 +538,10 @@ null exit code and empty output; clients must not retry automatically. Timeout
 or cancellation closes the server-controlled SSH channel/session but does not
 promise to kill an already detached remote process. The first delivery targets
 POSIX VPS hosts from POSIX or Windows clients; remote Windows-host quoting is
-future work. Interactive persistent shells, scripts, free-form redirection or
-pipes, file transfer, and port forwarding are excluded; file transfer belongs
-to issue #94. Support
+future work. The MCP does not provide a separate interactive shell, transfer,
+or forwarding protocol. A non-interactive command may still invoke a remote
+program that performs those actions and command evaluators require explicit
+human approval. Support
 material must omit hosts, usernames, profile IDs, credential references, paths,
 and secrets. For platform-specific troubleshooting, start with:
 

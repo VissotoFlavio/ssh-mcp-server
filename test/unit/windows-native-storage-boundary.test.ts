@@ -251,7 +251,7 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
     assert.equal(testBinding.testReadinessDescriptor({ host: 'api.internal.example', port: 0, user: 'deploy' }), false);
   });
 
-  test('accepts only bounded native agent-command request data', () => {
+  test('accepts bounded native agent-command data without an executable allowlist', () => {
     const valid = {
       profileId: 'production-api',
       host: 'api.internal.example',
@@ -265,10 +265,10 @@ if (process.platform !== 'win32' || !existsSync(addonPath) || !existsSync(testAd
     };
     assert.equal(testBinding.testAgentCommandRequest(valid), true);
     for (const command of ['sh', 'sh.exe', 'bash.exe', 'busybox.exe', 'env.exe', 'ssh.exe']) {
-      assert.equal(testBinding.testAgentCommandRequest({ ...valid, command }), false);
+      assert.equal(testBinding.testAgentCommandRequest({ ...valid, command }), true);
     }
-    assert.equal(testBinding.testAgentCommandRequest({ ...valid, args: ['-c'] }), false);
-    assert.equal(testBinding.testAgentCommandRequest({ ...valid, args: ['echo;whoami'] }), false);
+    assert.equal(testBinding.testAgentCommandRequest({ ...valid, command: 'custom command', args: ['-c', 'echo;whoami', '$HOME'] }), true);
+    assert.equal(testBinding.testAgentCommandRequest({ ...valid, command: 'id\nwhoami' }), false);
     assert.equal(testBinding.testAgentCommandRequest({ ...valid, extra: 'rejected' }), false);
   });
 

@@ -5,6 +5,16 @@ publish a release.
 
 ## Unreleased
 
+## [1.1.0] - 2026-11-16
+
+### Changed
+
+- Removed the remote executable and argument-shape allowlists from the
+  TypeScript and native Windows execution paths. Remote command evaluators and
+  wrappers are now available through the same request-bound human approval
+  boundary as recognized privilege escalation; profile authorization, host
+  verification, execution limits, and durable auditing remain mandatory.
+
 ## [1.0.1] - 2026-11-16
 
 ### Changed
@@ -98,9 +108,8 @@ publish a release.
 - The remote execution candidate now accepts an explicit host-injected human
   approval provider, binds approvals to the complete approved profile identity,
   fails closed when durable audit state is unavailable, bounds validation as
-  well as transport, rejects shell/script interpreters and control syntax, and
-  records only allowlisted argument shapes plus an HMAC digest of the original
-  vector.
+  well as transport, and records redacted argument data plus an HMAC digest of
+  the original vector.
 - Windows agent-key command execution now uses the exported native OpenSSH
   command boundary with an opaque approved known-hosts snapshot, bounded
   output, cancellation, and process-tree cleanup; it never uses an ambient
