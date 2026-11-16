@@ -50,9 +50,9 @@ const VALIDATE_CONNECTION_DESCRIPTION =
 const WINDOWS_READINESS_STATUS_DESCRIPTION =
   'Reports bounded local Windows readiness categories only. It accepts no connection settings, profile IDs, credentials, paths, or commands and never contacts a remote host.';
 const REMOTE_COMMAND_DESCRIPTION =
-  "Executes one bounded non-interactive command on an approved SSH profile. Recognized privilege-escalation executables require request-bound human approval; other commands use the remote account's existing permissions and may modify remote state without an additional server approval gate. Supports no persistent shell, file transfer, or port forwarding.";
+  "Executes one bounded non-interactive command on an approved SSH profile without an executable allowlist. Recognized privilege-escalation executables and command evaluators require request-bound human approval; other commands use the remote account's existing permissions and may modify remote state without an additional server approval gate. Supports no persistent SSH session or local shell.";
 const SUDO_APPROVAL_DESCRIPTION =
-  'Requests a one-time human approval for one exact sudo command. Approval is request-bound, expires quickly, and cannot be supplied as a caller boolean.';
+  'Requests a one-time human approval for one exact privileged or command-evaluator execution. Approval is request-bound, expires quickly, and cannot be supplied as a caller boolean.';
 const SAFE_PROFILE_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
 const MAX_DISCOVERABLE_PROFILES = 256;
 

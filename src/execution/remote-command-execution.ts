@@ -23,9 +23,9 @@ const MAX_ARGUMENTS = 64;
 const MAX_ARGUMENT_LENGTH = 4096;
 // eslint-disable-next-line no-control-regex -- reject control characters at the MCP trust boundary
 const CONTROL_CHARACTERS = /[\u0000-\u001F\u007F]/u;
-const COMMAND_DELIMITERS = /\s/u;
 const PROFILE_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
-const REJECTED_EXECUTABLES = new Set([
+const PRIVILEGE_ESCALATION_EXECUTABLES = new Set(['doas', 'dzdo', 'pkexec', 'runuser', 'su', 'sudo', 'sudoedit']);
+const COMMAND_EVALUATORS = new Set([
   'sh',
   'bash',
   'dash',
@@ -53,13 +53,10 @@ const REJECTED_EXECUTABLES = new Set([
   'daemonize',
   'xargs',
   'parallel',
-  'find',
   'timeout',
   'watch',
   'busybox',
 ]);
-const REJECTED_SHELL_FLAGS = new Set(['-c', '-ccommand', '--command', '-command', '-encodedcommand', '--eval', '-e', '/c', '/k']);
-const SHELL_METACHARACTERS = /[;&|<>`$(){}]/u;
 const AUDIT_SINK_KEY = randomBytes(32);
 
 export type RemoteExecutionOutcome = 'success' | 'failure' | 'timeout' | 'cancelled' | 'approval-required' | 'unknown';
@@ -237,28 +234,14 @@ function validateText(value: unknown, maxLength: number): string {
 }
 
 function validateCommand(value: unknown): string {
-  const command = validateText(value, MAX_COMMAND_LENGTH);
-  if (COMMAND_DELIMITERS.test(command)) throw new RemoteExecutionError('invalid-input', 'Remote command input is invalid');
-  const executable = command
-    .slice(Math.max(command.lastIndexOf('/'), command.lastIndexOf('\\')) + 1)
-    .toLowerCase()
-    .replace(/\.exe$/u, '');
-  if (REJECTED_EXECUTABLES.has(executable)) throw new RemoteExecutionError('invalid-input', 'Remote command input is invalid');
-  if (SHELL_METACHARACTERS.test(command)) throw new RemoteExecutionError('invalid-input', 'Remote command input is invalid');
-  return command;
+  return validateText(value, MAX_COMMAND_LENGTH);
 }
 
 function validateArgs(value: unknown): readonly string[] {
   if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype || value.length > MAX_ARGUMENTS) {
     throw new RemoteExecutionError('invalid-input', 'Remote command input is invalid');
   }
-  return value.map((argument) => {
-    const validated = validateText(argument, MAX_ARGUMENT_LENGTH);
-    if (SHELL_METACHARACTERS.test(validated) || REJECTED_SHELL_FLAGS.has(validated.toLowerCase())) {
-      throw new RemoteExecutionError('invalid-input', 'Remote command input is invalid');
-    }
-    return validated;
-  });
+  return value.map((argument) => validateText(argument, MAX_ARGUMENT_LENGTH));
 }
 
 function validateApprovalToken(value: unknown): string | undefined {
@@ -362,13 +345,24 @@ function canonicalRequest(request: SudoApprovalRequest, identity: ApprovedProfil
   return JSON.stringify([identity, request.profileId, request.command, request.args, request.timeoutMs, request.maxOutputBytes]);
 }
 
-function requiresSudo(command: string, args: readonly string[]): boolean {
-  const privilegeExecutables = new Set(['doas', 'dzdo', 'pkexec', 'runuser', 'su', 'sudo', 'sudoedit']);
-  const isSudo = (value: string): boolean => {
-    const basename = value.slice(Math.max(value.lastIndexOf('/'), value.lastIndexOf('\\')) + 1).toLowerCase();
-    return privilegeExecutables.has(basename.replace(/\.exe$/u, ''));
-  };
-  return isSudo(command) || args.some(isSudo);
+function commandBasename(value: string): string {
+  return value
+    .slice(Math.max(value.lastIndexOf('/'), value.lastIndexOf('\\')) + 1)
+    .toLowerCase()
+    .replace(/\.exe$/u, '');
+}
+
+/**
+ * Direct privilege escalation always needs human approval. Command evaluators
+ * are also approved because they can otherwise hide an escalation behind a
+ * script, `-c` argument, or child command. They remain available; this is an
+ * approval boundary, not an execution allowlist.
+ */
+function requiresHumanApproval(command: string, args: readonly string[]): boolean {
+  const isPrivilegeEscalation = (value: string): boolean => PRIVILEGE_ESCALATION_EXECUTABLES.has(commandBasename(value));
+  const evaluatesCommand = COMMAND_EVALUATORS.has(commandBasename(command));
+  const findExecutesCommand = commandBasename(command) === 'find' && args.some((argument) => argument === '-exec' || argument === '-execdir');
+  return evaluatesCommand || findExecutesCommand || isPrivilegeEscalation(command) || args.some(isPrivilegeEscalation);
 }
 
 function approvalToken(): string {
@@ -758,7 +752,7 @@ export class RemoteCommandExecutionProvider {
       timeoutMs: request.timeoutMs!,
       maxOutputBytes: request.maxOutputBytes!,
     };
-    if (!requiresSudo(request.command, request.args)) return rejected();
+    if (!requiresHumanApproval(request.command, request.args)) return rejected();
     if (this.dependencies.humanApproval === undefined) return rejected('approval-unavailable');
     let profile: ConnectionProfile | undefined;
     let authorization: ExecutionAuthorization | undefined;
@@ -931,7 +925,7 @@ export class RemoteCommandExecutionProvider {
           command: redactAuditText(request.command),
           args: redactRemoteAuditArguments(request.args),
           argsHmac,
-          approvalState: requiresSudo(request.command, request.args) ? 'blocked' : 'not-required',
+          approvalState: requiresHumanApproval(request.command, request.args) ? 'blocked' : 'not-required',
         });
       } catch {
         releaseConcurrency();
@@ -951,7 +945,7 @@ export class RemoteCommandExecutionProvider {
     let transportSettled: Promise<void> | undefined;
     try {
       if (signal?.aborted) return finish(safeResult(request.profileId, 'cancelled', 'cancelled', { operationId }));
-      if (requiresSudo(request.command, request.args)) {
+      if (requiresHumanApproval(request.command, request.args)) {
         approvalState = 'blocked';
         if (request.approvalToken === undefined)
           return finish(

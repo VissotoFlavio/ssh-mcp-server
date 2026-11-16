@@ -29,8 +29,8 @@ validation or execution succeeds: each call still fails
 closed when, for example, the approved credential is unavailable, SSH
 authentication fails, or host identity verification fails. If a required
 composition boundary is unavailable, the tool is omitted; this is not an
-invitation to pass hosts, credentials, paths, or arbitrary shell commands to
-the MCP server.
+invitation to pass hosts, credentials, paths, or local shell commands to the
+MCP server.
 
 ## Prerequisites
 
@@ -227,7 +227,7 @@ advertise `list_approved_profiles`, `get_windows_readiness_status`,
 `validate_connection`, `execute_remote_command`, and
 `request_sudo_approval`. Execution additionally requires an initialized
 protected audit journal; sudo commands also require the separate native
-approver broker. Missing providers omit the applicable tools or make calls
+approver broker, as do command evaluators. Missing providers omit the applicable tools or make calls
 fail closed. A listed tool does not guarantee connection or execution
 readiness: an individual call can still fail closed. If state is missing or
 unsafe, discovery fails closed when called and returns no profile data. Do not run
@@ -242,7 +242,7 @@ npm run windows:audit:init
 ```
 
 Initialization is required once per protected state root. Do not run the
-rotation command during initial setup. For a recognized privilege-escalation command, start
+rotation command during initial setup. For a recognized privilege-escalation command or command evaluator, start
 the one-request native approval broker with `npm run windows:approver` in a
 separate operator console and provide its protected pipe/secret values only to
 the trusted MCP process. Ordinary bounded commands do not require that broker.

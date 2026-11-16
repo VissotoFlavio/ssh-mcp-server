@@ -228,7 +228,7 @@ std::wstring PipeName() {
 }
 
 std::wstring PromptText(const std::wstring& presentation) {
-  return L"Allow one approved SSH sudo command?\n\n" + presentation;
+  return L"Allow one approved SSH privileged or command-evaluator execution?\n\n" + presentation;
 }
 
 int Run() {
