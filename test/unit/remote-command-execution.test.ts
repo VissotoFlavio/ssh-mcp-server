@@ -367,6 +367,44 @@ test('rejects shell interpreters, remote wrappers, and control syntax', async ()
   assert.equal(transport.calls.length, 0);
 });
 
+test('allows only fixed read-only Docker and Nginx inventory forms', async () => {
+  const { provider, transport } = createProvider();
+  const allowed = [
+    { command: 'docker', args: ['version', '--format', '{{.Server.Version}}|{{.Server.Os}}|{{.Server.Arch}}'] },
+    { command: 'docker', args: ['ps', '--all', '--format', '{{.Names}}|{{.Image}}|{{.Status}}|{{.Ports}}'] },
+    { command: 'docker', args: ['network', 'ls', '--format', '{{.Name}}|{{.Driver}}|{{.Scope}}'] },
+    { command: 'docker', args: ['volume', 'ls', '--format', '{{.Name}}|{{.Driver}}'] },
+    { command: 'docker', args: ['compose', 'ls', '--format', 'json'] },
+    { command: 'find', args: ['/etc/nginx', '-maxdepth', '3', '-type', 'f'] },
+  ];
+
+  for (const request of allowed) {
+    const result = await provider.execute({ profileId: profile.profileId, ...request });
+    assert.equal(result.code, 'success');
+  }
+
+  assert.equal(transport.calls.length, allowed.length);
+});
+
+test('rejects custom Docker templates and altered Nginx inventory forms', async () => {
+  const { provider, transport } = createProvider();
+  const rejected = [
+    { command: 'docker', args: ['ps', '--all', '--format', '{{json .Config.Env}}'] },
+    { command: 'docker', args: ['ps', '--all', '--format', '{{.Names}}'] },
+    { command: 'docker', args: ['network', 'ls', '--format={{.Name}}'] },
+    { command: 'find', args: ['/etc/nginx', '-type', 'f'] },
+    { command: 'find', args: ['/', '-maxdepth', '3', '-type', 'f'] },
+    { command: 'find', args: ['/etc/nginx', '-maxdepth', '3', '-type', 'f', '-exec', 'cat', '{}', ';'] },
+  ];
+
+  for (const request of rejected) {
+    const result = await provider.execute({ profileId: profile.profileId, ...request });
+    assert.equal(result.code, 'invalid-input');
+  }
+
+  assert.equal(transport.calls.length, 0);
+});
+
 test('rejects new remote work when the process concurrency limit is full', async () => {
   const limiter = new RemoteCommandConcurrencyLimiter(1);
   const firstTransport = new FakeTransport();

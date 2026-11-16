@@ -53,7 +53,6 @@ const REJECTED_EXECUTABLES = new Set([
   'daemonize',
   'xargs',
   'parallel',
-  'find',
   'timeout',
   'watch',
   'busybox',
@@ -61,6 +60,38 @@ const REJECTED_EXECUTABLES = new Set([
 const REJECTED_SHELL_FLAGS = new Set(['-c', '-ccommand', '--command', '-command', '-encodedcommand', '--eval', '-e', '/c', '/k']);
 const SHELL_METACHARACTERS = /[;&|<>`$(){}]/u;
 const AUDIT_SINK_KEY = randomBytes(32);
+
+/**
+ * Read-only inventory forms that require syntax otherwise rejected at the
+ * generic command boundary. The caller cannot supply a custom Docker template
+ * or vary the constrained Nginx path traversal.
+ */
+const FIXED_INVENTORY_COMMANDS: readonly { readonly command: string; readonly args: readonly string[] }[] = [
+  {
+    command: 'docker',
+    args: ['version', '--format', '{{.Server.Version}}|{{.Server.Os}}|{{.Server.Arch}}'],
+  },
+  {
+    command: 'docker',
+    args: ['ps', '--all', '--format', '{{.Names}}|{{.Image}}|{{.Status}}|{{.Ports}}'],
+  },
+  {
+    command: 'docker',
+    args: ['network', 'ls', '--format', '{{.Name}}|{{.Driver}}|{{.Scope}}'],
+  },
+  {
+    command: 'docker',
+    args: ['volume', 'ls', '--format', '{{.Name}}|{{.Driver}}'],
+  },
+  {
+    command: 'docker',
+    args: ['compose', 'ls', '--format', 'json'],
+  },
+  {
+    command: 'find',
+    args: ['/etc/nginx', '-maxdepth', '3', '-type', 'f'],
+  },
+];
 
 export type RemoteExecutionOutcome = 'success' | 'failure' | 'timeout' | 'cancelled' | 'approval-required' | 'unknown';
 export type RemoteExecutionCode =
@@ -248,17 +279,58 @@ function validateCommand(value: unknown): string {
   return command;
 }
 
-function validateArgs(value: unknown): readonly string[] {
+function commandBasename(command: string): string {
+  return command
+    .slice(Math.max(command.lastIndexOf('/'), command.lastIndexOf('\\')) + 1)
+    .toLowerCase()
+    .replace(/\.exe$/u, '');
+}
+
+function sameArguments(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((argument, index) => argument === right[index]);
+}
+
+function isFixedInventoryCommand(command: string, args: readonly string[]): boolean {
+  const executable = commandBasename(command);
+  return FIXED_INVENTORY_COMMANDS.some((candidate) => candidate.command === executable && sameArguments(candidate.args, args));
+}
+
+function hasDockerFormatArgument(args: readonly string[]): boolean {
+  return args.some((argument) => argument === '--format' || argument.startsWith('--format='));
+}
+
+function validateInventoryShape(command: string, args: readonly string[]): void {
+  const executable = commandBasename(command);
+  const fixedInventoryCommand = isFixedInventoryCommand(command, args);
+
+  if (executable === 'find' && !fixedInventoryCommand) {
+    throw new RemoteExecutionError('invalid-input', 'Remote command input is invalid');
+  }
+
+  if (executable === 'docker' && hasDockerFormatArgument(args) && !fixedInventoryCommand) {
+    throw new RemoteExecutionError('invalid-input', 'Remote command input is invalid');
+  }
+}
+
+function validateArgs(value: unknown, command: string): readonly string[] {
   if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype || value.length > MAX_ARGUMENTS) {
     throw new RemoteExecutionError('invalid-input', 'Remote command input is invalid');
   }
-  return value.map((argument) => {
+  const args = value.map((argument) => {
     const validated = validateText(argument, MAX_ARGUMENT_LENGTH);
-    if (SHELL_METACHARACTERS.test(validated) || REJECTED_SHELL_FLAGS.has(validated.toLowerCase())) {
+    if (REJECTED_SHELL_FLAGS.has(validated.toLowerCase())) {
       throw new RemoteExecutionError('invalid-input', 'Remote command input is invalid');
     }
     return validated;
   });
+
+  const fixedInventoryCommand = isFixedInventoryCommand(command, args);
+  if (args.some((argument) => SHELL_METACHARACTERS.test(argument)) && !fixedInventoryCommand) {
+    throw new RemoteExecutionError('invalid-input', 'Remote command input is invalid');
+  }
+
+  validateInventoryShape(command, args);
+  return args;
 }
 
 function validateApprovalToken(value: unknown): string | undefined {
@@ -275,7 +347,7 @@ function parseRequest(input: unknown): RemoteCommandRequest {
   }
   const profileId = validateProfileId(own(input, 'profileId'));
   const command = validateCommand(own(input, 'command'));
-  const args = validateArgs(own(input, 'args'));
+  const args = validateArgs(own(input, 'args'), command);
   const timeoutMs = boundedTimeout(own(input, 'timeoutMs'));
   const maxOutputBytes = boundedOutputLimit(own(input, 'maxOutputBytes'));
   const approvalToken = validateApprovalToken(own(input, 'approvalToken'));

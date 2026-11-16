@@ -337,6 +337,25 @@ include `success`, `remote-failure`, `connection-failure`,
 `approval-rejected`, `execution-limit`, `execution-audit-unavailable`,
 `outcome-unknown`, `invalid-input`, and `provider-failure`.
 
+#### Fixed infrastructure inventory forms
+
+The normal validation boundary rejects shell metacharacters and arbitrary
+`find` traversal. To support a small, read-only VPS inventory, the following
+complete command-and-argument vectors are additionally accepted exactly as
+shown. They are not templates: callers cannot vary their Docker format,
+options, or path.
+
+- `docker`: `args: ["version", "--format", "{{.Server.Version}}|{{.Server.Os}}|{{.Server.Arch}}"]`
+- `docker`: `args: ["ps", "--all", "--format", "{{.Names}}|{{.Image}}|{{.Status}}|{{.Ports}}"]`
+- `docker`: `args: ["network", "ls", "--format", "{{.Name}}|{{.Driver}}|{{.Scope}}"]`
+- `docker`: `args: ["volume", "ls", "--format", "{{.Name}}|{{.Driver}}"]`
+- `docker`: `args: ["compose", "ls", "--format", "json"]`
+- `find`: `args: ["/etc/nginx", "-maxdepth", "3", "-type", "f"]`
+
+The `find` form returns file names only; it cannot read file content, execute a
+subcommand, or traverse outside `/etc/nginx`. Any modified or additional
+argument is rejected as `invalid-input`.
+
 **Structured success response**
 
 ```json

@@ -111,6 +111,24 @@ directories, or users can be administered. This server does not change those
 privileges. Commands may be used for those operator-authorized tasks, subject
 to the normal SSH profile and human approval boundaries.
 
+### Fixed read-only infrastructure inventory
+
+The request validator normally rejects shell metacharacters and all `find`
+commands. It permits the six exact inventory forms below as narrow exceptions
+needed to identify Docker and Nginx layout on an approved VPS:
+
+- `docker version --format "{{.Server.Version}}|{{.Server.Os}}|{{.Server.Arch}}"`
+- `docker ps --all --format "{{.Names}}|{{.Image}}|{{.Status}}|{{.Ports}}"`
+- `docker network ls --format "{{.Name}}|{{.Driver}}|{{.Scope}}"`
+- `docker volume ls --format "{{.Name}}|{{.Driver}}"`
+- `docker compose ls --format json`
+- `find /etc/nginx -maxdepth 3 -type f`
+
+The request must match one row completely. In particular, a Docker caller
+cannot supply a custom Go template, and `find` cannot target another path,
+read a file, add predicates, or invoke `-exec`. These forms produce names and
+runtime metadata only; they do not alter remote state.
+
 This increment explicitly excludes interactive or persistent shells, scripts,
 free-form redirection or pipes, file transfer, port forwarding, SSH
 configuration changes, and VPS changes during automated tests. File transfer

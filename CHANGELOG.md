@@ -5,6 +5,13 @@ publish a release.
 
 ## Unreleased
 
+### Added
+
+- Added six fixed, read-only Docker and Nginx inventory forms to bounded remote
+  execution. The exact forms expose Docker runtime metadata, containers,
+  networks, volumes, compose projects, and Nginx file names without accepting
+  caller-defined templates, paths, or `find` actions.
+
 ### Changed
 
 - Aligned README, POSIX and Windows operator guides, trust-model documentation,
