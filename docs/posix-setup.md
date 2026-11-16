@@ -151,7 +151,7 @@ message envelope and validates the native peer-credential boundary. If the
 platform cannot expose peer credentials, approval is unavailable. The audit
 root and key are mandatory for every remote execution attempt. The approver
 socket and secret are needed only when a recognized privilege-escalation
-command requests human approval.
+command or command evaluator requests human approval.
 
 Restart Codex if its client requires it, then first call
 `list_approved_profiles` with `{}`. Call `validate_connection` only with a

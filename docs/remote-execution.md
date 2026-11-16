@@ -7,13 +7,17 @@ cannot supply any of those values.
 
 The server enforces request validation, approved-profile authorization, host
 identity checks, execution bounds, mandatory durable auditing, and fail-closed
-behavior. Recognized privilege-escalation executables (`sudo`, `sudoedit`,
-`su`, `doas`, `dzdo`, `runuser`, and `pkexec`) additionally require exact,
-request-bound, one-use human approval. A command that mutates remote state
-without recognized privilege escalation is not given a second server-enforced
-human approval gate; it runs only with the remote account's existing
-permissions. The MCP does not classify every command as destructive, and
-client-side confirmation conventions are not server authorization.
+behavior. It does not maintain an allowlist of remote executables or argument
+shapes. Recognized privilege-escalation executables (`sudo`, `sudoedit`, `su`,
+`doas`, `dzdo`, `runuser`, and `pkexec`) additionally require exact,
+request-bound, one-use human approval. Command evaluators and wrappers that
+can invoke a child command, such as shells, language runtimes, `env`, `xargs`,
+and `ssh`, require the same approval rather than being blocked. A command that
+mutates remote state without recognized privilege escalation is not given a
+second server-enforced human approval gate; it runs only with the remote
+account's existing permissions. The MCP does not classify every command as
+destructive, and client-side confirmation conventions are not server
+authorization.
 
 The five tools advertise output schemas. Structured JSON results are returned
 through `structuredContent` in addition to the existing JSON text content;
@@ -26,9 +30,11 @@ legacy plain-text availability errors remain text-only for compatibility.
 2. Discover the profile with `list_approved_profiles` and validate it with
    `validate_connection`.
 3. Call `execute_remote_command` with `profileId`, one executable `command`,
-   and an `args` array. Do not put an entire shell script in `command`.
+   and an `args` array. The server treats every supplied value as a literal
+   remote argument; it does not use a local shell.
 4. For a command containing a privilege-escalation executable such as `sudo`,
-   `sudoedit`, `su`, `doas`, `runuser`, or `pkexec`, call
+   `sudoedit`, `su`, `doas`, `dzdo`, `runuser`, or `pkexec`, or a command
+   evaluator/wrapper, call
    `request_sudo_approval`. A trusted `HumanSudoApprovalProvider` callback injected by the host/runtime must
    confirm the exact request. The MCP caller cannot provide an approval
    boolean. Use the returned opaque one-time capability only with the
@@ -60,7 +66,8 @@ legacy plain-text availability errors remain text-only for compatibility.
    mutual HMAC challenge/response. The server reads only
    `SSH_MCP_APPROVER_PIPE` and `SSH_MCP_APPROVER_SECRET` from its trusted
    process environment. If the broker is absent or its handshake fails, only
-   sudo approval is unavailable; ordinary commands remain unaffected.
+   privileged-execution approval is unavailable; ordinary commands remain
+   unaffected.
 5. Inspect the redacted local audit stream on standard error when diagnosing a
    result. It contains the bounded command/arguments, profile, approval state,
    duration, exit status, outcome, and stable code, but never stdout/stderr,
@@ -80,11 +87,11 @@ legacy plain-text availability errors remain text-only for compatibility.
   output-limit completion all close the SSH client before returning.
 - Local execution uses direct process APIs or the in-process SSH2 client; a
   caller cannot enable a local shell, proxy, forwarding, or persistent session.
-- `sudo` approval is bound to profile, command, arguments, timeout, and output
-  limit plus the approved host, port, user, fingerprint, authentication mode,
-  credential reference, and known-hosts reference; it expires after one minute
-  and is consumed once. A second simultaneous approval request returns
-  `approval-busy` without opening an SSH session.
+- Privileged-execution approval is bound to profile, command, arguments,
+  timeout, and output limit plus the approved host, port, user, fingerprint,
+  authentication mode, credential reference, and known-hosts reference; it
+  expires after one minute and is consumed once. A second simultaneous
+  approval request returns `approval-busy` without opening an SSH session.
 - The durable execution journal records the intent, approval transition, and
   handoff immediately before the irreversible SSH action. Cancellation or
   expiry before handoff is `cancelled`; after handoff it is
@@ -111,13 +118,15 @@ directories, or users can be administered. This server does not change those
 privileges. Commands may be used for those operator-authorized tasks, subject
 to the normal SSH profile and human approval boundaries.
 
-This increment explicitly excludes interactive or persistent shells, scripts,
-free-form redirection or pipes, file transfer, port forwarding, SSH
-configuration changes, and VPS changes during automated tests. File transfer
-is owned by issue #94. The first delivery supports POSIX VPS targets from
-POSIX or Windows clients; remote Windows-host quoting is future work.
-Integration tests are opt-in and must use a disposable,
-non-production endpoint owned by the test operator.
+This increment excludes interactive or persistent SSH sessions, a local shell,
+and VPS changes during automated tests. The server has no separate file
+transfer or port-forwarding protocol, but it does not block remote programs
+from performing those actions. Shells, scripts, redirection, and pipes can be
+used only through a remote command evaluator and therefore require human
+approval. The first delivery supports POSIX VPS targets from POSIX or Windows
+clients; remote Windows-host quoting is future work. Integration tests are
+opt-in and must use a disposable, non-production endpoint owned by the test
+operator.
 
 ## Windows authentication
 

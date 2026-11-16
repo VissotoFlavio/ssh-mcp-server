@@ -2686,9 +2686,7 @@ const char* ClassifyNativeAgentFailure(const std::string& stderr_data) {
 
 bool HasUnsafeCommandText(const std::wstring& value) {
   for (wchar_t character : value) {
-    if (character < 0x20 || character == 0x7f || iswspace(character) != 0 || character == L';' || character == L'&' || character == L'|' ||
-        character == L'<' || character == L'>' || character == L'`' || character == L'$' || character == L'(' || character == L')' ||
-        character == L'{' || character == L'}') {
+    if (character < 0x20 || character == 0x7f) {
       return true;
     }
   }
@@ -2697,39 +2695,10 @@ bool HasUnsafeCommandText(const std::wstring& value) {
 
 bool HasUnsafeArgumentText(const std::wstring& value) {
   for (wchar_t character : value) {
-    if (character < 0x20 || character == 0x7f || character == L';' || character == L'&' || character == L'|' || character == L'<' ||
-        character == L'>' || character == L'`' || character == L'$' || character == L'(' || character == L')' || character == L'{' ||
-        character == L'}') {
+    if (character < 0x20 || character == 0x7f) {
       return true;
     }
   }
-  return false;
-}
-
-std::wstring LowerAscii(const std::wstring& value) {
-  std::wstring lowered = value;
-  for (wchar_t& character : lowered) {
-    if (character >= L'A' && character <= L'Z') character = static_cast<wchar_t>(character - L'A' + L'a');
-  }
-  return lowered;
-}
-
-bool IsRejectedRemoteExecutable(const std::wstring& command) {
-  const size_t separator = command.find_last_of(L"/\\");
-  std::wstring executable = LowerAscii(command.substr(separator == std::wstring::npos ? 0 : separator + 1));
-  if (executable.size() > 4 && executable.compare(executable.size() - 4, 4, L".exe") == 0) executable.resize(executable.size() - 4);
-  static constexpr const wchar_t* rejected[] = {L"sh", L"bash", L"dash", L"zsh", L"ksh", L"csh", L"tcsh", L"fish", L"cmd", L"powershell",
-                                                 L"pwsh", L"python", L"python3", L"perl", L"ruby", L"node", L"ssh", L"scp", L"sftp", L"rsync",
-                                                 L"env", L"nohup", L"setsid", L"daemonize", L"xargs", L"parallel", L"find", L"timeout", L"watch",
-                                                 L"busybox"};
-  for (const wchar_t* candidate : rejected) if (executable == candidate) return true;
-  return false;
-}
-
-bool IsRejectedShellFlag(const std::wstring& value) {
-  const std::wstring lowered = LowerAscii(value);
-  static constexpr const wchar_t* rejected[] = {L"-c", L"-ccommand", L"--command", L"-command", L"-encodedcommand", L"--eval", L"-e", L"/c", L"/k"};
-  for (const wchar_t* candidate : rejected) if (lowered == candidate) return true;
   return false;
 }
 
@@ -2782,7 +2751,7 @@ bool ReadCommandArguments(napi_env env, napi_value object, std::vector<std::wstr
     if (napi_get_value_string_utf8(env, element, buffer.data(), buffer.size(), &bytes) != napi_ok) return false;
     std::string utf8(buffer.data(), bytes);
     std::wstring wide;
-    if (!Utf8ToWide(utf8, &wide) || HasUnsafeArgumentText(wide) || IsRejectedShellFlag(wide)) return false;
+    if (!Utf8ToWide(utf8, &wide) || HasUnsafeArgumentText(wide)) return false;
     arguments->push_back(std::move(wide));
   }
   return true;
@@ -2831,8 +2800,7 @@ bool ReadNativeAgentCommandRequest(napi_env env, napi_value input, NativeAgentCo
       !ReadCommandString(env, input, "expectedHostFingerprint", 64, &request->expected_fingerprint) || !IsFingerprint(request->expected_fingerprint) ||
       !ReadCommandString(env, input, "command", kNativeCommandMaxCommandBytes, &command_utf8) || !ReadCommandArguments(env, input, &request->arguments)) return false;
   if (!Utf8ToWide(host_utf8, &request->host) || !Utf8ToWide(user_utf8, &request->user) || !Utf8ToWide(command_utf8, &request->command) ||
-      !IsSafeReadinessHost(request->host) || !IsSafeReadinessUser(request->user) || HasUnsafeCommandText(request->command) ||
-      IsRejectedRemoteExecutable(request->command)) return false;
+      !IsSafeReadinessHost(request->host) || !IsSafeReadinessUser(request->user) || HasUnsafeCommandText(request->command)) return false;
   double port = 0;
   double timeout = 0;
   double output_limit = 0;
