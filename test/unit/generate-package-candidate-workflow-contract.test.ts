@@ -8,6 +8,7 @@ import test from 'node:test';
 const workflow = readFileSync(join(process.cwd(), '.github', 'workflows', 'generate-package-candidate.yml'), 'utf8');
 const helper = readFileSync(join(process.cwd(), 'scripts', 'verify-candidate-checks.sh'), 'utf8');
 const packageManifest = JSON.parse(readFileSync(join(process.cwd(), 'package.json'), 'utf8')) as { files: string[] };
+const resolve = workflow.slice(workflow.indexOf('  resolve:'), workflow.indexOf('  check:'));
 const packageGate = workflow.slice(workflow.indexOf('  package-gate:'), workflow.indexOf('  package-windows:'));
 const packaging = workflow.slice(workflow.indexOf('  package-windows:'), workflow.indexOf('  publish:'));
 const publish = workflow.slice(workflow.indexOf('  publish:'), workflow.indexOf('  report:'));
@@ -170,6 +171,16 @@ test('candidate helper chooses the newest started attempt and fails closed on am
   assert.match(helper, /exit 1/u);
 });
 
+test('candidate versions use the next sequence for their stable version and channel', () => {
+  assert.match(workflow, /group: package-candidate-\$\{\{ github\.repository \}\}/u);
+  assert.doesNotMatch(workflow, /group: package-candidate-\$\{\{ github\.repository \}\}-\$\{\{ github\.event\.issue\.number \}\}/u);
+  assert.match(resolve, /git\/matching-refs\/tags\/\$tag_prefix/u);
+  assert.match(resolve, /ltrimstr\("refs\/tags\/" \+ \$tag_prefix\)/u);
+  assert.match(resolve, /select\(test\("\^\[1-9\]\[0-9\]\*\$"\)\)/u);
+  assert.match(resolve, /candidate_version="\$\{base_version\}-\$\{channel\}-\$\(\(existing_sequence \+ 1\)\)"/u);
+  assert.doesNotMatch(resolve, /candidate_version=".*PULL_REQUEST_NUMBER|candidate_version=".*source_sha/u);
+});
+
 test('package-gate validates identity, exposes errors, and invokes the trusted helper', () => {
   assert.match(packageGate, /runs-on: ubuntu-latest/u);
   assert.match(packageGate, /checks: read\s+actions: read/u);
@@ -197,6 +208,7 @@ test('packaging is only the candidate build and pack matrix', () => {
   assert.doesNotMatch(packaging, /path: verifier|verify-candidate-checks|outputs:|checks: read|actions: read/u);
   assert.match(packaging, /npm run build:native/u);
   assert.match(packaging, /npm pack --json/u);
+  assert.match(packaging, /\(rc\|hotfix\)-\[1-9\]\[0-9\]\*\$/u);
   assert.match(packaging, /build\/Release\/ssh-mcp-approver\.exe/u);
   assert.match(packaging, /scripts\/windows-approver\.mjs/u);
   assert.match(packaging, /scripts\/windows-audit-journal\.mjs/u);
@@ -236,6 +248,8 @@ test('publication rechecks immediately before release and exposes late errors', 
   assert.match(publish, /emit_error/u);
   assert.match(publish, /\.head\.repo\.full_name == \$repository and \.head\.sha == \$source_sha/u);
   assert.match(publish, /gh release create "\$tag"/u);
+  assert.match(publish, /--title "\$VERSION"/u);
+  assert.doesNotMatch(publish, /--title "Candidate \$VERSION"/u);
   assert.match(publish, /gh release upload "\$tag"/u);
   assert.match(publish, /release_status.*404/u);
   assert.match(publish, /Unable to determine whether candidate release/u);
