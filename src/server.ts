@@ -9,6 +9,12 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import { serializeAuditEvent } from './diagnostics/redacted-diagnostics-audit.js';
 import { createLocalHumanSudoApprovalProvider } from './execution/human-approver-ipc.js';
 import {
+  requestFileUploadApprovalToolName,
+  uploadRemoteFileToolName,
+  type FileUploadResult,
+  type RemoteFileUploadProvider,
+} from './execution/remote-file-upload.js';
+import {
   remoteCommandToolName,
   requestSudoApprovalToolName,
   type HumanSudoApprovalProvider,
@@ -53,6 +59,10 @@ const REMOTE_COMMAND_DESCRIPTION =
   "Executes one bounded non-interactive command on an approved SSH profile without an executable allowlist. Recognized privilege-escalation executables and command evaluators require request-bound human approval; other commands use the remote account's existing permissions and may modify remote state without an additional server approval gate. Supports no persistent SSH session or local shell.";
 const SUDO_APPROVAL_DESCRIPTION =
   'Requests a one-time human approval for one exact privileged or command-evaluator execution. Approval is request-bound, expires quickly, and cannot be supplied as a caller boolean.';
+const FILE_UPLOAD_APPROVAL_DESCRIPTION =
+  'Shows a local human approver the exact remote destination, file size, and SHA-256 before issuing a one-use upload capability. File content is never presented to the approver.';
+const FILE_UPLOAD_DESCRIPTION =
+  'Uploads one Base64 file to the exact remote destination approved by the local human approver. The destination is not restricted by a server-side directory allowlist; remote permissions still apply.';
 const SAFE_PROFILE_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
 const MAX_DISCOVERABLE_PROFILES = 256;
 
@@ -200,6 +210,58 @@ const SUDO_APPROVAL_OUTPUT_SCHEMA = {
   additionalProperties: false,
 };
 
+const FILE_UPLOAD_APPROVAL_OUTPUT_SCHEMA = {
+  type: 'object',
+  properties: {
+    approved: { type: 'boolean' },
+    code: { type: 'string', enum: ['approved', 'approval-unavailable', 'approval-rejected', 'approval-busy', 'cancelled', 'invalid-input'] },
+    operationId: { type: 'string', pattern: '^[a-f0-9]{32}$' },
+    capability: { type: 'string', maxLength: 256 },
+  },
+  required: ['approved', 'code', 'operationId'],
+  additionalProperties: false,
+};
+
+const FILE_UPLOAD_OUTPUT_SCHEMA = {
+  type: 'object',
+  properties: {
+    operationId: { type: 'string', pattern: '^[a-f0-9]{32}$' },
+    profileId: { type: 'string', pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$|^unknown$' },
+    remotePath: { type: 'string', maxLength: 4096 },
+    sha256: { type: 'string', pattern: '^[a-f0-9]{64}$|^$' },
+    sizeBytes: { type: 'integer', minimum: 0, maximum: 1048576 },
+    outcome: { type: 'string', enum: ['success', 'failure', 'timeout', 'cancelled', 'approval-required', 'unknown'] },
+    code: {
+      type: 'string',
+      enum: [
+        'success',
+        'connection-failure',
+        'authentication-failure',
+        'host-key-failure',
+        'remote-failure',
+        'integrity-failure',
+        'timeout',
+        'cancelled',
+        'approval-required',
+        'approval-expired',
+        'approval-altered',
+        'approval-reused',
+        'approval-unavailable',
+        'approval-busy',
+        'approval-rejected',
+        'execution-limit',
+        'execution-audit-unavailable',
+        'outcome-unknown',
+        'invalid-input',
+        'provider-failure',
+      ],
+    },
+    integrity: { type: 'string', enum: ['verified', 'unknown'] },
+  },
+  required: ['operationId', 'profileId', 'remotePath', 'sha256', 'sizeBytes', 'outcome', 'code', 'integrity'],
+  additionalProperties: false,
+};
+
 export interface ServerOptions {
   /** Trusted provider that exposes only minimized, approved profile summaries. */
   readonly approvedProfileListingProvider?: ApprovedProfileListingProvider;
@@ -212,6 +274,8 @@ export interface ServerOptions {
   /** Trusted remote execution and human approval boundary. */
   readonly remoteCommandExecutionProvider?: RemoteCommandExecutionProvider;
   readonly humanSudoApprovalProvider?: HumanSudoApprovalProvider;
+  /** Trusted upload provider. It is absent until a platform transport is composed. */
+  readonly remoteFileUploadProvider?: RemoteFileUploadProvider;
 }
 
 export interface StdioServerOptions {
@@ -224,6 +288,7 @@ export interface StdioServerOptions {
   windowsReadinessStatusProvider?: WindowsReadinessStatusProvider;
   remoteCommandExecutionProvider?: RemoteCommandExecutionProvider;
   humanSudoApprovalProvider?: HumanSudoApprovalProvider;
+  remoteFileUploadProvider?: RemoteFileUploadProvider;
 }
 
 function isEmptyDiscoveryInput(input: unknown): boolean {
@@ -355,6 +420,10 @@ function remoteResult(result: RemoteCommandResult): ReturnType<typeof textToolRe
   return textToolResult(JSON.stringify(result), result.outcome !== 'success' && result.outcome !== 'approval-required', structuredResult);
 }
 
+function fileUploadResult(result: FileUploadResult): ReturnType<typeof textToolResult> {
+  return jsonToolResult(result, result.outcome !== 'success' && result.outcome !== 'approval-required');
+}
+
 function unavailableConnectionValidationResult(): ReturnType<typeof textToolResult> {
   return validationResult({ ready: false, outcome: 'failure', code: 'provider-failure' }, true);
 }
@@ -469,6 +538,7 @@ function registerTools(
   windowsReadinessStatusProvider: WindowsReadinessStatusProvider | undefined,
   remoteCommandExecutionProvider: RemoteCommandExecutionProvider | undefined,
   humanSudoApprovalProvider: HumanSudoApprovalProvider | undefined,
+  remoteFileUploadProvider: RemoteFileUploadProvider | undefined,
   auditSink: ((serializedEvent: string) => void) | undefined,
 ): void {
   const configuredRemoteCommandExecutionProvider =
@@ -570,6 +640,45 @@ function registerTools(
               },
             },
           ]),
+      ...(remoteFileUploadProvider === undefined
+        ? []
+        : [
+            {
+              name: requestFileUploadApprovalToolName,
+              description: FILE_UPLOAD_APPROVAL_DESCRIPTION,
+              outputSchema: FILE_UPLOAD_APPROVAL_OUTPUT_SCHEMA,
+              annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+              inputSchema: {
+                type: 'object',
+                properties: {
+                  profileId: { type: 'string', pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$' },
+                  remotePath: { type: 'string', minLength: 1, maxLength: 4096 },
+                  contentBase64: { type: 'string', minLength: 1, maxLength: 1398108 },
+                  timeoutMs: { type: 'integer', minimum: 1, maximum: 60000 },
+                },
+                required: ['profileId', 'remotePath', 'contentBase64'],
+                additionalProperties: false,
+              },
+            },
+            {
+              name: uploadRemoteFileToolName,
+              description: FILE_UPLOAD_DESCRIPTION,
+              outputSchema: FILE_UPLOAD_OUTPUT_SCHEMA,
+              annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+              inputSchema: {
+                type: 'object',
+                properties: {
+                  profileId: { type: 'string', pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$' },
+                  remotePath: { type: 'string', minLength: 1, maxLength: 4096 },
+                  contentBase64: { type: 'string', minLength: 1, maxLength: 1398108 },
+                  timeoutMs: { type: 'integer', minimum: 1, maximum: 60000 },
+                  approvalToken: { type: 'string', minLength: 1, maxLength: 256 },
+                },
+                required: ['profileId', 'remotePath', 'contentBase64', 'approvalToken'],
+                additionalProperties: false,
+              },
+            },
+          ]),
     ],
   }));
 
@@ -606,6 +715,28 @@ function registerTools(
       } catch {
         return jsonToolResult({ approved: false, code: 'invalid-input' }, true);
       }
+    }
+
+    if (request.params.name === requestFileUploadApprovalToolName) {
+      if (remoteFileUploadProvider === undefined)
+        return jsonToolResult({ approved: false, code: 'approval-unavailable', operationId: '0'.repeat(32) }, true);
+      const approval = await remoteFileUploadProvider.requestApproval(request.params.arguments, extra.signal);
+      return jsonToolResult(approval, approval.approved !== true);
+    }
+
+    if (request.params.name === uploadRemoteFileToolName) {
+      if (remoteFileUploadProvider === undefined)
+        return fileUploadResult({
+          operationId: '0'.repeat(32),
+          profileId: 'unknown',
+          remotePath: '',
+          sha256: '',
+          sizeBytes: 0,
+          outcome: 'failure',
+          code: 'provider-failure',
+          integrity: 'unknown',
+        });
+      return fileUploadResult(await remoteFileUploadProvider.upload(request.params.arguments, extra.signal));
     }
 
     if (request.params.name === remoteCommandToolName) {
@@ -667,6 +798,7 @@ export function createServer({
   windowsReadinessStatusProvider,
   remoteCommandExecutionProvider,
   humanSudoApprovalProvider,
+  remoteFileUploadProvider,
 }: ServerOptions = {}): Server {
   const server = new Server({ name: serverName, version: serverVersion }, { capabilities: { tools: {} } });
   registerTools(
@@ -676,6 +808,7 @@ export function createServer({
     windowsReadinessStatusProvider,
     remoteCommandExecutionProvider,
     humanSudoApprovalProvider,
+    remoteFileUploadProvider,
     auditSink,
   );
   return server;
@@ -695,6 +828,7 @@ export async function runStdioServer({
   windowsReadinessStatusProvider,
   remoteCommandExecutionProvider,
   humanSudoApprovalProvider,
+  remoteFileUploadProvider,
 }: StdioServerOptions = {}): Promise<void> {
   const server = createServer({
     approvedProfileListingProvider,
@@ -702,6 +836,7 @@ export async function runStdioServer({
     windowsReadinessStatusProvider,
     remoteCommandExecutionProvider,
     humanSudoApprovalProvider,
+    remoteFileUploadProvider,
     auditSink: (serializedEvent) => errorOutput.write(`${serializedEvent}\n`),
   });
   const transport = new StdioServerTransport(input, output);
