@@ -53,6 +53,12 @@ function provider(transport: RemoteFileUploadTransport, journal?: ExecutionAudit
   });
 }
 
+async function approvedInput(uploadProvider: RemoteFileUploadProvider, value = input) {
+  const approval = await uploadProvider.requestActionApproval(value);
+  assert.equal(approval.approved, true);
+  return { ...value, approvalCapability: approval.capability };
+}
+
 test('uploads once through the client-confirmed mutating tool and requires a transport-confirmed digest', async () => {
   let received: RemoteFileUploadTransportRequest | undefined;
   const uploadProvider = provider({
@@ -62,7 +68,7 @@ test('uploads once through the client-confirmed mutating tool and requires a tra
       return { uploadedBytes: request.content.length, sha256: request.sha256 };
     },
   });
-  const uploaded = await uploadProvider.upload(input);
+  const uploaded = await uploadProvider.upload(await approvedInput(uploadProvider));
   assert.equal(uploaded.outcome, 'success');
   assert.equal(uploaded.integrity, 'verified');
   assert.equal(received?.remotePath, input.remotePath);
@@ -102,7 +108,7 @@ test('records only a redacted destination in the durable upload journal', async 
     },
     journal,
   );
-  await uploadProvider.upload(input);
+  await uploadProvider.upload(await approvedInput(uploadProvider));
 
   assert.deepEqual(intents[0].args, [
     '[redacted]',
@@ -124,7 +130,7 @@ test('returns unknown after an upload handoff is interrupted', async () => {
       throw new RemoteExecutionError('timeout', 'timed out');
     },
   });
-  const uploaded = await uploadProvider.upload(input);
+  const uploaded = await uploadProvider.upload(await approvedInput(uploadProvider));
   assert.equal(uploaded.outcome, 'unknown');
   assert.equal(uploaded.code, 'outcome-unknown');
 });
@@ -147,7 +153,7 @@ test('fails closed before transport when a durable audit journal is unavailable'
       },
     },
   });
-  const uploadedResult = await uploadProvider.upload(input);
+  const uploadedResult = await uploadProvider.upload(await approvedInput(uploadProvider));
   assert.equal(uploadedResult.code, 'execution-audit-unavailable');
   assert.equal(uploaded, false);
 });

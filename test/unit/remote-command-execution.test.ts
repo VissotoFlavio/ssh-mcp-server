@@ -80,6 +80,12 @@ function createProvider(
   };
 }
 
+async function executeClientApproved(provider: RemoteCommandExecutionProvider, request: Record<string, unknown>) {
+  const approval = await provider.requestActionApproval(request);
+  assert.equal(approval.approved, true);
+  return provider.execute({ ...request, approvalCapability: approval.capability });
+}
+
 const command = { profileId: 'production-api', command: 'uname', args: ['-a'] };
 
 test('executes the strict contract and returns bounded structured output', async () => {
@@ -141,18 +147,18 @@ test('preserves public host-key and authentication failure classes from authoriz
 test('executes sudo once after client confirmation and records a redacted audit event', async () => {
   const audit: string[] = [];
   const { provider, transport } = createProvider(undefined, { audit });
-  const result = await provider.execute({ profileId: profile.profileId, command: 'sudo', args: ['--password=secret'] });
+  const result = await executeClientApproved(provider, { profileId: profile.profileId, command: 'sudo', args: ['--password=secret'] });
   assert.equal(result.outcome, 'success');
   assert.equal(result.code, 'success');
   assert.equal(transport.calls.length, 1);
   assert.equal(audit.length, 1);
   assert.equal(audit[0].includes('secret'), false);
-  assert.equal(JSON.parse(audit[0]).approvalState, 'not-required');
+  assert.equal(JSON.parse(audit[0]).approvalState, 'approved');
 });
 
 test('does not depend on a native sudo approver', async () => {
   const { provider, transport } = createProvider(undefined, { humanApproval: false });
-  const result = await provider.execute({ profileId: profile.profileId, command: 'sudo', args: ['id'] });
+  const result = await executeClientApproved(provider, { profileId: profile.profileId, command: 'sudo', args: ['id'] });
   assert.equal(result.outcome, 'success');
   assert.equal(result.code, 'success');
   assert.equal(transport.calls.length, 1);
@@ -161,7 +167,7 @@ test('does not depend on a native sudo approver', async () => {
 test('executes recognized privilege-escalation executables without a second server prompt', async () => {
   for (const command of ['doas', 'dzdo', 'pkexec', 'runuser', 'su', 'sudoedit']) {
     const { provider, transport } = createProvider(undefined, { humanApproval: false });
-    const result = await provider.execute({ profileId: profile.profileId, command, args: ['id'] });
+    const result = await executeClientApproved(provider, { profileId: profile.profileId, command, args: ['id'] });
     assert.equal(result.code, 'success');
     assert.equal(transport.calls.length, 1);
   }
@@ -330,7 +336,7 @@ test('allows arbitrary non-privileged executables and literal arguments', async 
 test('executes command evaluators in one client-confirmed call', async () => {
   const { provider, transport } = createProvider();
   const request = { profileId: profile.profileId, command: 'bash', args: ['-c', 'printf approved'] };
-  const result = await provider.execute(request);
+  const result = await executeClientApproved(provider, request);
   assert.equal(result.code, 'success');
   assert.equal(transport.calls.length, 1);
 });
@@ -347,7 +353,7 @@ test('does not open a server approval flow for command evaluators and find comma
     { ...command, command: 'busybox', args: ['sh', '-c', 'id'] },
     { ...command, command: 'find', args: ['.', '-exec', 'id', ';'] },
   ]) {
-    const result = await provider.execute(request);
+    const result = await executeClientApproved(provider, request);
     assert.equal(result.code, 'success');
   }
   assert.equal(transport.calls.length, 8);

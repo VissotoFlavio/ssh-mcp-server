@@ -144,18 +144,25 @@ test('registers and routes remote execution without a production endpoint', asyn
     jsonrpc: '2.0',
     id: 3,
     method: 'tools/call',
+    params: { name: 'request_action_approval', arguments: { action: 'remote-command', profileId: 'test-profile', command: 'sudo', args: ['id'] } },
+  });
+  const approval = JSON.parse((result.result as { content: Array<{ text: string }> }).content[0].text) as { capability: string };
+  const execution = await requestResponse(input, output, {
+    jsonrpc: '2.0',
+    id: 4,
+    method: 'tools/call',
     params: {
       name: 'execute_remote_command',
-      arguments: { profileId: 'test-profile', command: 'sudo', args: ['id'] },
+      arguments: { profileId: 'test-profile', command: 'sudo', args: ['id'], approvalCapability: approval.capability },
     },
   });
-  const resultPayload = JSON.parse((result.result as { content: Array<{ text: string }> }).content[0].text) as Record<string, unknown>;
+  const resultPayload = JSON.parse((execution.result as { content: Array<{ text: string }> }).content[0].text) as Record<string, unknown>;
   assert.equal(resultPayload.profileId, 'test-profile');
   assert.equal(resultPayload.outcome, 'success');
   assert.equal(resultPayload.code, 'success');
   assert.match(String(resultPayload.operationId), /^[a-f0-9]{32}$/u);
   assert.equal(resultPayload.stdout, 'test-output');
-  assert.deepEqual((result.result as { structuredContent: unknown }).structuredContent, resultPayload);
+  assert.deepEqual((execution.result as { structuredContent: unknown }).structuredContent, resultPayload);
 
   input.end();
   await runtime;
@@ -220,7 +227,7 @@ test('MCP SDK 1.x validates structured output and preserves legacy text errors',
       const listed = await client.listTools();
       assert.deepEqual(
         listed.tools.map((tool) => tool.name),
-        ['list_approved_profiles', 'validate_connection', 'get_windows_readiness_status', 'execute_remote_command'],
+        ['list_approved_profiles', 'validate_connection', 'get_windows_readiness_status', 'request_action_approval', 'execute_remote_command'],
       );
       for (const tool of listed.tools) {
         assert.equal(tool.outputSchema?.type, 'object');
@@ -239,10 +246,16 @@ test('MCP SDK 1.x validates structured output and preserves legacy text errors',
       assert.deepEqual(structuredPayload(validation), { profileId: 'test-profile', ready: true });
       assert.deepEqual(textPayload(validation), structuredPayload(validation));
 
+      const approval = contractResult(
+        await client.callTool({
+          name: 'request_action_approval',
+          arguments: { action: 'remote-command', profileId: 'test-profile', command: 'sudo', args: ['id'] },
+        }),
+      );
       const execution = contractResult(
         await client.callTool({
           name: 'execute_remote_command',
-          arguments: { profileId: 'test-profile', command: 'sudo', args: ['id'] },
+          arguments: { profileId: 'test-profile', command: 'sudo', args: ['id'], approvalCapability: structuredPayload(approval).capability },
         }),
       );
       assert.equal(structuredPayload(execution).outcome, 'success');

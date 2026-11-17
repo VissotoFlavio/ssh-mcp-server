@@ -5,7 +5,7 @@ import test from 'node:test';
 
 import { createExecutionAuthorization } from '../../src/execution/remote-command-execution.js';
 import { RemoteFileUploadProvider, uploadRemoteFileToolName } from '../../src/execution/remote-file-upload.js';
-import { runStdioServer } from '../../src/server.js';
+import { requestActionApprovalToolName, runStdioServer } from '../../src/server.js';
 
 const profile = {
   profileId: 'production-api',
@@ -59,20 +59,35 @@ test('registers one client-confirmed upload tool and returns a structured verifi
   const listed = (tools.result as { tools: readonly { name: string; annotations?: unknown; outputSchema?: { type?: string } }[] }).tools;
   assert.deepEqual(
     listed.map((tool) => tool.name),
-    [uploadRemoteFileToolName],
+    [requestActionApprovalToolName, uploadRemoteFileToolName],
   );
   for (const tool of listed) {
     assert.deepEqual(tool.annotations, { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true });
     assert.equal(tool.outputSchema?.type, 'object');
   }
 
-  const upload = await requestResponse(input, output, {
+  const approval = await requestResponse(input, output, {
     jsonrpc: '2.0',
     id: 3,
     method: 'tools/call',
     params: {
+      name: requestActionApprovalToolName,
+      arguments: { action: 'file-upload', profileId: profile.profileId, remotePath: '/opt/app/.env', contentBase64: payload },
+    },
+  });
+  const approvalPayload = JSON.parse((approval.result as { content: readonly { text: string }[] }).content[0].text) as { capability: string };
+  const upload = await requestResponse(input, output, {
+    jsonrpc: '2.0',
+    id: 4,
+    method: 'tools/call',
+    params: {
       name: uploadRemoteFileToolName,
-      arguments: { profileId: profile.profileId, remotePath: '/opt/app/.env', contentBase64: payload },
+      arguments: {
+        profileId: profile.profileId,
+        remotePath: '/opt/app/.env',
+        contentBase64: payload,
+        approvalCapability: approvalPayload.capability,
+      },
     },
   });
   const result = upload.result as { content: readonly { text: string }[]; structuredContent: Record<string, unknown> };

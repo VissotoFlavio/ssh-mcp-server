@@ -1,3 +1,4 @@
+import { ActionApprovalStore } from '../execution/action-approval.js';
 import type { ExecutionAuditJournal } from '../execution/execution-audit-journal.js';
 import { UnavailableExecutionAuditJournal } from '../execution/execution-audit-journal.js';
 import {
@@ -78,6 +79,7 @@ export function createWindowsRuntimeProviders(
   })(),
   humanApproval?: HumanSudoApprovalProvider,
 ): WindowsRuntimeProviders {
+  const actionApprovals = new ActionApprovalStore();
   const validationProvider =
     validationSession === undefined
       ? undefined
@@ -113,6 +115,7 @@ export function createWindowsRuntimeProviders(
           auditJournal: storage.executionAuditJournal ?? new UnavailableExecutionAuditJournal(),
           authorizationProvider: validationProvider === undefined ? undefined : createProfileExecutionAuthorizationProvider(validationProvider),
           humanApproval,
+          actionApprovals,
         });
   const remoteFileUploadProvider =
     validationProvider === undefined || typeof storage.getProfile !== 'function'
@@ -128,6 +131,7 @@ export function createWindowsRuntimeProviders(
           ),
           auditJournal: storage.executionAuditJournal ?? new UnavailableExecutionAuditJournal(),
           authorizationProvider: createProfileExecutionAuthorizationProvider(validationProvider),
+          actionApprovals,
         });
   const readinessStorage =
     typeof storage.inspectReadiness === 'function' &&

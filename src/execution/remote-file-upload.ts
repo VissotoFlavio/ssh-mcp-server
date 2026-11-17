@@ -4,6 +4,7 @@ import { Client, type AuthHandlerMiddleware, type ConnectConfig, type NextAuthHa
 
 import type { ConnectionValidationProvider } from '../validation/trusted-connection-validation.js';
 
+import { ActionApprovalStore } from './action-approval.js';
 import { UnavailableExecutionAuditJournal, type ExecutionAuditHandle, type ExecutionAuditJournal } from './execution-audit-journal.js';
 import {
   RemoteCommandConcurrencyLimiter,
@@ -23,7 +24,7 @@ const PROFILE_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
 // eslint-disable-next-line no-control-regex -- control characters make an approval presentation ambiguous.
 const CONTROL_CHARACTERS = /[\u0000-\u001F\u007F]/u;
 
-export type FileUploadOutcome = 'success' | 'failure' | 'timeout' | 'cancelled' | 'unknown';
+export type FileUploadOutcome = 'success' | 'failure' | 'timeout' | 'cancelled' | 'approval-required' | 'unknown';
 export type FileUploadCode =
   | 'success'
   | 'connection-failure'
@@ -33,6 +34,10 @@ export type FileUploadCode =
   | 'integrity-failure'
   | 'timeout'
   | 'cancelled'
+  | 'approval-required'
+  | 'approval-expired'
+  | 'approval-altered'
+  | 'approval-reused'
   | 'execution-limit'
   | 'execution-audit-unavailable'
   | 'outcome-unknown'
@@ -46,6 +51,7 @@ export interface FileUploadRequest {
   readonly content: Buffer;
   readonly sha256: string;
   readonly timeoutMs: number;
+  readonly approvalCapability?: string;
 }
 
 export interface RemoteFileUploadTransportRequest {
@@ -86,6 +92,7 @@ export interface RemoteFileUploadDependencies {
   readonly auditJournal?: ExecutionAuditJournal;
   readonly authorizationProvider?: ExecutionAuthorizationProvider;
   readonly concurrency?: RemoteCommandConcurrencyLimiter;
+  readonly actionApprovals?: ActionApprovalStore;
 }
 
 export interface FileUploadResult {
@@ -145,18 +152,30 @@ function decodeContent(value: unknown): Buffer {
   return decoded;
 }
 
-function parse(input: unknown): FileUploadRequest {
+function approvalCapability(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || value.length === 0 || value.length > 256 || CONTROL_CHARACTERS.test(value)) inputError();
+  return value;
+}
+
+function parse(input: unknown, allowApprovalCapability = false): FileUploadRequest {
   if (!isPlainRecord(input)) inputError();
-  const allowed = new Set(['profileId', 'remotePath', 'contentBase64', 'timeoutMs']);
+  const allowed = new Set(['profileId', 'remotePath', 'contentBase64', 'timeoutMs', ...(allowApprovalCapability ? ['approvalCapability'] : [])]);
   if (Reflect.ownKeys(input).some((key) => typeof key !== 'string' || !allowed.has(key))) inputError();
   const content = decodeContent(own(input, 'contentBase64'));
+  const capability = allowApprovalCapability ? approvalCapability(own(input, 'approvalCapability')) : undefined;
   return Object.freeze({
     profileId: profileId(own(input, 'profileId')),
     remotePath: remotePath(own(input, 'remotePath')),
     content,
     sha256: createHash('sha256').update(content).digest('hex'),
     timeoutMs: timeout(own(input, 'timeoutMs')),
+    ...(capability === undefined ? {} : { approvalCapability: capability }),
   });
+}
+
+function approvalBinding(request: FileUploadRequest): string {
+  return JSON.stringify([request.profileId, request.remotePath, request.content.length, request.sha256, request.timeoutMs]);
 }
 
 function operationId(): string {
@@ -369,16 +388,45 @@ export class WindowsPasswordFileUploadTransport implements RemoteFileUploadTrans
 export class RemoteFileUploadProvider {
   private readonly auditJournal: ExecutionAuditJournal;
   private readonly concurrency: RemoteCommandConcurrencyLimiter;
+  private readonly actionApprovals: ActionApprovalStore;
 
   constructor(private readonly dependencies: RemoteFileUploadDependencies) {
     this.concurrency = dependencies.concurrency ?? new RemoteCommandConcurrencyLimiter();
     this.auditJournal = dependencies.auditJournal ?? new UnavailableExecutionAuditJournal();
+    this.actionApprovals = dependencies.actionApprovals ?? new ActionApprovalStore();
+  }
+
+  async requestActionApproval(
+    input: unknown,
+    signal?: AbortSignal,
+  ): Promise<{ readonly approved: boolean; readonly code: string; readonly capability?: string; readonly summary?: object }> {
+    let request: FileUploadRequest;
+    try {
+      request = parse(input);
+      const authorization = await (
+        this.dependencies.authorizationProvider ?? createProfileExecutionAuthorizationProvider(this.dependencies.connectionValidation)
+      ).authorize(request.profileId, signal);
+      return {
+        approved: true,
+        code: 'approved',
+        capability: this.actionApprovals.issue('file-upload', approvalBinding(request), authorization),
+        summary: {
+          action: 'file-upload',
+          profileId: request.profileId,
+          remotePath: request.remotePath,
+          sizeBytes: request.content.length,
+          sha256: request.sha256,
+        },
+      };
+    } catch {
+      return { approved: false, code: signal?.aborted ? 'cancelled' : 'approval-unavailable' };
+    }
   }
 
   async upload(input: unknown, signal?: AbortSignal): Promise<FileUploadResult> {
     let request: FileUploadRequest;
     try {
-      request = parse(input);
+      request = parse(input, true);
     } catch {
       return {
         operationId: operationId(),
@@ -408,14 +456,17 @@ export class RemoteFileUploadProvider {
       }
     };
     try {
+      const consumed = this.actionApprovals.consume('file-upload', approvalBinding(request), request.approvalCapability);
+      if (consumed.status !== 'approved' || consumed.authorization === undefined) {
+        const code: FileUploadCode =
+          consumed.status === 'expired' ? 'approval-expired' : consumed.status === 'altered' ? 'approval-altered' : 'approval-reused';
+        return await finish(result(request, id, 'approval-required', code));
+      }
       try {
-        authorization = await (
-          this.dependencies.authorizationProvider ?? createProfileExecutionAuthorizationProvider(this.dependencies.connectionValidation)
-        ).authorize(request.profileId, signal);
-        authorization = authorization.consume();
-      } catch (error) {
-        const code = signal?.aborted ? 'cancelled' : mapError(error);
-        return await finish(result(request, id, code === 'cancelled' ? 'cancelled' : 'failure', code));
+        authorization = consumed.authorization;
+      } catch {
+        await consumed.authorization.release?.();
+        return await finish(result(request, id, 'approval-required', 'approval-expired'));
       }
       try {
         const args = [request.remotePath, request.sha256, String(request.content.length)];

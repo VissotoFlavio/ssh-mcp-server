@@ -36,6 +36,7 @@ export const serverVersion = '1.1.0';
 export const listApprovedProfilesToolName = 'list_approved_profiles';
 export const validateConnectionToolName = 'validate_connection';
 export const getWindowsReadinessStatusToolName = 'get_windows_readiness_status';
+export const requestActionApprovalToolName = 'request_action_approval';
 
 const LIST_APPROVED_PROFILES_DESCRIPTION =
   'Lists operator-approved profile IDs only. Use an ID returned here for validation; connection, credential, and host details are never disclosed.';
@@ -196,6 +197,18 @@ const FILE_UPLOAD_OUTPUT_SCHEMA = {
     integrity: { type: 'string', enum: ['verified', 'unknown'] },
   },
   required: ['operationId', 'profileId', 'remotePath', 'sha256', 'sizeBytes', 'outcome', 'code', 'integrity'],
+  additionalProperties: false,
+};
+
+const ACTION_APPROVAL_OUTPUT_SCHEMA = {
+  type: 'object',
+  properties: {
+    approved: { type: 'boolean' },
+    code: { type: 'string' },
+    capability: { type: 'string', maxLength: 256 },
+    summary: { type: 'object', additionalProperties: true },
+  },
+  required: ['approved', 'code'],
   additionalProperties: false,
 };
 
@@ -529,6 +542,32 @@ function registerTools(
               },
             },
           ]),
+      ...(configuredRemoteCommandExecutionProvider === undefined && remoteFileUploadProvider === undefined
+        ? []
+        : [
+            {
+              name: requestActionApprovalToolName,
+              description:
+                'Requests a one-use approval capability for one exact sensitive action. The MCP client must obtain explicit user consent for this mutating call in the conversation. The capability is bound to the action and execution does not prompt again.',
+              outputSchema: ACTION_APPROVAL_OUTPUT_SCHEMA,
+              annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+              inputSchema: {
+                type: 'object',
+                properties: {
+                  action: { type: 'string', enum: ['file-upload', 'remote-command'] },
+                  profileId: { type: 'string', pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$' },
+                  remotePath: { type: 'string', minLength: 1, maxLength: 4096 },
+                  contentBase64: { type: 'string', minLength: 1, maxLength: 1398108 },
+                  command: { type: 'string', minLength: 1, maxLength: 256 },
+                  args: { type: 'array', items: { type: 'string', maxLength: 4096 }, maxItems: 64 },
+                  timeoutMs: { type: 'integer', minimum: 1, maximum: 60000 },
+                  maxOutputBytes: { type: 'integer', minimum: 1, maximum: 1048576 },
+                },
+                required: ['action', 'profileId'],
+                additionalProperties: false,
+              },
+            },
+          ]),
       ...(configuredRemoteCommandExecutionProvider === undefined
         ? []
         : [
@@ -545,6 +584,7 @@ function registerTools(
                   args: { type: 'array', items: { type: 'string', maxLength: 4096 }, maxItems: 64 },
                   timeoutMs: { type: 'integer', minimum: 1, maximum: 60000 },
                   maxOutputBytes: { type: 'integer', minimum: 1, maximum: 1048576 },
+                  approvalCapability: { type: 'string', minLength: 1, maxLength: 256 },
                 },
                 required: ['profileId', 'command', 'args'],
                 additionalProperties: false,
@@ -566,6 +606,7 @@ function registerTools(
                   remotePath: { type: 'string', minLength: 1, maxLength: 4096 },
                   contentBase64: { type: 'string', minLength: 1, maxLength: 1398108 },
                   timeoutMs: { type: 'integer', minimum: 1, maximum: 60000 },
+                  approvalCapability: { type: 'string', minLength: 1, maxLength: 256 },
                 },
                 required: ['profileId', 'remotePath', 'contentBase64'],
                 additionalProperties: false,
@@ -576,6 +617,21 @@ function registerTools(
   }));
 
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+    if (request.params.name === requestActionApprovalToolName) {
+      const input = request.params.arguments;
+      if (typeof input !== 'object' || input === null || Array.isArray(input))
+        return jsonToolResult({ approved: false, code: 'invalid-input' }, true);
+      const { action, ...payload } = input as Record<string, unknown>;
+      if (action === 'file-upload' && remoteFileUploadProvider !== undefined) {
+        const approval = await remoteFileUploadProvider.requestActionApproval(payload, extra.signal);
+        return jsonToolResult(approval, approval.approved !== true);
+      }
+      if (action === 'remote-command' && configuredRemoteCommandExecutionProvider !== undefined) {
+        const approval = await configuredRemoteCommandExecutionProvider.requestActionApproval(payload, extra.signal);
+        return jsonToolResult(approval, approval.approved !== true);
+      }
+      return jsonToolResult({ approved: false, code: 'invalid-input' }, true);
+    }
     if (request.params.name === listApprovedProfilesToolName) {
       if (!isEmptyDiscoveryInput(request.params.arguments) || approvedProfileListingProvider === undefined) {
         return unavailableDiscoveryResult();
