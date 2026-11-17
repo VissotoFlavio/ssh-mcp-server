@@ -1,3 +1,4 @@
+import { ActionApprovalStore } from '../execution/action-approval.js';
 import type { ExecutionAuditJournal } from '../execution/execution-audit-journal.js';
 import { UnavailableExecutionAuditJournal } from '../execution/execution-audit-journal.js';
 import {
@@ -8,6 +9,7 @@ import {
   createProfileExecutionAuthorizationProvider,
   type HumanSudoApprovalProvider,
 } from '../execution/remote-command-execution.js';
+import { RemoteFileUploadProvider, Ssh2RemoteFileUploadTransport, WindowsPasswordFileUploadTransport } from '../execution/remote-file-upload.js';
 import { APPROVED_PROFILE_CLASSIFICATION, type ApprovedProfileListingProvider } from '../profiles/approved-profile-listing.js';
 import { validateProfileSelection } from '../profiles/connection-profile.js';
 import type { ConnectionValidationProvider } from '../validation/trusted-connection-validation.js';
@@ -23,6 +25,7 @@ export interface WindowsRuntimeProviders {
   readonly connectionValidationProvider?: ConnectionValidationProvider;
   readonly windowsReadinessStatusProvider: WindowsReadinessStatusProvider;
   readonly remoteCommandExecutionProvider?: RemoteCommandExecutionProvider;
+  readonly remoteFileUploadProvider?: RemoteFileUploadProvider;
 }
 
 /**
@@ -76,6 +79,7 @@ export function createWindowsRuntimeProviders(
   })(),
   humanApproval?: HumanSudoApprovalProvider,
 ): WindowsRuntimeProviders {
+  const actionApprovals = new ActionApprovalStore();
   const validationProvider =
     validationSession === undefined
       ? undefined
@@ -111,6 +115,23 @@ export function createWindowsRuntimeProviders(
           auditJournal: storage.executionAuditJournal ?? new UnavailableExecutionAuditJournal(),
           authorizationProvider: validationProvider === undefined ? undefined : createProfileExecutionAuthorizationProvider(validationProvider),
           humanApproval,
+          actionApprovals,
+        });
+  const remoteFileUploadProvider =
+    validationProvider === undefined || typeof storage.getProfile !== 'function'
+      ? undefined
+      : new RemoteFileUploadProvider({
+          connectionValidation: validationProvider,
+          transport: new WindowsPasswordFileUploadTransport(
+            new Ssh2RemoteFileUploadTransport({
+              async getPassword(reference: string) {
+                return new WindowsCredentialManager(undefined, [reference]).getPassword(reference);
+              },
+            }),
+          ),
+          auditJournal: storage.executionAuditJournal ?? new UnavailableExecutionAuditJournal(),
+          authorizationProvider: createProfileExecutionAuthorizationProvider(validationProvider),
+          actionApprovals,
         });
   const readinessStorage =
     typeof storage.inspectReadiness === 'function' &&
@@ -131,6 +152,7 @@ export function createWindowsRuntimeProviders(
     },
     ...(validationProvider === undefined ? {} : { connectionValidationProvider: validationProvider }),
     ...(remoteCommandExecutionProvider === undefined ? {} : { remoteCommandExecutionProvider }),
+    ...(remoteFileUploadProvider === undefined ? {} : { remoteFileUploadProvider }),
     windowsReadinessStatusProvider: createWindowsReadinessStatusProvider(true, readinessStorage, validationProvider !== undefined),
   };
 }

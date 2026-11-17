@@ -5,6 +5,19 @@ publish a release.
 
 ## Unreleased
 
+## [1.2.0] - 2026-11-17
+
+### Added
+
+- Added audited SFTP upload for an exact remote path selected by the MCP client.
+
+### Changed
+
+- Added one client-context `request_action_approval` flow with one-use capabilities bound to exact uploads and privileged remote commands. Upload and command execution no longer open a native approval dialog or request a second confirmation after capability issuance.
+- Package candidates now use sequential prerelease versions for each stable
+  branch version, such as `1.1.0-rc-1` and `1.1.0-rc-2`, and use that version
+  directly as the GitHub prerelease title.
+
 ## [1.1.0] - 2026-11-16
 
 ### Changed

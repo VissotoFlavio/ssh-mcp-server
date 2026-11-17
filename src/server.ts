@@ -7,14 +7,8 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 
 import { serializeAuditEvent } from './diagnostics/redacted-diagnostics-audit.js';
-import { createLocalHumanSudoApprovalProvider } from './execution/human-approver-ipc.js';
-import {
-  remoteCommandToolName,
-  requestSudoApprovalToolName,
-  type HumanSudoApprovalProvider,
-  type RemoteCommandExecutionProvider,
-  type RemoteCommandResult,
-} from './execution/remote-command-execution.js';
+import { remoteCommandToolName, type RemoteCommandExecutionProvider, type RemoteCommandResult } from './execution/remote-command-execution.js';
+import { uploadRemoteFileToolName, type FileUploadResult, type RemoteFileUploadProvider } from './execution/remote-file-upload.js';
 import {
   APPROVED_PROFILE_CLASSIFICATION,
   createRuntimeApprovedProfileListingProvider,
@@ -38,10 +32,11 @@ import { supportsWindowsAlphaRuntime } from './windows/windows-runtime-support.j
 import { createWindowsRuntimeProviders } from './windows/windows-runtime.js';
 
 export const serverName = 'ssh-mcp-server';
-export const serverVersion = '1.1.0';
+export const serverVersion = '1.2.0';
 export const listApprovedProfilesToolName = 'list_approved_profiles';
 export const validateConnectionToolName = 'validate_connection';
 export const getWindowsReadinessStatusToolName = 'get_windows_readiness_status';
+export const requestActionApprovalToolName = 'request_action_approval';
 
 const LIST_APPROVED_PROFILES_DESCRIPTION =
   'Lists operator-approved profile IDs only. Use an ID returned here for validation; connection, credential, and host details are never disclosed.';
@@ -50,9 +45,9 @@ const VALIDATE_CONNECTION_DESCRIPTION =
 const WINDOWS_READINESS_STATUS_DESCRIPTION =
   'Reports bounded local Windows readiness categories only. It accepts no connection settings, profile IDs, credentials, paths, or commands and never contacts a remote host.';
 const REMOTE_COMMAND_DESCRIPTION =
-  "Executes one bounded non-interactive command on an approved SSH profile without an executable allowlist. Recognized privilege-escalation executables and command evaluators require request-bound human approval; other commands use the remote account's existing permissions and may modify remote state without an additional server approval gate. Supports no persistent SSH session or local shell.";
-const SUDO_APPROVAL_DESCRIPTION =
-  'Requests a one-time human approval for one exact privileged or command-evaluator execution. Approval is request-bound, expires quickly, and cannot be supplied as a caller boolean.';
+  'Executes one bounded non-interactive command on an approved SSH profile without an executable allowlist. This mutating tool requires the MCP client to obtain explicit user confirmation in the conversation before calling it, including for sudo and command evaluators; it does not open a native server dialog. Supports no persistent SSH session or local shell.';
+const FILE_UPLOAD_DESCRIPTION =
+  'Uploads one Base64 file to an exact remote destination. This mutating tool requires the MCP client to obtain explicit user confirmation in the conversation before calling it; it does not open a native server dialog. The destination is not restricted by a server-side directory allowlist; remote permissions still apply.';
 const SAFE_PROFILE_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
 const MAX_DISCOVERABLE_PROFILES = 256;
 
@@ -172,31 +167,48 @@ const REMOTE_COMMAND_OUTPUT_SCHEMA = {
   additionalProperties: false,
 };
 
-const SUDO_APPROVAL_OUTPUT_SCHEMA = {
+const FILE_UPLOAD_OUTPUT_SCHEMA = {
+  type: 'object',
+  properties: {
+    operationId: { type: 'string', pattern: '^[a-f0-9]{32}$' },
+    profileId: { type: 'string', pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$|^unknown$' },
+    remotePath: { type: 'string', maxLength: 4096 },
+    sha256: { type: 'string', pattern: '^[a-f0-9]{64}$|^$' },
+    sizeBytes: { type: 'integer', minimum: 0, maximum: 1048576 },
+    outcome: { type: 'string', enum: ['success', 'failure', 'timeout', 'cancelled', 'unknown'] },
+    code: {
+      type: 'string',
+      enum: [
+        'success',
+        'connection-failure',
+        'authentication-failure',
+        'host-key-failure',
+        'remote-failure',
+        'integrity-failure',
+        'timeout',
+        'cancelled',
+        'execution-limit',
+        'execution-audit-unavailable',
+        'outcome-unknown',
+        'invalid-input',
+        'provider-failure',
+      ],
+    },
+    integrity: { type: 'string', enum: ['verified', 'unknown'] },
+  },
+  required: ['operationId', 'profileId', 'remotePath', 'sha256', 'sizeBytes', 'outcome', 'code', 'integrity'],
+  additionalProperties: false,
+};
+
+const ACTION_APPROVAL_OUTPUT_SCHEMA = {
   type: 'object',
   properties: {
     approved: { type: 'boolean' },
-    code: {
-      type: 'string',
-      enum: ['approved', 'approval-unavailable', 'approval-rejected', 'approval-busy', 'cancelled', 'invalid-input', 'provider-failure'],
-    },
-    operationId: { type: 'string', pattern: '^[a-f0-9]{32}$' },
+    code: { type: 'string' },
     capability: { type: 'string', maxLength: 256 },
+    summary: { type: 'object', additionalProperties: true },
   },
-  oneOf: [
-    {
-      required: ['approved', 'code', 'operationId', 'capability'],
-      properties: { approved: { const: true }, code: { const: 'approved' } },
-    },
-    {
-      required: ['approved', 'code'],
-      properties: {
-        approved: { const: false },
-        code: { enum: ['approval-unavailable', 'approval-rejected', 'approval-busy', 'cancelled', 'invalid-input', 'provider-failure'] },
-      },
-      not: { required: ['capability'] },
-    },
-  ],
+  required: ['approved', 'code'],
   additionalProperties: false,
 };
 
@@ -209,9 +221,10 @@ export interface ServerOptions {
   readonly auditSink?: (serializedEvent: string) => void;
   /** Local-only, redacted Windows prerequisite status provider. */
   readonly windowsReadinessStatusProvider?: WindowsReadinessStatusProvider;
-  /** Trusted remote execution and human approval boundary. */
+  /** Trusted remote execution boundary. */
   readonly remoteCommandExecutionProvider?: RemoteCommandExecutionProvider;
-  readonly humanSudoApprovalProvider?: HumanSudoApprovalProvider;
+  /** Trusted upload provider. It is absent until a platform transport is composed. */
+  readonly remoteFileUploadProvider?: RemoteFileUploadProvider;
 }
 
 export interface StdioServerOptions {
@@ -223,7 +236,7 @@ export interface StdioServerOptions {
   connectionValidationProvider?: ConnectionValidationProvider;
   windowsReadinessStatusProvider?: WindowsReadinessStatusProvider;
   remoteCommandExecutionProvider?: RemoteCommandExecutionProvider;
-  humanSudoApprovalProvider?: HumanSudoApprovalProvider;
+  remoteFileUploadProvider?: RemoteFileUploadProvider;
 }
 
 function isEmptyDiscoveryInput(input: unknown): boolean {
@@ -355,6 +368,10 @@ function remoteResult(result: RemoteCommandResult): ReturnType<typeof textToolRe
   return textToolResult(JSON.stringify(result), result.outcome !== 'success' && result.outcome !== 'approval-required', structuredResult);
 }
 
+function fileUploadResult(result: FileUploadResult): ReturnType<typeof textToolResult> {
+  return jsonToolResult(result, result.outcome !== 'success');
+}
+
 function unavailableConnectionValidationResult(): ReturnType<typeof textToolResult> {
   return validationResult({ ready: false, outcome: 'failure', code: 'provider-failure' }, true);
 }
@@ -468,19 +485,15 @@ function registerTools(
   connectionValidationProvider: ConnectionValidationProvider | undefined,
   windowsReadinessStatusProvider: WindowsReadinessStatusProvider | undefined,
   remoteCommandExecutionProvider: RemoteCommandExecutionProvider | undefined,
-  humanSudoApprovalProvider: HumanSudoApprovalProvider | undefined,
+  remoteFileUploadProvider: RemoteFileUploadProvider | undefined,
   auditSink: ((serializedEvent: string) => void) | undefined,
 ): void {
   const configuredRemoteCommandExecutionProvider =
     remoteCommandExecutionProvider === undefined
       ? undefined
-      : (() => {
-          const configured =
-            humanSudoApprovalProvider === undefined
-              ? remoteCommandExecutionProvider
-              : remoteCommandExecutionProvider.withHumanSudoApprovalProvider(humanSudoApprovalProvider);
-          return auditSink === undefined ? configured : configured.withAuditSink(auditSink);
-        })();
+      : auditSink === undefined
+        ? remoteCommandExecutionProvider
+        : remoteCommandExecutionProvider.withAuditSink(auditSink);
   server.setRequestHandler(ListToolsRequestSchema, () => ({
     tools: [
       ...(approvedProfileListingProvider === undefined
@@ -529,6 +542,32 @@ function registerTools(
               },
             },
           ]),
+      ...(configuredRemoteCommandExecutionProvider === undefined && remoteFileUploadProvider === undefined
+        ? []
+        : [
+            {
+              name: requestActionApprovalToolName,
+              description:
+                'Requests a one-use approval capability for one exact sensitive action. The MCP client must obtain explicit user consent for this mutating call in the conversation. The capability is bound to the action and execution does not prompt again.',
+              outputSchema: ACTION_APPROVAL_OUTPUT_SCHEMA,
+              annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+              inputSchema: {
+                type: 'object',
+                properties: {
+                  action: { type: 'string', enum: ['file-upload', 'remote-command'] },
+                  profileId: { type: 'string', pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$' },
+                  remotePath: { type: 'string', minLength: 1, maxLength: 4096 },
+                  contentBase64: { type: 'string', minLength: 1, maxLength: 1398108 },
+                  command: { type: 'string', minLength: 1, maxLength: 256 },
+                  args: { type: 'array', items: { type: 'string', maxLength: 4096 }, maxItems: 64 },
+                  timeoutMs: { type: 'integer', minimum: 1, maximum: 60000 },
+                  maxOutputBytes: { type: 'integer', minimum: 1, maximum: 1048576 },
+                },
+                required: ['action', 'profileId'],
+                additionalProperties: false,
+              },
+            },
+          ]),
       ...(configuredRemoteCommandExecutionProvider === undefined
         ? []
         : [
@@ -545,27 +584,31 @@ function registerTools(
                   args: { type: 'array', items: { type: 'string', maxLength: 4096 }, maxItems: 64 },
                   timeoutMs: { type: 'integer', minimum: 1, maximum: 60000 },
                   maxOutputBytes: { type: 'integer', minimum: 1, maximum: 1048576 },
-                  approvalToken: { type: 'string', maxLength: 256 },
+                  approvalCapability: { type: 'string', minLength: 1, maxLength: 256 },
                 },
                 required: ['profileId', 'command', 'args'],
                 additionalProperties: false,
               },
             },
+          ]),
+      ...(remoteFileUploadProvider === undefined
+        ? []
+        : [
             {
-              name: requestSudoApprovalToolName,
-              description: SUDO_APPROVAL_DESCRIPTION,
-              outputSchema: SUDO_APPROVAL_OUTPUT_SCHEMA,
-              annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+              name: uploadRemoteFileToolName,
+              description: FILE_UPLOAD_DESCRIPTION,
+              outputSchema: FILE_UPLOAD_OUTPUT_SCHEMA,
+              annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
               inputSchema: {
                 type: 'object',
                 properties: {
                   profileId: { type: 'string', pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$' },
-                  command: { type: 'string', minLength: 1, maxLength: 256 },
-                  args: { type: 'array', items: { type: 'string', maxLength: 4096 }, maxItems: 64 },
+                  remotePath: { type: 'string', minLength: 1, maxLength: 4096 },
+                  contentBase64: { type: 'string', minLength: 1, maxLength: 1398108 },
                   timeoutMs: { type: 'integer', minimum: 1, maximum: 60000 },
-                  maxOutputBytes: { type: 'integer', minimum: 1, maximum: 1048576 },
+                  approvalCapability: { type: 'string', minLength: 1, maxLength: 256 },
                 },
-                required: ['profileId', 'command', 'args'],
+                required: ['profileId', 'remotePath', 'contentBase64'],
                 additionalProperties: false,
               },
             },
@@ -574,6 +617,21 @@ function registerTools(
   }));
 
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+    if (request.params.name === requestActionApprovalToolName) {
+      const input = request.params.arguments;
+      if (typeof input !== 'object' || input === null || Array.isArray(input))
+        return jsonToolResult({ approved: false, code: 'invalid-input' }, true);
+      const { action, ...payload } = input as Record<string, unknown>;
+      if (action === 'file-upload' && remoteFileUploadProvider !== undefined) {
+        const approval = await remoteFileUploadProvider.requestActionApproval(payload, extra.signal);
+        return jsonToolResult(approval, approval.approved !== true);
+      }
+      if (action === 'remote-command' && configuredRemoteCommandExecutionProvider !== undefined) {
+        const approval = await configuredRemoteCommandExecutionProvider.requestActionApproval(payload, extra.signal);
+        return jsonToolResult(approval, approval.approved !== true);
+      }
+      return jsonToolResult({ approved: false, code: 'invalid-input' }, true);
+    }
     if (request.params.name === listApprovedProfilesToolName) {
       if (!isEmptyDiscoveryInput(request.params.arguments) || approvedProfileListingProvider === undefined) {
         return unavailableDiscoveryResult();
@@ -598,14 +656,19 @@ function registerTools(
       }
     }
 
-    if (request.params.name === requestSudoApprovalToolName) {
-      if (configuredRemoteCommandExecutionProvider === undefined) return jsonToolResult({ approved: false, code: 'provider-failure' }, true);
-      try {
-        const approval = await configuredRemoteCommandExecutionProvider.requestSudoApproval(request.params.arguments, extra.signal);
-        return jsonToolResult(approval, approval.approved !== true);
-      } catch {
-        return jsonToolResult({ approved: false, code: 'invalid-input' }, true);
-      }
+    if (request.params.name === uploadRemoteFileToolName) {
+      if (remoteFileUploadProvider === undefined)
+        return fileUploadResult({
+          operationId: '0'.repeat(32),
+          profileId: 'unknown',
+          remotePath: '',
+          sha256: '',
+          sizeBytes: 0,
+          outcome: 'failure',
+          code: 'provider-failure',
+          integrity: 'unknown',
+        });
+      return fileUploadResult(await remoteFileUploadProvider.upload(request.params.arguments, extra.signal));
     }
 
     if (request.params.name === remoteCommandToolName) {
@@ -666,7 +729,7 @@ export function createServer({
   auditSink,
   windowsReadinessStatusProvider,
   remoteCommandExecutionProvider,
-  humanSudoApprovalProvider,
+  remoteFileUploadProvider,
 }: ServerOptions = {}): Server {
   const server = new Server({ name: serverName, version: serverVersion }, { capabilities: { tools: {} } });
   registerTools(
@@ -675,7 +738,7 @@ export function createServer({
     connectionValidationProvider,
     windowsReadinessStatusProvider,
     remoteCommandExecutionProvider,
-    humanSudoApprovalProvider,
+    remoteFileUploadProvider,
     auditSink,
   );
   return server;
@@ -694,14 +757,14 @@ export async function runStdioServer({
   connectionValidationProvider,
   windowsReadinessStatusProvider,
   remoteCommandExecutionProvider,
-  humanSudoApprovalProvider,
+  remoteFileUploadProvider,
 }: StdioServerOptions = {}): Promise<void> {
   const server = createServer({
     approvedProfileListingProvider,
     connectionValidationProvider,
     windowsReadinessStatusProvider,
     remoteCommandExecutionProvider,
-    humanSudoApprovalProvider,
+    remoteFileUploadProvider,
     auditSink: (serializedEvent) => errorOutput.write(`${serializedEvent}\n`),
   });
   const transport = new StdioServerTransport(input, output);
@@ -794,21 +857,26 @@ export function createProductionRuntimeProviders(
         return false;
       }
     })(),
-  windowsRuntimeFactory: (
-    humanApproval?: HumanSudoApprovalProvider,
-  ) => Pick<
+  windowsRuntimeFactory: () => Pick<
     ServerOptions,
-    'approvedProfileListingProvider' | 'connectionValidationProvider' | 'windowsReadinessStatusProvider' | 'remoteCommandExecutionProvider'
-  > = (humanApproval) => createWindowsRuntimeProviders(undefined, undefined, humanApproval),
-  humanSudoApprovalProvider?: HumanSudoApprovalProvider,
+    | 'approvedProfileListingProvider'
+    | 'connectionValidationProvider'
+    | 'windowsReadinessStatusProvider'
+    | 'remoteCommandExecutionProvider'
+    | 'remoteFileUploadProvider'
+  > = () => createWindowsRuntimeProviders(),
 ): Pick<
   ServerOptions,
-  'approvedProfileListingProvider' | 'connectionValidationProvider' | 'windowsReadinessStatusProvider' | 'remoteCommandExecutionProvider'
+  | 'approvedProfileListingProvider'
+  | 'connectionValidationProvider'
+  | 'windowsReadinessStatusProvider'
+  | 'remoteCommandExecutionProvider'
+  | 'remoteFileUploadProvider'
 > {
   if (platform === 'win32') {
     if (!windowsSupported) return { windowsReadinessStatusProvider: createWindowsReadinessStatusProvider(false) };
     try {
-      return windowsRuntimeFactory(humanSudoApprovalProvider);
+      return windowsRuntimeFactory();
     } catch {
       return { windowsReadinessStatusProvider: createWindowsReadinessStatusProvider(true) };
     }
@@ -818,7 +886,7 @@ export function createProductionRuntimeProviders(
     return {
       approvedProfileListingProvider: createRuntimeApprovedProfileListingProvider(),
       connectionValidationProvider,
-      remoteCommandExecutionProvider: createRuntimeRemoteCommandExecutionProvider({ connectionValidationProvider }, humanSudoApprovalProvider),
+      remoteCommandExecutionProvider: createRuntimeRemoteCommandExecutionProvider({ connectionValidationProvider }),
     };
   }
   return {};
@@ -826,9 +894,7 @@ export function createProductionRuntimeProviders(
 
 if (isEntrypoint) {
   const runProductionServer = async (): Promise<void> => {
-    const localApprover = createLocalHumanSudoApprovalProvider();
-    const runtime = createProductionRuntimeProviders();
-    await runStdioServer(localApprover === undefined ? runtime : { ...runtime, humanSudoApprovalProvider: localApprover });
+    await runStdioServer(createProductionRuntimeProviders());
   };
 
   runProductionServer().catch((error: unknown) => {

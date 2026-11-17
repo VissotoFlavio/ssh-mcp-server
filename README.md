@@ -12,7 +12,7 @@ agents can discover safe profile identifiers, validate one approved connection,
 and execute one non-interactive command through that profile. It never becomes
 an SSH terminal.
 
-> **Status:** `v1.1.0` is a source-built release. The native Windows runtime
+> **Status:** `v1.2.0` is a source-built release. The native Windows runtime
 > remains within its alpha support boundary. This repository is public,
 > but npm publishing is disabled. No npm package, standalone binary, or license
 > has been published. Distribution remains controlled from source; publishing
@@ -559,13 +559,14 @@ An authorized repository owner, member, or collaborator can comment exactly
 immutable pull-request commit, then creates or verifies a GitHub prerelease
 candidate and reports its result on the pull request.
 
-The candidate version is derived from the stable branch version and the exact
-pull-request commit. It is not an npm publication or a stable release. Because
-the native Windows addon is ABI-specific, each candidate release has separate
-Windows x64 assets for Node.js 22 and Node.js 24. Select the asset matching the
-Node.js major version used by Codex, install it from a trusted local file, and
-do not copy its addon into another environment. Before packaging, the workflow
-requires the four exact successful checks from the canonical
+The candidate version is the next sequential prerelease for the stable branch
+version: for example, `1.1.0-rc-1`, then `1.1.0-rc-2`. It is not an npm
+publication or a stable release. Because the native Windows addon is
+ABI-specific, each candidate release has separate Windows x64 assets for
+Node.js 22 and Node.js 24. Select the asset matching the Node.js major version
+used by Codex, install it from a trusted local file, and do not copy its addon
+into another environment. Before packaging, the workflow requires the four
+exact successful checks from the canonical
 `.github/workflows/ci.yml` workflow for that same commit (`validate` and
 `validate-windows-native` on Node.js 22 and 24); missing, pending, failed, or
 untrusted checks block the candidate. The prerelease is an internal delivery

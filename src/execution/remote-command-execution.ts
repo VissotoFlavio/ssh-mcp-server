@@ -7,10 +7,10 @@ import { HostIdentityCredentialPolicyError } from '../policy/host-identity-crede
 import type { ConnectionProfile } from '../profiles/connection-profile.js';
 import type { ConnectionValidationProvider } from '../validation/trusted-connection-validation.js';
 
+import { ActionApprovalStore } from './action-approval.js';
 import type { ExecutionAuditHandle, ExecutionAuditJournal } from './execution-audit-journal.js';
 
 export const remoteCommandToolName = 'execute_remote_command';
-export const requestSudoApprovalToolName = 'request_sudo_approval';
 
 export const REMOTE_COMMAND_DEFAULT_TIMEOUT_MS = 30_000;
 export const REMOTE_COMMAND_MAX_TIMEOUT_MS = 60_000;
@@ -90,7 +90,7 @@ export interface RemoteCommandRequest {
   readonly args: readonly string[];
   readonly timeoutMs?: number;
   readonly maxOutputBytes?: number;
-  readonly approvalToken?: string;
+  readonly approvalCapability?: string;
 }
 
 export interface RemoteCommandResult {
@@ -244,15 +244,17 @@ function validateArgs(value: unknown): readonly string[] {
   return value.map((argument) => validateText(argument, MAX_ARGUMENT_LENGTH));
 }
 
-function validateApprovalToken(value: unknown): string | undefined {
-  if (value === undefined) return undefined;
-  return validateText(value, 256);
-}
-
-function parseRequest(input: unknown): RemoteCommandRequest {
+function parseRequest(input: unknown, allowApprovalCapability = false): RemoteCommandRequest {
   if (!isPlainRecord(input)) throw new RemoteExecutionError('invalid-input', 'Remote command input is invalid');
   const keys = Reflect.ownKeys(input);
-  const allowed = new Set(['profileId', 'command', 'args', 'timeoutMs', 'maxOutputBytes', 'approvalToken']);
+  const allowed = new Set([
+    'profileId',
+    'command',
+    'args',
+    'timeoutMs',
+    'maxOutputBytes',
+    ...(allowApprovalCapability ? ['approvalCapability'] : []),
+  ]);
   if (keys.some((key) => typeof key !== 'string' || !allowed.has(key))) {
     throw new RemoteExecutionError('invalid-input', 'Remote command input is invalid');
   }
@@ -261,15 +263,21 @@ function parseRequest(input: unknown): RemoteCommandRequest {
   const args = validateArgs(own(input, 'args'));
   const timeoutMs = boundedTimeout(own(input, 'timeoutMs'));
   const maxOutputBytes = boundedOutputLimit(own(input, 'maxOutputBytes'));
-  const approvalToken = validateApprovalToken(own(input, 'approvalToken'));
+  const approvalCapabilityValue = own(input, 'approvalCapability');
+  const approvalCapability =
+    approvalCapabilityValue === undefined ? undefined : allowApprovalCapability ? validateText(approvalCapabilityValue, 256) : undefined;
   return Object.freeze({
     profileId,
     command,
     args: Object.freeze([...args]),
     timeoutMs,
     maxOutputBytes,
-    ...(approvalToken === undefined ? {} : { approvalToken }),
+    ...(approvalCapability === undefined ? {} : { approvalCapability }),
   });
+}
+
+function commandApprovalBinding(request: RemoteCommandRequest): string {
+  return JSON.stringify([request.profileId, request.command, request.args, request.timeoutMs, request.maxOutputBytes]);
 }
 
 function profileIdentity(profile: ConnectionProfile): ApprovedProfileIdentity {
@@ -459,6 +467,7 @@ export interface RemoteCommandExecutionDependencies {
   readonly authorizationProvider?: ExecutionAuthorizationProvider;
   readonly concurrency?: RemoteCommandConcurrencyLimiter;
   readonly now?: () => number;
+  readonly actionApprovals?: ActionApprovalStore;
 }
 
 /** Limits in-process remote work before any profile authorization or SSH launch. */
@@ -687,11 +696,40 @@ export class RemoteCommandExecutionProvider {
   private readonly approvals: SudoApprovalStore;
   private readonly concurrency: RemoteCommandConcurrencyLimiter;
   private readonly now: () => number;
+  private readonly actionApprovals: ActionApprovalStore;
 
   constructor(private readonly dependencies: RemoteCommandExecutionDependencies) {
     this.approvals = dependencies.sudoApprovals ?? new SudoApprovalStore();
     this.concurrency = dependencies.concurrency ?? new RemoteCommandConcurrencyLimiter();
     this.now = dependencies.now ?? Date.now;
+    this.actionApprovals = dependencies.actionApprovals ?? new ActionApprovalStore(this.now);
+  }
+
+  async requestActionApproval(
+    input: unknown,
+    signal?: AbortSignal,
+  ): Promise<{ readonly approved: boolean; readonly code: string; readonly capability?: string; readonly summary?: object }> {
+    let request: RemoteCommandRequest;
+    try {
+      request = parseRequest(input);
+      if (!requiresHumanApproval(request.command, request.args)) return { approved: false, code: 'invalid-input' };
+      const authorization = await (
+        this.dependencies.authorizationProvider ?? createProfileExecutionAuthorizationProvider(this.dependencies.connectionValidation, this.now)
+      ).authorize(request.profileId, signal);
+      return {
+        approved: true,
+        code: 'approved',
+        capability: this.actionApprovals.issue('remote-command', commandApprovalBinding(request), authorization),
+        summary: {
+          action: 'remote-command',
+          profileId: request.profileId,
+          command: redactAuditText(request.command),
+          argumentCount: request.args.length,
+        },
+      };
+    } catch {
+      return { approved: false, code: signal?.aborted ? 'cancelled' : 'approval-unavailable' };
+    }
   }
 
   withHumanSudoApprovalProvider(humanApproval: HumanSudoApprovalProvider): RemoteCommandExecutionProvider {
@@ -699,7 +737,7 @@ export class RemoteCommandExecutionProvider {
   }
 
   withAuditSink(auditSink: (serializedEvent: string) => void): RemoteCommandExecutionProvider {
-    return new RemoteCommandExecutionProvider({ ...this.dependencies, auditSink });
+    return new RemoteCommandExecutionProvider({ ...this.dependencies, auditSink, actionApprovals: this.actionApprovals });
   }
 
   async requestSudoApproval(
@@ -734,7 +772,7 @@ export class RemoteCommandExecutionProvider {
     const operationId = cryptoRandomToken().slice(0, 32);
     let request: RemoteCommandRequest;
     try {
-      request = parseRequest(input);
+      request = parseRequest(input, true);
     } catch {
       return { approved: false, code: 'approval-rejected', operationId };
     }
@@ -744,7 +782,6 @@ export class RemoteCommandExecutionProvider {
       writeRemoteAudit(this.dependencies.auditSink, request, 'rejected', result, Math.max(0, this.now() - startedAt));
       return { approved: false, code, operationId } as const;
     };
-    if (request.approvalToken !== undefined) return rejected();
     const sudoRequest: SudoApprovalRequest = {
       profileId: request.profileId,
       command: request.command,
@@ -876,7 +913,7 @@ export class RemoteCommandExecutionProvider {
   async execute(input: unknown, signal?: AbortSignal): Promise<RemoteCommandResult> {
     let request: RemoteCommandRequest;
     try {
-      request = parseRequest(input);
+      request = parseRequest(input, true);
     } catch {
       const invalid = safeResult('unknown', 'failure', 'invalid-input');
       writeRemoteAudit(this.dependencies.auditSink, { profileId: 'unknown', command: '[invalid]', args: [] }, 'rejected', invalid, 0);
@@ -892,13 +929,6 @@ export class RemoteCommandExecutionProvider {
     let argsHmac = createHmac('sha256', AUDIT_SINK_KEY).update(JSON.stringify(request.args)).digest('hex');
     let approvalState: SudoApprovalState = 'not-required';
     let journal: ExecutionAuditHandle | undefined;
-    const sudoRequest: SudoApprovalRequest = {
-      profileId: request.profileId,
-      command: request.command,
-      args: request.args,
-      timeoutMs: request.timeoutMs!,
-      maxOutputBytes: request.maxOutputBytes!,
-    };
     const finish = async (result: RemoteCommandResult): Promise<RemoteCommandResult> => {
       let finalResult = result;
       if (journal !== undefined) {
@@ -947,34 +977,14 @@ export class RemoteCommandExecutionProvider {
       if (signal?.aborted) return finish(safeResult(request.profileId, 'cancelled', 'cancelled', { operationId }));
       if (requiresHumanApproval(request.command, request.args)) {
         approvalState = 'blocked';
-        if (request.approvalToken === undefined)
-          return finish(
-            safeResult(
-              request.profileId,
-              this.dependencies.humanApproval === undefined ? 'failure' : 'approval-required',
-              this.dependencies.humanApproval === undefined ? 'approval-unavailable' : 'approval-required',
-              { operationId },
-            ),
-          );
-        const consumed = this.approvals.consumeForAuthorization(request.approvalToken, sudoRequest, this.now());
-        approvalState = consumed.status;
-        if (consumed.status !== 'approved') {
-          const code = consumed.status === 'expired' ? 'approval-expired' : consumed.status === 'altered' ? 'approval-altered' : 'approval-reused';
+        const consumed = this.actionApprovals.consume('remote-command', commandApprovalBinding(request), request.approvalCapability);
+        if (consumed.status !== 'approved' || consumed.authorization === undefined) {
+          const code: RemoteExecutionCode =
+            consumed.status === 'expired' ? 'approval-expired' : consumed.status === 'altered' ? 'approval-altered' : 'approval-reused';
           return finish(safeResult(request.profileId, 'approval-required', code, { operationId }));
         }
-        if (journal?.approval !== undefined) await journal.approval('approval-approved');
+        approvalState = 'approved';
         authorization = consumed.authorization;
-        if (authorization === undefined) {
-          authorization = await boundedOperation(
-            (validationSignal) =>
-              (
-                this.dependencies.authorizationProvider ??
-                createProfileExecutionAuthorizationProvider(this.dependencies.connectionValidation, this.now)
-              ).authorize(request.profileId, validationSignal),
-            remainingTimeout(startedAt, request.timeoutMs!),
-            signal,
-          );
-        }
       } else {
         authorization = await boundedOperation(
           (validationSignal) =>
@@ -985,7 +995,7 @@ export class RemoteCommandExecutionProvider {
           signal,
         );
       }
-      const consumedAuthorization = authorization.consume();
+      const consumedAuthorization = authorization;
       const transportOperation = boundedTransportExecute(
         this.dependencies.transport,
         {

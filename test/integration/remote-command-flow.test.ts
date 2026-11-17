@@ -118,7 +118,6 @@ test('registers and routes remote execution without a production endpoint', asyn
     errorOutput: errors,
     installSignalHandlers: false,
     remoteCommandExecutionProvider: provider,
-    humanSudoApprovalProvider: { approve: async () => true },
   });
 
   await requestResponse(input, output, {
@@ -140,42 +139,30 @@ test('registers and routes remote execution without a production endpoint', asyn
   const executionTool = listed.find((tool) => tool.name === 'execute_remote_command');
   assert.deepEqual(executionTool?.annotations, { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true });
   assert.equal(executionTool?.outputSchema?.type, 'object');
-  const approvalTool = listed.find((tool) => tool.name === 'request_sudo_approval');
-  assert.deepEqual(approvalTool?.annotations, { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false });
-  assert.equal(approvalTool?.outputSchema?.type, 'object');
 
-  const approval = await requestResponse(input, output, {
+  const result = await requestResponse(input, output, {
     jsonrpc: '2.0',
     id: 3,
     method: 'tools/call',
-    params: { name: 'request_sudo_approval', arguments: { profileId: 'test-profile', command: 'sudo', args: ['id'] } },
+    params: { name: 'request_action_approval', arguments: { action: 'remote-command', profileId: 'test-profile', command: 'sudo', args: ['id'] } },
   });
-  const approvalPayload = JSON.parse((approval.result as { content: Array<{ text: string }> }).content[0].text) as {
-    approved: boolean;
-    capability?: string;
-    operationId: string;
-  };
-  assert.equal(approvalPayload.approved, true);
-  assert.equal(typeof approvalPayload.capability, 'string');
-  assert.match(approvalPayload.operationId, /^[a-f0-9]{32}$/u);
-  assert.deepEqual((approval.result as { structuredContent: unknown }).structuredContent, approvalPayload);
-
-  const result = await requestResponse(input, output, {
+  const approval = JSON.parse((result.result as { content: Array<{ text: string }> }).content[0].text) as { capability: string };
+  const execution = await requestResponse(input, output, {
     jsonrpc: '2.0',
     id: 4,
     method: 'tools/call',
     params: {
       name: 'execute_remote_command',
-      arguments: { profileId: 'test-profile', command: 'sudo', args: ['id'], approvalToken: approvalPayload.capability },
+      arguments: { profileId: 'test-profile', command: 'sudo', args: ['id'], approvalCapability: approval.capability },
     },
   });
-  const resultPayload = JSON.parse((result.result as { content: Array<{ text: string }> }).content[0].text) as Record<string, unknown>;
+  const resultPayload = JSON.parse((execution.result as { content: Array<{ text: string }> }).content[0].text) as Record<string, unknown>;
   assert.equal(resultPayload.profileId, 'test-profile');
   assert.equal(resultPayload.outcome, 'success');
   assert.equal(resultPayload.code, 'success');
   assert.match(String(resultPayload.operationId), /^[a-f0-9]{32}$/u);
   assert.equal(resultPayload.stdout, 'test-output');
-  assert.deepEqual((result.result as { structuredContent: unknown }).structuredContent, resultPayload);
+  assert.deepEqual((execution.result as { structuredContent: unknown }).structuredContent, resultPayload);
 
   input.end();
   await runtime;
@@ -184,7 +171,6 @@ test('registers and routes remote execution without a production endpoint', asyn
 
 test('MCP SDK 1.x validates structured output and preserves legacy text errors', async () => {
   let failDiscovery = false;
-  let approveSudo = true;
   const profile = {
     profileId: 'test-profile',
     host: 'test.invalid',
@@ -236,13 +222,12 @@ test('MCP SDK 1.x validates structured output and preserves legacy text errors',
       },
       windowsReadinessStatusProvider: readiness,
       remoteCommandExecutionProvider: remoteProvider,
-      humanSudoApprovalProvider: { approve: async () => approveSudo },
     },
     async (client) => {
       const listed = await client.listTools();
       assert.deepEqual(
         listed.tools.map((tool) => tool.name),
-        ['list_approved_profiles', 'validate_connection', 'get_windows_readiness_status', 'execute_remote_command', 'request_sudo_approval'],
+        ['list_approved_profiles', 'validate_connection', 'get_windows_readiness_status', 'request_action_approval', 'execute_remote_command'],
       );
       for (const tool of listed.tools) {
         assert.equal(tool.outputSchema?.type, 'object');
@@ -263,36 +248,18 @@ test('MCP SDK 1.x validates structured output and preserves legacy text errors',
 
       const approval = contractResult(
         await client.callTool({
-          name: 'request_sudo_approval',
-          arguments: { profileId: 'test-profile', command: 'sudo', args: ['id'] },
+          name: 'request_action_approval',
+          arguments: { action: 'remote-command', profileId: 'test-profile', command: 'sudo', args: ['id'] },
         }),
       );
-      const approvalPayload = structuredPayload(approval);
-      assert.equal(approvalPayload.approved, true);
-      assert.equal(typeof approvalPayload.capability, 'string');
-      assert.deepEqual(textPayload(approval), approvalPayload);
-
       const execution = contractResult(
         await client.callTool({
           name: 'execute_remote_command',
-          arguments: { profileId: 'test-profile', command: 'sudo', args: ['id'], approvalToken: approvalPayload.capability },
+          arguments: { profileId: 'test-profile', command: 'sudo', args: ['id'], approvalCapability: structuredPayload(approval).capability },
         }),
       );
       assert.equal(structuredPayload(execution).outcome, 'success');
       assert.deepEqual(textPayload(execution), structuredPayload(execution));
-
-      approveSudo = false;
-      const rejected = contractResult(
-        await client.callTool({
-          name: 'request_sudo_approval',
-          arguments: { profileId: 'test-profile', command: 'sudo', args: ['id'] },
-        }),
-      );
-      assert.equal(rejected.isError, true);
-      const rejectedPayload = structuredPayload(rejected);
-      assert.equal(rejectedPayload.approved, false);
-      assert.equal(rejectedPayload.code, 'approval-rejected');
-      assert.match(String(rejectedPayload.operationId), /^[a-f0-9]{32}$/u);
 
       failDiscovery = true;
       const legacyError = contractResult(await client.callTool({ name: 'list_approved_profiles', arguments: {} }));
@@ -326,17 +293,6 @@ test('MCP SDK 1.x validates structured output and preserves legacy text errors',
       delete missingOperationId.operationId;
       assert.equal(validateRemote(missingOperationId).valid, false);
       assert.equal(validateRemote({ ...structuredPayload(execution), outcome: 'not-an-outcome' }).valid, false);
-
-      const validateSudo = validateSchema('request_sudo_approval');
-      assert.equal(validateSudo({ approved: true, code: 'approved', operationId: 'a'.repeat(32), capability: 'fake-capability' }).valid, true);
-      assert.equal(validateSudo({ approved: false, code: 'approval-rejected' }).valid, true);
-      assert.equal(validateSudo({ approved: false, code: 'approved', capability: 'fake-capability' }).valid, false);
-      assert.equal(validateSudo({ approved: false, code: 'approval-rejected', capability: 'fake-capability' }).valid, false);
-      assert.equal(validateSudo({ approved: false, code: 'not-a-code' }).valid, false);
-      assert.equal(
-        validateSudo({ approved: true, code: 'approved', operationId: 'a'.repeat(32), capability: 'fake-capability', extra: true }).valid,
-        false,
-      );
     },
   );
 });
