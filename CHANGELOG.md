@@ -5,6 +5,10 @@ publish a release.
 
 ## Unreleased
 
+### Changed
+
+- Added one client-context `request_action_approval` flow with one-use capabilities bound to exact uploads and privileged remote commands. Upload and command execution no longer open a native approval dialog or request a second confirmation after capability issuance.
+
 ## [1.1.0] - 2026-11-16
 
 ### Changed
