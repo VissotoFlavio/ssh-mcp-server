@@ -15,12 +15,7 @@ import {
   type RemoteCommandExecutionProvider,
   type RemoteCommandResult,
 } from './execution/remote-command-execution.js';
-import {
-  requestFileUploadApprovalToolName,
-  uploadRemoteFileToolName,
-  type FileUploadResult,
-  type RemoteFileUploadProvider,
-} from './execution/remote-file-upload.js';
+import { uploadRemoteFileToolName, type FileUploadResult, type RemoteFileUploadProvider } from './execution/remote-file-upload.js';
 import {
   APPROVED_PROFILE_CLASSIFICATION,
   createRuntimeApprovedProfileListingProvider,
@@ -59,10 +54,8 @@ const REMOTE_COMMAND_DESCRIPTION =
   "Executes one bounded non-interactive command on an approved SSH profile without an executable allowlist. Recognized privilege-escalation executables and command evaluators require request-bound human approval; other commands use the remote account's existing permissions and may modify remote state without an additional server approval gate. Supports no persistent SSH session or local shell.";
 const SUDO_APPROVAL_DESCRIPTION =
   'Requests a one-time human approval for one exact privileged or command-evaluator execution. Approval is request-bound, expires quickly, and cannot be supplied as a caller boolean.';
-const FILE_UPLOAD_APPROVAL_DESCRIPTION =
-  'Shows a local human approver the exact remote destination, file size, and SHA-256 before issuing a one-use upload capability. File content is never presented to the approver.';
 const FILE_UPLOAD_DESCRIPTION =
-  'Uploads one Base64 file to the exact remote destination approved by the local human approver. The destination is not restricted by a server-side directory allowlist; remote permissions still apply.';
+  'Uploads one Base64 file to an exact remote destination. This mutating tool requires the MCP client to obtain explicit user confirmation in the conversation before calling it; it does not open a native server dialog. The destination is not restricted by a server-side directory allowlist; remote permissions still apply.';
 const SAFE_PROFILE_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
 const MAX_DISCOVERABLE_PROFILES = 256;
 
@@ -210,18 +203,6 @@ const SUDO_APPROVAL_OUTPUT_SCHEMA = {
   additionalProperties: false,
 };
 
-const FILE_UPLOAD_APPROVAL_OUTPUT_SCHEMA = {
-  type: 'object',
-  properties: {
-    approved: { type: 'boolean' },
-    code: { type: 'string', enum: ['approved', 'approval-unavailable', 'approval-rejected', 'approval-busy', 'cancelled', 'invalid-input'] },
-    operationId: { type: 'string', pattern: '^[a-f0-9]{32}$' },
-    capability: { type: 'string', maxLength: 256 },
-  },
-  required: ['approved', 'code', 'operationId'],
-  additionalProperties: false,
-};
-
 const FILE_UPLOAD_OUTPUT_SCHEMA = {
   type: 'object',
   properties: {
@@ -230,7 +211,7 @@ const FILE_UPLOAD_OUTPUT_SCHEMA = {
     remotePath: { type: 'string', maxLength: 4096 },
     sha256: { type: 'string', pattern: '^[a-f0-9]{64}$|^$' },
     sizeBytes: { type: 'integer', minimum: 0, maximum: 1048576 },
-    outcome: { type: 'string', enum: ['success', 'failure', 'timeout', 'cancelled', 'approval-required', 'unknown'] },
+    outcome: { type: 'string', enum: ['success', 'failure', 'timeout', 'cancelled', 'unknown'] },
     code: {
       type: 'string',
       enum: [
@@ -242,13 +223,6 @@ const FILE_UPLOAD_OUTPUT_SCHEMA = {
         'integrity-failure',
         'timeout',
         'cancelled',
-        'approval-required',
-        'approval-expired',
-        'approval-altered',
-        'approval-reused',
-        'approval-unavailable',
-        'approval-busy',
-        'approval-rejected',
         'execution-limit',
         'execution-audit-unavailable',
         'outcome-unknown',
@@ -421,7 +395,7 @@ function remoteResult(result: RemoteCommandResult): ReturnType<typeof textToolRe
 }
 
 function fileUploadResult(result: FileUploadResult): ReturnType<typeof textToolResult> {
-  return jsonToolResult(result, result.outcome !== 'success' && result.outcome !== 'approval-required');
+  return jsonToolResult(result, result.outcome !== 'success');
 }
 
 function unavailableConnectionValidationResult(): ReturnType<typeof textToolResult> {
@@ -644,23 +618,6 @@ function registerTools(
         ? []
         : [
             {
-              name: requestFileUploadApprovalToolName,
-              description: FILE_UPLOAD_APPROVAL_DESCRIPTION,
-              outputSchema: FILE_UPLOAD_APPROVAL_OUTPUT_SCHEMA,
-              annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
-              inputSchema: {
-                type: 'object',
-                properties: {
-                  profileId: { type: 'string', pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$' },
-                  remotePath: { type: 'string', minLength: 1, maxLength: 4096 },
-                  contentBase64: { type: 'string', minLength: 1, maxLength: 1398108 },
-                  timeoutMs: { type: 'integer', minimum: 1, maximum: 60000 },
-                },
-                required: ['profileId', 'remotePath', 'contentBase64'],
-                additionalProperties: false,
-              },
-            },
-            {
               name: uploadRemoteFileToolName,
               description: FILE_UPLOAD_DESCRIPTION,
               outputSchema: FILE_UPLOAD_OUTPUT_SCHEMA,
@@ -672,9 +629,8 @@ function registerTools(
                   remotePath: { type: 'string', minLength: 1, maxLength: 4096 },
                   contentBase64: { type: 'string', minLength: 1, maxLength: 1398108 },
                   timeoutMs: { type: 'integer', minimum: 1, maximum: 60000 },
-                  approvalToken: { type: 'string', minLength: 1, maxLength: 256 },
                 },
-                required: ['profileId', 'remotePath', 'contentBase64', 'approvalToken'],
+                required: ['profileId', 'remotePath', 'contentBase64'],
                 additionalProperties: false,
               },
             },
@@ -715,13 +671,6 @@ function registerTools(
       } catch {
         return jsonToolResult({ approved: false, code: 'invalid-input' }, true);
       }
-    }
-
-    if (request.params.name === requestFileUploadApprovalToolName) {
-      if (remoteFileUploadProvider === undefined)
-        return jsonToolResult({ approved: false, code: 'approval-unavailable', operationId: '0'.repeat(32) }, true);
-      const approval = await remoteFileUploadProvider.requestApproval(request.params.arguments, extra.signal);
-      return jsonToolResult(approval, approval.approved !== true);
     }
 
     if (request.params.name === uploadRemoteFileToolName) {

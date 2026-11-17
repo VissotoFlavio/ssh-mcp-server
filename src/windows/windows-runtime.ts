@@ -8,12 +8,7 @@ import {
   createProfileExecutionAuthorizationProvider,
   type HumanSudoApprovalProvider,
 } from '../execution/remote-command-execution.js';
-import {
-  RemoteFileUploadProvider,
-  Ssh2RemoteFileUploadTransport,
-  WindowsPasswordFileUploadTransport,
-  createHumanFileUploadApprovalProvider,
-} from '../execution/remote-file-upload.js';
+import { RemoteFileUploadProvider, Ssh2RemoteFileUploadTransport, WindowsPasswordFileUploadTransport } from '../execution/remote-file-upload.js';
 import { APPROVED_PROFILE_CLASSIFICATION, type ApprovedProfileListingProvider } from '../profiles/approved-profile-listing.js';
 import { validateProfileSelection } from '../profiles/connection-profile.js';
 import type { ConnectionValidationProvider } from '../validation/trusted-connection-validation.js';
@@ -133,7 +128,6 @@ export function createWindowsRuntimeProviders(
           ),
           auditJournal: storage.executionAuditJournal ?? new UnavailableExecutionAuditJournal(),
           authorizationProvider: createProfileExecutionAuthorizationProvider(validationProvider),
-          ...(humanApproval === undefined ? {} : { humanApproval: createHumanFileUploadApprovalProvider(humanApproval) }),
         });
   const readinessStorage =
     typeof storage.inspectReadiness === 'function' &&

@@ -4,7 +4,7 @@ import { PassThrough } from 'node:stream';
 import test from 'node:test';
 
 import { createExecutionAuthorization } from '../../src/execution/remote-command-execution.js';
-import { RemoteFileUploadProvider, requestFileUploadApprovalToolName, uploadRemoteFileToolName } from '../../src/execution/remote-file-upload.js';
+import { RemoteFileUploadProvider, uploadRemoteFileToolName } from '../../src/execution/remote-file-upload.js';
 import { runStdioServer } from '../../src/server.js';
 
 const profile = {
@@ -23,17 +23,10 @@ function requestResponse(input: PassThrough, output: PassThrough, request: Recor
   return response.then(([chunk]) => JSON.parse(String(chunk)) as Record<string, unknown>);
 }
 
-test('registers only approval and upload tools and returns a structured verified upload result', async () => {
-  let approvedPath: string | undefined;
+test('registers one client-confirmed upload tool and returns a structured verified upload result', async () => {
   const provider = new RemoteFileUploadProvider({
     connectionValidation: { validateConnection: async () => ({ profileId: profile.profileId, ready: true as const }) },
     authorizationProvider: { authorize: async () => createExecutionAuthorization(profile, Date.now() + 60_000) },
-    humanApproval: {
-      approve: async (request) => {
-        approvedPath = request.remotePath;
-        return true;
-      },
-    },
     transport: {
       upload: async (request) => {
         await request.onUploadHandoff?.();
@@ -66,33 +59,20 @@ test('registers only approval and upload tools and returns a structured verified
   const listed = (tools.result as { tools: readonly { name: string; annotations?: unknown; outputSchema?: { type?: string } }[] }).tools;
   assert.deepEqual(
     listed.map((tool) => tool.name),
-    [requestFileUploadApprovalToolName, uploadRemoteFileToolName],
+    [uploadRemoteFileToolName],
   );
   for (const tool of listed) {
     assert.deepEqual(tool.annotations, { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true });
     assert.equal(tool.outputSchema?.type, 'object');
   }
 
-  const approval = await requestResponse(input, output, {
+  const upload = await requestResponse(input, output, {
     jsonrpc: '2.0',
     id: 3,
     method: 'tools/call',
     params: {
-      name: requestFileUploadApprovalToolName,
-      arguments: { profileId: profile.profileId, remotePath: '/opt/app/.env', contentBase64: payload },
-    },
-  });
-  const approvalPayload = JSON.parse((approval.result as { content: readonly { text: string }[] }).content[0].text) as { capability: string };
-  assert.equal(approvedPath, '/opt/app/.env');
-  assert.equal(JSON.stringify(approval).includes('sensitive=value'), false);
-
-  const upload = await requestResponse(input, output, {
-    jsonrpc: '2.0',
-    id: 4,
-    method: 'tools/call',
-    params: {
       name: uploadRemoteFileToolName,
-      arguments: { profileId: profile.profileId, remotePath: '/opt/app/.env', contentBase64: payload, approvalToken: approvalPayload.capability },
+      arguments: { profileId: profile.profileId, remotePath: '/opt/app/.env', contentBase64: payload },
     },
   });
   const result = upload.result as { content: readonly { text: string }[]; structuredContent: Record<string, unknown> };

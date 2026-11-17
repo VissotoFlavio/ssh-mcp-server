@@ -11,23 +11,19 @@ import {
   createProfileExecutionAuthorizationProvider,
   type ExecutionAuthorization,
   type ExecutionAuthorizationProvider,
-  type HumanSudoApprovalProvider,
-  type HumanSudoApprovalDecision,
 } from './remote-command-execution.js';
 
-export const requestFileUploadApprovalToolName = 'request_file_upload_approval';
 export const uploadRemoteFileToolName = 'upload_remote_file';
 
 export const FILE_UPLOAD_DEFAULT_TIMEOUT_MS = 30_000;
 export const FILE_UPLOAD_MAX_TIMEOUT_MS = 60_000;
 export const FILE_UPLOAD_MAX_BYTES = 1024 * 1024;
-const APPROVAL_TTL_MS = 60_000;
 const MAX_REMOTE_PATH_LENGTH = 4096;
 const PROFILE_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
 // eslint-disable-next-line no-control-regex -- control characters make an approval presentation ambiguous.
 const CONTROL_CHARACTERS = /[\u0000-\u001F\u007F]/u;
 
-export type FileUploadOutcome = 'success' | 'failure' | 'timeout' | 'cancelled' | 'approval-required' | 'unknown';
+export type FileUploadOutcome = 'success' | 'failure' | 'timeout' | 'cancelled' | 'unknown';
 export type FileUploadCode =
   | 'success'
   | 'connection-failure'
@@ -37,13 +33,6 @@ export type FileUploadCode =
   | 'integrity-failure'
   | 'timeout'
   | 'cancelled'
-  | 'approval-required'
-  | 'approval-expired'
-  | 'approval-altered'
-  | 'approval-reused'
-  | 'approval-unavailable'
-  | 'approval-busy'
-  | 'approval-rejected'
   | 'execution-limit'
   | 'execution-audit-unavailable'
   | 'outcome-unknown'
@@ -52,29 +41,11 @@ export type FileUploadCode =
 
 export interface FileUploadRequest {
   readonly profileId: string;
-  /** A complete POSIX destination path selected by the caller and shown to the human approver. */
+  /** A complete POSIX destination path selected by the caller and presented by the MCP client for approval. */
   readonly remotePath: string;
   readonly content: Buffer;
   readonly sha256: string;
   readonly timeoutMs: number;
-  readonly approvalToken?: string;
-}
-
-export interface FileUploadApprovalRequest {
-  readonly profileId: string;
-  readonly remotePath: string;
-  readonly sizeBytes: number;
-  readonly sha256: string;
-  readonly timeoutMs: number;
-  /** Trusted binding values for a local-only human approval provider. */
-  readonly operationId?: string;
-  readonly leaseIdentityDigest?: string;
-  readonly approvedIdentity?: ExecutionAuthorization['identity'];
-}
-
-export interface HumanFileUploadApprovalProvider {
-  /** The provider must render destination, size, and digest without rendering content. */
-  approve(request: FileUploadApprovalRequest, signal?: AbortSignal): Promise<HumanSudoApprovalDecision>;
 }
 
 export interface RemoteFileUploadTransportRequest {
@@ -112,11 +83,9 @@ export type Ssh2FileUploadClientFactory = () => Ssh2ClientLike;
 export interface RemoteFileUploadDependencies {
   readonly connectionValidation: ConnectionValidationProvider;
   readonly transport: RemoteFileUploadTransport;
-  readonly humanApproval?: HumanFileUploadApprovalProvider;
   readonly auditJournal?: ExecutionAuditJournal;
   readonly authorizationProvider?: ExecutionAuthorizationProvider;
   readonly concurrency?: RemoteCommandConcurrencyLimiter;
-  readonly now?: () => number;
 }
 
 export interface FileUploadResult {
@@ -176,36 +145,22 @@ function decodeContent(value: unknown): Buffer {
   return decoded;
 }
 
-function approvalToken(value: unknown): string | undefined {
-  if (value === undefined) return undefined;
-  if (typeof value !== 'string' || value.length === 0 || value.length > 256 || CONTROL_CHARACTERS.test(value)) inputError();
-  return value;
-}
-
 function parse(input: unknown): FileUploadRequest {
   if (!isPlainRecord(input)) inputError();
-  const allowed = new Set(['profileId', 'remotePath', 'contentBase64', 'timeoutMs', 'approvalToken']);
+  const allowed = new Set(['profileId', 'remotePath', 'contentBase64', 'timeoutMs']);
   if (Reflect.ownKeys(input).some((key) => typeof key !== 'string' || !allowed.has(key))) inputError();
   const content = decodeContent(own(input, 'contentBase64'));
-  const token = approvalToken(own(input, 'approvalToken'));
   return Object.freeze({
     profileId: profileId(own(input, 'profileId')),
     remotePath: remotePath(own(input, 'remotePath')),
     content,
     sha256: createHash('sha256').update(content).digest('hex'),
     timeoutMs: timeout(own(input, 'timeoutMs')),
-    ...(token === undefined ? {} : { approvalToken: token }),
   });
 }
 
 function operationId(): string {
   return randomBytes(16).toString('hex');
-}
-
-function requestHash(request: FileUploadRequest, identityDigest: string): string {
-  return createHash('sha256')
-    .update(JSON.stringify([identityDigest, request.profileId, request.remotePath, request.content.length, request.sha256, request.timeoutMs]))
-    .digest('hex');
 }
 
 function unknownResult(request: FileUploadRequest, id: string, code: FileUploadCode = 'outcome-unknown'): FileUploadResult {
@@ -249,9 +204,6 @@ function mapError(error: unknown): FileUploadCode {
   if (code === 'cancelled') return 'cancelled';
   if (code === 'execution-audit-unavailable') return 'execution-audit-unavailable';
   if (code === 'outcome-unknown') return 'outcome-unknown';
-  if (code === 'approval-expired') return 'approval-expired';
-  if (code === 'approval-altered') return 'approval-altered';
-  if (code === 'approval-reused') return 'approval-reused';
   return 'remote-failure';
 }
 
@@ -414,147 +366,13 @@ export class WindowsPasswordFileUploadTransport implements RemoteFileUploadTrans
   }
 }
 
-/** Adapts the authenticated local approval channel to an exact file-upload presentation. */
-export function createHumanFileUploadApprovalProvider(approver: HumanSudoApprovalProvider): HumanFileUploadApprovalProvider {
-  return {
-    approve: (request, signal) =>
-      approver.approve(
-        {
-          profileId: request.profileId,
-          command: 'upload_remote_file',
-          args: [request.remotePath, `sha256=${request.sha256}`, `sizeBytes=${request.sizeBytes}`],
-          timeoutMs: request.timeoutMs,
-          maxOutputBytes: 1,
-          operationId: request.operationId,
-          approvedIdentity: request.approvedIdentity,
-          leaseIdentityDigest: request.leaseIdentityDigest,
-        },
-        signal,
-      ),
-  };
-}
-
-class UploadApprovalStore {
-  private pending = false;
-  private readonly approvals = new Map<
-    string,
-    { readonly requestHash: string; readonly authorization: ExecutionAuthorization; readonly expiresAt: number; used: boolean }
-  >();
-
-  tryBeginPending(): boolean {
-    if (this.pending) return false;
-    this.pending = true;
-    return true;
-  }
-
-  endPending(): void {
-    this.pending = false;
-  }
-
-  issue(request: FileUploadRequest, authorization: ExecutionAuthorization, now: number): string {
-    const token = `${now.toString(36)}-${randomBytes(32).toString('hex')}`;
-    const expiresAt = now + APPROVAL_TTL_MS;
-    this.approvals.set(token, { requestHash: requestHash(request, authorization.identityDigest), authorization, expiresAt, used: false });
-    const expiry = setTimeout(() => {
-      const current = this.approvals.get(token);
-      if (current?.used !== true && current?.expiresAt === expiresAt) {
-        this.approvals.delete(token);
-        void current.authorization.release?.().catch(() => undefined);
-      }
-    }, APPROVAL_TTL_MS);
-    expiry.unref?.();
-    return token;
-  }
-
-  consume(
-    token: string,
-    request: FileUploadRequest,
-    now: number,
-  ): { readonly state: 'approved' | 'expired' | 'altered' | 'reused'; readonly authorization?: ExecutionAuthorization } {
-    const approval = this.approvals.get(token);
-    if (approval === undefined || approval.used) return { state: 'reused' };
-    if (approval.expiresAt <= now) {
-      this.approvals.delete(token);
-      void approval.authorization.release?.().catch(() => undefined);
-      return { state: 'expired' };
-    }
-    if (approval.requestHash !== requestHash(request, approval.authorization.identityDigest)) return { state: 'altered' };
-    approval.used = true;
-    this.approvals.delete(token);
-    return { state: 'approved', authorization: approval.authorization };
-  }
-}
-
 export class RemoteFileUploadProvider {
-  private readonly approvals = new UploadApprovalStore();
   private readonly auditJournal: ExecutionAuditJournal;
   private readonly concurrency: RemoteCommandConcurrencyLimiter;
-  private readonly now: () => number;
 
   constructor(private readonly dependencies: RemoteFileUploadDependencies) {
     this.concurrency = dependencies.concurrency ?? new RemoteCommandConcurrencyLimiter();
     this.auditJournal = dependencies.auditJournal ?? new UnavailableExecutionAuditJournal();
-    this.now = dependencies.now ?? Date.now;
-  }
-
-  async requestApproval(
-    input: unknown,
-    signal?: AbortSignal,
-  ): Promise<{
-    readonly approved: boolean;
-    readonly code: 'approved' | 'approval-unavailable' | 'approval-rejected' | 'approval-busy' | 'cancelled' | 'invalid-input';
-    readonly operationId: string;
-    readonly capability?: string;
-  }> {
-    const id = operationId();
-    let request: FileUploadRequest;
-    try {
-      request = parse(input);
-      if (request.approvalToken !== undefined) return { approved: false, code: 'invalid-input', operationId: id };
-    } catch {
-      return { approved: false, code: 'invalid-input', operationId: id };
-    }
-    if (!this.approvals.tryBeginPending()) return { approved: false, code: 'approval-busy', operationId: id };
-    try {
-      if (this.dependencies.humanApproval === undefined) return { approved: false, code: 'approval-unavailable', operationId: id };
-      let authorization: ExecutionAuthorization;
-      try {
-        authorization = await (
-          this.dependencies.authorizationProvider ?? createProfileExecutionAuthorizationProvider(this.dependencies.connectionValidation, this.now)
-        ).authorize(request.profileId, signal);
-      } catch {
-        return { approved: false, code: signal?.aborted ? 'cancelled' : 'approval-unavailable', operationId: id };
-      }
-      try {
-        const approved = await this.dependencies.humanApproval.approve(
-          {
-            profileId: request.profileId,
-            remotePath: request.remotePath,
-            sizeBytes: request.content.length,
-            sha256: request.sha256,
-            timeoutMs: request.timeoutMs,
-            operationId: id,
-            leaseIdentityDigest: authorization.identityDigest,
-            approvedIdentity: authorization.identity,
-          },
-          signal,
-        );
-        if (approved !== true) {
-          await authorization.release?.();
-          return {
-            approved: false,
-            code: approved === 'unavailable' ? 'approval-unavailable' : signal?.aborted ? 'cancelled' : 'approval-rejected',
-            operationId: id,
-          };
-        }
-        return { approved: true, code: 'approved', operationId: id, capability: this.approvals.issue(request, authorization, this.now()) };
-      } catch {
-        await authorization.release?.();
-        return { approved: false, code: signal?.aborted ? 'cancelled' : 'approval-unavailable', operationId: id };
-      }
-    } finally {
-      this.approvals.endPending();
-    }
   }
 
   async upload(input: unknown, signal?: AbortSignal): Promise<FileUploadResult> {
@@ -590,18 +408,14 @@ export class RemoteFileUploadProvider {
       }
     };
     try {
-      if (request.approvalToken === undefined) return await finish(result(request, id, 'approval-required', 'approval-required'));
-      const consumed = this.approvals.consume(request.approvalToken, request, this.now());
-      if (consumed.state !== 'approved' || consumed.authorization === undefined) {
-        const code: FileUploadCode =
-          consumed.state === 'expired' ? 'approval-expired' : consumed.state === 'altered' ? 'approval-altered' : 'approval-reused';
-        return await finish(result(request, id, 'approval-required', code));
-      }
       try {
-        authorization = consumed.authorization.consume();
-      } catch {
-        await consumed.authorization.release?.();
-        return await finish(result(request, id, 'approval-required', 'approval-expired'));
+        authorization = await (
+          this.dependencies.authorizationProvider ?? createProfileExecutionAuthorizationProvider(this.dependencies.connectionValidation)
+        ).authorize(request.profileId, signal);
+        authorization = authorization.consume();
+      } catch (error) {
+        const code = signal?.aborted ? 'cancelled' : mapError(error);
+        return await finish(result(request, id, code === 'cancelled' ? 'cancelled' : 'failure', code));
       }
       try {
         const args = [request.remotePath, request.sha256, String(request.content.length)];
@@ -611,9 +425,8 @@ export class RemoteFileUploadProvider {
           command: '[file-upload]',
           args: ['[redacted]', request.sha256, String(request.content.length)],
           argsHmac: await this.auditJournal.digestArguments(args),
-          approvalState: 'approved',
+          approvalState: 'intent',
         });
-        await journal.approval?.('approval-approved');
       } catch {
         await authorization.release?.();
         authorization = undefined;
