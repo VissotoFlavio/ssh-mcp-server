@@ -5,6 +5,12 @@ publish a release.
 
 ## Unreleased
 
+## [1.2.0] - 2026-11-17
+
+### Added
+
+- Added audited SFTP upload for an exact remote path selected by the MCP client.
+
 ### Changed
 
 - Added one client-context `request_action_approval` flow with one-use capabilities bound to exact uploads and privileged remote commands. Upload and command execution no longer open a native approval dialog or request a second confirmation after capability issuance.
