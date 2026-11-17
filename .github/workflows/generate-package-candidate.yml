@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: package-candidate-${{ github.repository }}-${{ github.event.issue.number }}
+  group: package-candidate-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
@@ -70,8 +70,19 @@ jobs:
             fi
 
             if [[ "$base_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              tag_prefix="v${base_version}-${channel}-"
+              candidate_tags="$(gh api --paginate --slurp "repos/$REPOSITORY/git/matching-refs/tags/$tag_prefix")"
+              existing_sequence="$(jq --raw-output --arg tag_prefix "$tag_prefix" '
+                [(.[] | if type == "array" then .[] else . end)
+                 | .ref? // empty
+                 | select(startswith("refs/tags/" + $tag_prefix))
+                 | ltrimstr("refs/tags/" + $tag_prefix)
+                 | select(test("^[1-9][0-9]*$"))
+                 | tonumber]
+                | max // 0
+              ' <<<"$candidate_tags")"
               accepted=true
-              candidate_version="${base_version}-${channel}.${PULL_REQUEST_NUMBER}.${source_sha:0:12}"
+              candidate_version="${base_version}-${channel}-$((existing_sequence + 1))"
               error=''
             else
               error='Candidate branches must use release/<stable-semver> or hotfix/<stable-semver>.'
@@ -230,7 +241,7 @@ jobs:
           if ($manifestVersion -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' -or $manifestVersion -ne $lockVersion -or $manifestVersion -ne $rootPackageVersion) {
             throw 'package.json and package-lock.json must match the stable branch version.'
           }
-          if ($env:CANDIDATE_VERSION -notmatch "^$([regex]::Escape($manifestVersion))-(rc|hotfix)\.\d+\.[0-9a-f]{12}$") {
+          if ($env:CANDIDATE_VERSION -notmatch "^$([regex]::Escape($manifestVersion))-(rc|hotfix)-[1-9][0-9]*$") {
             throw 'The candidate version does not match the stable package version.'
           }
 
@@ -417,7 +428,7 @@ jobs:
           release_probe="$(gh api --include --silent "repos/$REPOSITORY/releases/tags/$tag" 2>&1 || true)"
           release_status="$(sed -n '1s/^[^ ]* \([0-9][0-9][0-9]\).*/\1/p' <<<"$release_probe")"
           if [[ "$release_status" == 404 ]]; then
-            gh release create "$tag" --repo "$REPOSITORY" --target "$SOURCE_SHA" --title "Candidate $VERSION" --generate-notes --prerelease
+            gh release create "$tag" --repo "$REPOSITORY" --target "$SOURCE_SHA" --title "$VERSION" --generate-notes --prerelease
           elif [[ "$release_status" == 200 ]]; then
             release="$(gh release view "$tag" --repo "$REPOSITORY" --json isPrerelease,targetCommitish,url)" || fail "Unable to read existing $tag Release."
             jq --exit-status --arg source_sha "$SOURCE_SHA" '.isPrerelease == true and .targetCommitish == $source_sha' <<<"$release" >/dev/null || fail "Existing $tag Release is not the expected prerelease."
