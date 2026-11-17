@@ -7,14 +7,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 
 import { serializeAuditEvent } from './diagnostics/redacted-diagnostics-audit.js';
-import { createLocalHumanSudoApprovalProvider } from './execution/human-approver-ipc.js';
-import {
-  remoteCommandToolName,
-  requestSudoApprovalToolName,
-  type HumanSudoApprovalProvider,
-  type RemoteCommandExecutionProvider,
-  type RemoteCommandResult,
-} from './execution/remote-command-execution.js';
+import { remoteCommandToolName, type RemoteCommandExecutionProvider, type RemoteCommandResult } from './execution/remote-command-execution.js';
 import { uploadRemoteFileToolName, type FileUploadResult, type RemoteFileUploadProvider } from './execution/remote-file-upload.js';
 import {
   APPROVED_PROFILE_CLASSIFICATION,
@@ -51,9 +44,7 @@ const VALIDATE_CONNECTION_DESCRIPTION =
 const WINDOWS_READINESS_STATUS_DESCRIPTION =
   'Reports bounded local Windows readiness categories only. It accepts no connection settings, profile IDs, credentials, paths, or commands and never contacts a remote host.';
 const REMOTE_COMMAND_DESCRIPTION =
-  "Executes one bounded non-interactive command on an approved SSH profile without an executable allowlist. Recognized privilege-escalation executables and command evaluators require request-bound human approval; other commands use the remote account's existing permissions and may modify remote state without an additional server approval gate. Supports no persistent SSH session or local shell.";
-const SUDO_APPROVAL_DESCRIPTION =
-  'Requests a one-time human approval for one exact privileged or command-evaluator execution. Approval is request-bound, expires quickly, and cannot be supplied as a caller boolean.';
+  'Executes one bounded non-interactive command on an approved SSH profile without an executable allowlist. This mutating tool requires the MCP client to obtain explicit user confirmation in the conversation before calling it, including for sudo and command evaluators; it does not open a native server dialog. Supports no persistent SSH session or local shell.';
 const FILE_UPLOAD_DESCRIPTION =
   'Uploads one Base64 file to an exact remote destination. This mutating tool requires the MCP client to obtain explicit user confirmation in the conversation before calling it; it does not open a native server dialog. The destination is not restricted by a server-side directory allowlist; remote permissions still apply.';
 const SAFE_PROFILE_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
@@ -175,34 +166,6 @@ const REMOTE_COMMAND_OUTPUT_SCHEMA = {
   additionalProperties: false,
 };
 
-const SUDO_APPROVAL_OUTPUT_SCHEMA = {
-  type: 'object',
-  properties: {
-    approved: { type: 'boolean' },
-    code: {
-      type: 'string',
-      enum: ['approved', 'approval-unavailable', 'approval-rejected', 'approval-busy', 'cancelled', 'invalid-input', 'provider-failure'],
-    },
-    operationId: { type: 'string', pattern: '^[a-f0-9]{32}$' },
-    capability: { type: 'string', maxLength: 256 },
-  },
-  oneOf: [
-    {
-      required: ['approved', 'code', 'operationId', 'capability'],
-      properties: { approved: { const: true }, code: { const: 'approved' } },
-    },
-    {
-      required: ['approved', 'code'],
-      properties: {
-        approved: { const: false },
-        code: { enum: ['approval-unavailable', 'approval-rejected', 'approval-busy', 'cancelled', 'invalid-input', 'provider-failure'] },
-      },
-      not: { required: ['capability'] },
-    },
-  ],
-  additionalProperties: false,
-};
-
 const FILE_UPLOAD_OUTPUT_SCHEMA = {
   type: 'object',
   properties: {
@@ -245,9 +208,8 @@ export interface ServerOptions {
   readonly auditSink?: (serializedEvent: string) => void;
   /** Local-only, redacted Windows prerequisite status provider. */
   readonly windowsReadinessStatusProvider?: WindowsReadinessStatusProvider;
-  /** Trusted remote execution and human approval boundary. */
+  /** Trusted remote execution boundary. */
   readonly remoteCommandExecutionProvider?: RemoteCommandExecutionProvider;
-  readonly humanSudoApprovalProvider?: HumanSudoApprovalProvider;
   /** Trusted upload provider. It is absent until a platform transport is composed. */
   readonly remoteFileUploadProvider?: RemoteFileUploadProvider;
 }
@@ -261,7 +223,6 @@ export interface StdioServerOptions {
   connectionValidationProvider?: ConnectionValidationProvider;
   windowsReadinessStatusProvider?: WindowsReadinessStatusProvider;
   remoteCommandExecutionProvider?: RemoteCommandExecutionProvider;
-  humanSudoApprovalProvider?: HumanSudoApprovalProvider;
   remoteFileUploadProvider?: RemoteFileUploadProvider;
 }
 
@@ -511,20 +472,15 @@ function registerTools(
   connectionValidationProvider: ConnectionValidationProvider | undefined,
   windowsReadinessStatusProvider: WindowsReadinessStatusProvider | undefined,
   remoteCommandExecutionProvider: RemoteCommandExecutionProvider | undefined,
-  humanSudoApprovalProvider: HumanSudoApprovalProvider | undefined,
   remoteFileUploadProvider: RemoteFileUploadProvider | undefined,
   auditSink: ((serializedEvent: string) => void) | undefined,
 ): void {
   const configuredRemoteCommandExecutionProvider =
     remoteCommandExecutionProvider === undefined
       ? undefined
-      : (() => {
-          const configured =
-            humanSudoApprovalProvider === undefined
-              ? remoteCommandExecutionProvider
-              : remoteCommandExecutionProvider.withHumanSudoApprovalProvider(humanSudoApprovalProvider);
-          return auditSink === undefined ? configured : configured.withAuditSink(auditSink);
-        })();
+      : auditSink === undefined
+        ? remoteCommandExecutionProvider
+        : remoteCommandExecutionProvider.withAuditSink(auditSink);
   server.setRequestHandler(ListToolsRequestSchema, () => ({
     tools: [
       ...(approvedProfileListingProvider === undefined
@@ -589,25 +545,6 @@ function registerTools(
                   args: { type: 'array', items: { type: 'string', maxLength: 4096 }, maxItems: 64 },
                   timeoutMs: { type: 'integer', minimum: 1, maximum: 60000 },
                   maxOutputBytes: { type: 'integer', minimum: 1, maximum: 1048576 },
-                  approvalToken: { type: 'string', maxLength: 256 },
-                },
-                required: ['profileId', 'command', 'args'],
-                additionalProperties: false,
-              },
-            },
-            {
-              name: requestSudoApprovalToolName,
-              description: SUDO_APPROVAL_DESCRIPTION,
-              outputSchema: SUDO_APPROVAL_OUTPUT_SCHEMA,
-              annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
-              inputSchema: {
-                type: 'object',
-                properties: {
-                  profileId: { type: 'string', pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$' },
-                  command: { type: 'string', minLength: 1, maxLength: 256 },
-                  args: { type: 'array', items: { type: 'string', maxLength: 4096 }, maxItems: 64 },
-                  timeoutMs: { type: 'integer', minimum: 1, maximum: 60000 },
-                  maxOutputBytes: { type: 'integer', minimum: 1, maximum: 1048576 },
                 },
                 required: ['profileId', 'command', 'args'],
                 additionalProperties: false,
@@ -660,16 +597,6 @@ function registerTools(
         return jsonToolResult(safeWindowsReadinessStatus(await windowsReadinessStatusProvider.getWindowsReadinessStatus()));
       } catch {
         return unavailableWindowsReadinessStatusResult();
-      }
-    }
-
-    if (request.params.name === requestSudoApprovalToolName) {
-      if (configuredRemoteCommandExecutionProvider === undefined) return jsonToolResult({ approved: false, code: 'provider-failure' }, true);
-      try {
-        const approval = await configuredRemoteCommandExecutionProvider.requestSudoApproval(request.params.arguments, extra.signal);
-        return jsonToolResult(approval, approval.approved !== true);
-      } catch {
-        return jsonToolResult({ approved: false, code: 'invalid-input' }, true);
       }
     }
 
@@ -746,7 +673,6 @@ export function createServer({
   auditSink,
   windowsReadinessStatusProvider,
   remoteCommandExecutionProvider,
-  humanSudoApprovalProvider,
   remoteFileUploadProvider,
 }: ServerOptions = {}): Server {
   const server = new Server({ name: serverName, version: serverVersion }, { capabilities: { tools: {} } });
@@ -756,7 +682,6 @@ export function createServer({
     connectionValidationProvider,
     windowsReadinessStatusProvider,
     remoteCommandExecutionProvider,
-    humanSudoApprovalProvider,
     remoteFileUploadProvider,
     auditSink,
   );
@@ -776,7 +701,6 @@ export async function runStdioServer({
   connectionValidationProvider,
   windowsReadinessStatusProvider,
   remoteCommandExecutionProvider,
-  humanSudoApprovalProvider,
   remoteFileUploadProvider,
 }: StdioServerOptions = {}): Promise<void> {
   const server = createServer({
@@ -784,7 +708,6 @@ export async function runStdioServer({
     connectionValidationProvider,
     windowsReadinessStatusProvider,
     remoteCommandExecutionProvider,
-    humanSudoApprovalProvider,
     remoteFileUploadProvider,
     auditSink: (serializedEvent) => errorOutput.write(`${serializedEvent}\n`),
   });
@@ -878,17 +801,14 @@ export function createProductionRuntimeProviders(
         return false;
       }
     })(),
-  windowsRuntimeFactory: (
-    humanApproval?: HumanSudoApprovalProvider,
-  ) => Pick<
+  windowsRuntimeFactory: () => Pick<
     ServerOptions,
     | 'approvedProfileListingProvider'
     | 'connectionValidationProvider'
     | 'windowsReadinessStatusProvider'
     | 'remoteCommandExecutionProvider'
     | 'remoteFileUploadProvider'
-  > = (humanApproval) => createWindowsRuntimeProviders(undefined, undefined, humanApproval),
-  humanSudoApprovalProvider?: HumanSudoApprovalProvider,
+  > = () => createWindowsRuntimeProviders(),
 ): Pick<
   ServerOptions,
   | 'approvedProfileListingProvider'
@@ -900,7 +820,7 @@ export function createProductionRuntimeProviders(
   if (platform === 'win32') {
     if (!windowsSupported) return { windowsReadinessStatusProvider: createWindowsReadinessStatusProvider(false) };
     try {
-      return windowsRuntimeFactory(humanSudoApprovalProvider);
+      return windowsRuntimeFactory();
     } catch {
       return { windowsReadinessStatusProvider: createWindowsReadinessStatusProvider(true) };
     }
@@ -910,7 +830,7 @@ export function createProductionRuntimeProviders(
     return {
       approvedProfileListingProvider: createRuntimeApprovedProfileListingProvider(),
       connectionValidationProvider,
-      remoteCommandExecutionProvider: createRuntimeRemoteCommandExecutionProvider({ connectionValidationProvider }, humanSudoApprovalProvider),
+      remoteCommandExecutionProvider: createRuntimeRemoteCommandExecutionProvider({ connectionValidationProvider }),
     };
   }
   return {};
@@ -918,9 +838,7 @@ export function createProductionRuntimeProviders(
 
 if (isEntrypoint) {
   const runProductionServer = async (): Promise<void> => {
-    const localApprover = createLocalHumanSudoApprovalProvider();
-    const runtime = createProductionRuntimeProviders(process.platform, undefined, undefined, localApprover);
-    await runStdioServer(localApprover === undefined ? runtime : { ...runtime, humanSudoApprovalProvider: localApprover });
+    await runStdioServer(createProductionRuntimeProviders());
   };
 
   runProductionServer().catch((error: unknown) => {

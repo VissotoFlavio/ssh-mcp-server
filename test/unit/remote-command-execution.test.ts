@@ -11,7 +11,6 @@ import {
   Ssh2RemoteCommandTransport,
   SudoApprovalStore,
   WindowsRemoteCommandTransport,
-  createExecutionAuthorization,
   serializeRemoteAuditEvent,
   type RemoteCommandTransport,
   type RemoteCommandTransportResult,
@@ -139,32 +138,32 @@ test('preserves public host-key and authentication failure classes from authoriz
   assert.equal((await authentication.provider.execute(command)).code, 'authentication-failure');
 });
 
-test('blocks sudo without a server-issued approval and records a redacted audit event', async () => {
+test('executes sudo once after client confirmation and records a redacted audit event', async () => {
   const audit: string[] = [];
   const { provider, transport } = createProvider(undefined, { audit });
   const result = await provider.execute({ profileId: profile.profileId, command: 'sudo', args: ['--password=secret'] });
-  assert.equal(result.outcome, 'approval-required');
-  assert.equal(result.code, 'approval-required');
-  assert.equal(transport.calls.length, 0);
+  assert.equal(result.outcome, 'success');
+  assert.equal(result.code, 'success');
+  assert.equal(transport.calls.length, 1);
   assert.equal(audit.length, 1);
   assert.equal(audit[0].includes('secret'), false);
-  assert.equal(JSON.parse(audit[0]).approvalState, 'blocked');
+  assert.equal(JSON.parse(audit[0]).approvalState, 'not-required');
 });
 
-test('reports unavailable sudo approval as a failure before transport', async () => {
+test('does not depend on a native sudo approver', async () => {
   const { provider, transport } = createProvider(undefined, { humanApproval: false });
   const result = await provider.execute({ profileId: profile.profileId, command: 'sudo', args: ['id'] });
-  assert.equal(result.outcome, 'failure');
-  assert.equal(result.code, 'approval-unavailable');
-  assert.equal(transport.calls.length, 0);
+  assert.equal(result.outcome, 'success');
+  assert.equal(result.code, 'success');
+  assert.equal(transport.calls.length, 1);
 });
 
-test('requires approval for recognized privilege-escalation executables', async () => {
+test('executes recognized privilege-escalation executables without a second server prompt', async () => {
   for (const command of ['doas', 'dzdo', 'pkexec', 'runuser', 'su', 'sudoedit']) {
     const { provider, transport } = createProvider(undefined, { humanApproval: false });
     const result = await provider.execute({ profileId: profile.profileId, command, args: ['id'] });
-    assert.equal(result.code, 'approval-unavailable');
-    assert.equal(transport.calls.length, 0);
+    assert.equal(result.code, 'success');
+    assert.equal(transport.calls.length, 1);
   }
 });
 
@@ -207,32 +206,6 @@ test('allows only one pending approval per process and fails the second closed',
   controller.abort();
   releaseApproval();
   assert.equal((await pending).code, 'cancelled');
-});
-
-test('binds sudo approval to exact request, expiry and one-time use', async () => {
-  let now = 1_000;
-  const approvals = new SudoApprovalStore();
-  const { provider, transport } = createProvider(undefined, { approvals, now: () => now });
-  const sudo = { profileId: profile.profileId, command: 'sudo', args: ['systemctl', 'restart', 'api'] };
-  const approval = await provider.requestSudoApproval(sudo);
-  assert.equal(approval.approved, true);
-  assert.equal(typeof approval.token, 'string');
-
-  const altered = await provider.execute({ ...sudo, args: ['systemctl', 'stop', 'api'], approvalToken: approval.token });
-  assert.equal(altered.code, 'approval-altered');
-  assert.equal(transport.calls.length, 0);
-
-  const executed = await provider.execute({ ...sudo, approvalToken: approval.token });
-  assert.equal(executed.code, 'success');
-  assert.equal(transport.calls.length, 1);
-
-  const reused = await provider.execute({ ...sudo, approvalToken: approval.token });
-  assert.equal(reused.code, 'approval-reused');
-
-  const second = await provider.requestSudoApproval(sudo);
-  now += 60_001;
-  const expired = await provider.execute({ ...sudo, approvalToken: second.token });
-  assert.equal(expired.code, 'approval-expired');
 });
 
 test('honors an already-cancelled request before remote transport', async () => {
@@ -354,18 +327,15 @@ test('allows arbitrary non-privileged executables and literal arguments', async 
   assert.equal(transport.calls.length, 4);
 });
 
-test('allows command evaluators after exact human approval', async () => {
+test('executes command evaluators in one client-confirmed call', async () => {
   const { provider, transport } = createProvider();
   const request = { profileId: profile.profileId, command: 'bash', args: ['-c', 'printf approved'] };
-  const approval = await provider.requestSudoApproval(request);
-  assert.equal(approval.code, 'approved');
-
-  const result = await provider.execute({ ...request, approvalToken: approval.token });
+  const result = await provider.execute(request);
   assert.equal(result.code, 'success');
   assert.equal(transport.calls.length, 1);
 });
 
-test('requires approval for command evaluators and find command execution', async () => {
+test('does not open a server approval flow for command evaluators and find command execution', async () => {
   const { provider, transport } = createProvider(undefined, { humanApproval: false });
   for (const request of [
     { ...command, command: 'sh', args: ['-c', 'sudo id'] },
@@ -378,9 +348,9 @@ test('requires approval for command evaluators and find command execution', asyn
     { ...command, command: 'find', args: ['.', '-exec', 'id', ';'] },
   ]) {
     const result = await provider.execute(request);
-    assert.equal(result.code, 'approval-unavailable');
+    assert.equal(result.code, 'success');
   }
-  assert.equal(transport.calls.length, 0);
+  assert.equal(transport.calls.length, 8);
 });
 
 test('rejects new remote work when the process concurrency limit is full', async () => {
@@ -546,50 +516,6 @@ test('preserves outcome-unknown when journal finalization and secondary audit bo
   assert.equal(result.exitCode, null);
   assert.equal(result.stdout, '');
   assert.equal(result.stderr, '');
-});
-
-test('uses the approved sudo lease when the profile source changes', async () => {
-  const changed = { ...profile, host: 'changed.internal.example' };
-  let current = profile;
-  const transport = new FakeTransport();
-  const provider = new RemoteCommandExecutionProvider({
-    profiles: { getProfile: async () => current },
-    connectionValidation: {
-      validateConnection: async () => ({ profileId: profile.profileId, ready: true as const }),
-      authorizeExecution: async () => ({ profile: current }),
-    },
-    transport,
-    authorizationProvider: {
-      authorize: async () => createExecutionAuthorization(current, Date.now() + 60_000),
-    },
-    humanApproval: { approve: async () => true },
-  });
-  const sudo = { profileId: profile.profileId, command: 'sudo', args: ['id'] };
-  const approval = await provider.requestSudoApproval(sudo);
-  current = changed;
-  const result = await provider.execute({ ...sudo, approvalToken: approval.token });
-  assert.equal(result.code, 'success');
-  assert.equal((transport.calls[0] as { profile: ConnectionProfile }).profile.host, profile.host);
-});
-
-test('keeps the approved profile snapshot when no explicit authorization provider is injected', async () => {
-  let current = profile;
-  const transport = new FakeTransport();
-  const provider = new RemoteCommandExecutionProvider({
-    profiles: { getProfile: async () => current },
-    connectionValidation: {
-      validateConnection: async () => ({ profileId: profile.profileId, ready: true as const }),
-      authorizeExecution: async () => ({ profile: current }),
-    },
-    transport,
-    humanApproval: { approve: async () => true },
-  });
-  const sudo = { profileId: profile.profileId, command: 'sudo', args: ['id'] };
-  const approval = await provider.requestSudoApproval(sudo);
-  current = { ...profile, host: 'changed.internal.example' };
-  const result = await provider.execute({ ...sudo, approvalToken: approval.token });
-  assert.equal(result.code, 'success');
-  assert.equal((transport.calls[0] as { profile: ConnectionProfile }).profile.host, profile.host);
 });
 
 test('blocks Windows agent-key execution while retaining the password transport boundary', async () => {

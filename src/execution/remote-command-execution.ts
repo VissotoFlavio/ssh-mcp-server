@@ -10,7 +10,6 @@ import type { ConnectionValidationProvider } from '../validation/trusted-connect
 import type { ExecutionAuditHandle, ExecutionAuditJournal } from './execution-audit-journal.js';
 
 export const remoteCommandToolName = 'execute_remote_command';
-export const requestSudoApprovalToolName = 'request_sudo_approval';
 
 export const REMOTE_COMMAND_DEFAULT_TIMEOUT_MS = 30_000;
 export const REMOTE_COMMAND_MAX_TIMEOUT_MS = 60_000;
@@ -90,7 +89,6 @@ export interface RemoteCommandRequest {
   readonly args: readonly string[];
   readonly timeoutMs?: number;
   readonly maxOutputBytes?: number;
-  readonly approvalToken?: string;
 }
 
 export interface RemoteCommandResult {
@@ -244,15 +242,10 @@ function validateArgs(value: unknown): readonly string[] {
   return value.map((argument) => validateText(argument, MAX_ARGUMENT_LENGTH));
 }
 
-function validateApprovalToken(value: unknown): string | undefined {
-  if (value === undefined) return undefined;
-  return validateText(value, 256);
-}
-
 function parseRequest(input: unknown): RemoteCommandRequest {
   if (!isPlainRecord(input)) throw new RemoteExecutionError('invalid-input', 'Remote command input is invalid');
   const keys = Reflect.ownKeys(input);
-  const allowed = new Set(['profileId', 'command', 'args', 'timeoutMs', 'maxOutputBytes', 'approvalToken']);
+  const allowed = new Set(['profileId', 'command', 'args', 'timeoutMs', 'maxOutputBytes']);
   if (keys.some((key) => typeof key !== 'string' || !allowed.has(key))) {
     throw new RemoteExecutionError('invalid-input', 'Remote command input is invalid');
   }
@@ -261,14 +254,12 @@ function parseRequest(input: unknown): RemoteCommandRequest {
   const args = validateArgs(own(input, 'args'));
   const timeoutMs = boundedTimeout(own(input, 'timeoutMs'));
   const maxOutputBytes = boundedOutputLimit(own(input, 'maxOutputBytes'));
-  const approvalToken = validateApprovalToken(own(input, 'approvalToken'));
   return Object.freeze({
     profileId,
     command,
     args: Object.freeze([...args]),
     timeoutMs,
     maxOutputBytes,
-    ...(approvalToken === undefined ? {} : { approvalToken }),
   });
 }
 
@@ -744,7 +735,6 @@ export class RemoteCommandExecutionProvider {
       writeRemoteAudit(this.dependencies.auditSink, request, 'rejected', result, Math.max(0, this.now() - startedAt));
       return { approved: false, code, operationId } as const;
     };
-    if (request.approvalToken !== undefined) return rejected();
     const sudoRequest: SudoApprovalRequest = {
       profileId: request.profileId,
       command: request.command,
@@ -890,15 +880,8 @@ export class RemoteCommandExecutionProvider {
     const startedAt = this.now();
     const operationId = cryptoRandomToken().slice(0, 32);
     let argsHmac = createHmac('sha256', AUDIT_SINK_KEY).update(JSON.stringify(request.args)).digest('hex');
-    let approvalState: SudoApprovalState = 'not-required';
+    const approvalState: SudoApprovalState = 'not-required';
     let journal: ExecutionAuditHandle | undefined;
-    const sudoRequest: SudoApprovalRequest = {
-      profileId: request.profileId,
-      command: request.command,
-      args: request.args,
-      timeoutMs: request.timeoutMs!,
-      maxOutputBytes: request.maxOutputBytes!,
-    };
     const finish = async (result: RemoteCommandResult): Promise<RemoteCommandResult> => {
       let finalResult = result;
       if (journal !== undefined) {
@@ -925,7 +908,7 @@ export class RemoteCommandExecutionProvider {
           command: redactAuditText(request.command),
           args: redactRemoteAuditArguments(request.args),
           argsHmac,
-          approvalState: requiresHumanApproval(request.command, request.args) ? 'blocked' : 'not-required',
+          approvalState: 'not-required',
         });
       } catch {
         releaseConcurrency();
@@ -945,46 +928,14 @@ export class RemoteCommandExecutionProvider {
     let transportSettled: Promise<void> | undefined;
     try {
       if (signal?.aborted) return finish(safeResult(request.profileId, 'cancelled', 'cancelled', { operationId }));
-      if (requiresHumanApproval(request.command, request.args)) {
-        approvalState = 'blocked';
-        if (request.approvalToken === undefined)
-          return finish(
-            safeResult(
-              request.profileId,
-              this.dependencies.humanApproval === undefined ? 'failure' : 'approval-required',
-              this.dependencies.humanApproval === undefined ? 'approval-unavailable' : 'approval-required',
-              { operationId },
-            ),
-          );
-        const consumed = this.approvals.consumeForAuthorization(request.approvalToken, sudoRequest, this.now());
-        approvalState = consumed.status;
-        if (consumed.status !== 'approved') {
-          const code = consumed.status === 'expired' ? 'approval-expired' : consumed.status === 'altered' ? 'approval-altered' : 'approval-reused';
-          return finish(safeResult(request.profileId, 'approval-required', code, { operationId }));
-        }
-        if (journal?.approval !== undefined) await journal.approval('approval-approved');
-        authorization = consumed.authorization;
-        if (authorization === undefined) {
-          authorization = await boundedOperation(
-            (validationSignal) =>
-              (
-                this.dependencies.authorizationProvider ??
-                createProfileExecutionAuthorizationProvider(this.dependencies.connectionValidation, this.now)
-              ).authorize(request.profileId, validationSignal),
-            remainingTimeout(startedAt, request.timeoutMs!),
-            signal,
-          );
-        }
-      } else {
-        authorization = await boundedOperation(
-          (validationSignal) =>
-            (
-              this.dependencies.authorizationProvider ?? createProfileExecutionAuthorizationProvider(this.dependencies.connectionValidation, this.now)
-            ).authorize(request.profileId, validationSignal),
-          remainingTimeout(startedAt, request.timeoutMs!),
-          signal,
-        );
-      }
+      authorization = await boundedOperation(
+        (validationSignal) =>
+          (
+            this.dependencies.authorizationProvider ?? createProfileExecutionAuthorizationProvider(this.dependencies.connectionValidation, this.now)
+          ).authorize(request.profileId, validationSignal),
+        remainingTimeout(startedAt, request.timeoutMs!),
+        signal,
+      );
       const consumedAuthorization = authorization.consume();
       const transportOperation = boundedTransportExecute(
         this.dependencies.transport,

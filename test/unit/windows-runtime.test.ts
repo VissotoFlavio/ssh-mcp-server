@@ -161,21 +161,15 @@ test('selects the injected Windows runtime only on a supported host', () => {
   assert.equal(composed, 1);
 });
 
-test('passes the explicit human sudo approval boundary through production composition', () => {
-  let received: unknown;
-  const approval = { approve: async () => true };
+test('does not pass a native sudo approval boundary through production composition', () => {
+  let received: readonly unknown[] | undefined;
   const expected = createWindowsRuntimeProviders({ listProfiles: () => [] });
-  const selected = createProductionRuntimeProviders(
-    'win32',
-    true,
-    (injected) => {
-      received = injected;
-      return expected;
-    },
-    approval,
-  );
+  const selected = createProductionRuntimeProviders('win32', true, (...injected) => {
+    received = injected;
+    return expected;
+  });
   assert.equal(selected, expected);
-  assert.equal(received, approval);
+  assert.deepEqual(received, []);
 });
 
 test('wires the native Windows agent command through the immutable profile snapshot lease', async () => {
