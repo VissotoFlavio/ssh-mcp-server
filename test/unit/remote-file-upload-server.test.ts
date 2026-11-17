@@ -3,8 +3,8 @@ import { once } from 'node:events';
 import { PassThrough } from 'node:stream';
 import test from 'node:test';
 
-import { RemoteFileUploadProvider, requestFileUploadApprovalToolName, uploadRemoteFileToolName } from '../../src/execution/remote-file-upload.js';
 import { createExecutionAuthorization } from '../../src/execution/remote-command-execution.js';
+import { RemoteFileUploadProvider, requestFileUploadApprovalToolName, uploadRemoteFileToolName } from '../../src/execution/remote-file-upload.js';
 import { runStdioServer } from '../../src/server.js';
 
 const profile = {

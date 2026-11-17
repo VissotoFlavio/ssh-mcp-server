@@ -1,5 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 
+import { Client, type AuthHandlerMiddleware, type ConnectConfig, type NextAuthHandler, type SFTPWrapper } from 'ssh2';
+
 import type { ConnectionValidationProvider } from '../validation/trusted-connection-validation.js';
 
 import { UnavailableExecutionAuditJournal, type ExecutionAuditHandle, type ExecutionAuditJournal } from './execution-audit-journal.js';
@@ -9,6 +11,7 @@ import {
   createProfileExecutionAuthorizationProvider,
   type ExecutionAuthorization,
   type ExecutionAuthorizationProvider,
+  type HumanSudoApprovalProvider,
   type HumanSudoApprovalDecision,
 } from './remote-command-execution.js';
 
@@ -66,6 +69,7 @@ export interface FileUploadApprovalRequest {
   /** Trusted binding values for a local-only human approval provider. */
   readonly operationId?: string;
   readonly leaseIdentityDigest?: string;
+  readonly approvedIdentity?: ExecutionAuthorization['identity'];
 }
 
 export interface HumanFileUploadApprovalProvider {
@@ -94,6 +98,16 @@ export interface RemoteFileUploadTransportResult {
 export interface RemoteFileUploadTransport {
   upload(request: RemoteFileUploadTransportRequest, signal?: AbortSignal): Promise<RemoteFileUploadTransportResult>;
 }
+
+interface Ssh2ClientLike {
+  on(event: 'ready' | 'error' | 'close', listener: (...args: readonly unknown[]) => void): this;
+  connect(config: ConnectConfig): this;
+  sftp(callback: (error: Error | undefined, sftp: SFTPWrapper) => void): void;
+  end(): void;
+  destroy(): void;
+}
+
+export type Ssh2FileUploadClientFactory = () => Ssh2ClientLike;
 
 export interface RemoteFileUploadDependencies {
   readonly connectionValidation: ConnectionValidationProvider;
@@ -241,6 +255,185 @@ function mapError(error: unknown): FileUploadCode {
   return 'remote-failure';
 }
 
+function hostFingerprint(key: Buffer): string {
+  return `SHA256:${createHash('sha256').update(key).digest('base64').replace(/=+$/u, '')}`;
+}
+
+function sftpCallback(operation: (done: (error?: Error | null) => void) => void): Promise<void> {
+  return new Promise<void>((resolve, reject) => operation((error) => (error === undefined ? resolve() : reject(error))));
+}
+
+/**
+ * Direct SSH2 SFTP upload transport. It receives only a validated immutable
+ * authorization and never starts a local shell or child process.
+ */
+export class Ssh2RemoteFileUploadTransport implements RemoteFileUploadTransport {
+  constructor(
+    private readonly credentials?: { getPassword(reference: string): Promise<{ readonly password: string }> },
+    private readonly agent?: string,
+    private readonly clients: Ssh2FileUploadClientFactory = () => new Client(),
+  ) {}
+
+  upload(request: RemoteFileUploadTransportRequest, signal?: AbortSignal): Promise<RemoteFileUploadTransportResult> {
+    if (signal?.aborted) return Promise.reject(new RemoteExecutionError('cancelled', 'Remote file upload cancelled'));
+    return new Promise((resolve, reject) => {
+      const client = this.clients();
+      let finished = false;
+      let ready = false;
+      let hostVerified = false;
+      let hostKeyRejected = false;
+      let authenticationStarted = false;
+      let started = false;
+      let temporaryPath: string | undefined;
+      let sftp: SFTPWrapper | undefined;
+      const cleanup = (): void => {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', abort);
+        try {
+          client.end();
+        } catch {
+          client.destroy();
+        }
+      };
+      const finish = (error?: RemoteExecutionError, value?: RemoteFileUploadTransportResult): void => {
+        if (finished) return;
+        finished = true;
+        cleanup();
+        if (error === undefined && value !== undefined) resolve(value);
+        else reject(error ?? new RemoteExecutionError('remote-failure', 'Remote file upload failed'));
+      };
+      const abort = (): void => {
+        try {
+          client.destroy();
+        } finally {
+          finish(new RemoteExecutionError(started ? 'outcome-unknown' : 'cancelled', 'Remote file upload cancelled'));
+        }
+      };
+      const timer = setTimeout(() => {
+        try {
+          client.destroy();
+        } finally {
+          finish(new RemoteExecutionError(started ? 'outcome-unknown' : 'timeout', 'Remote file upload timed out'));
+        }
+      }, request.timeoutMs);
+      const cleanupTemporary = (): void => {
+        if (sftp === undefined || temporaryPath === undefined) return;
+        sftp.unlink(temporaryPath, () => undefined);
+      };
+      signal?.addEventListener('abort', abort, { once: true });
+      client.on('error', () => {
+        cleanupTemporary();
+        const code = started
+          ? 'outcome-unknown'
+          : hostKeyRejected
+            ? 'host-key-failure'
+            : authenticationStarted
+              ? 'authentication-failure'
+              : ready
+                ? 'connection-failure'
+                : 'connection-failure';
+        finish(new RemoteExecutionError(code, 'Remote SSH connection failed'));
+      });
+      client.on('close', () => {
+        if (!finished) finish(new RemoteExecutionError(started ? 'outcome-unknown' : 'connection-failure', 'Remote SSH connection closed'));
+      });
+      const rename = async (): Promise<void> => {
+        if (sftp === undefined || temporaryPath === undefined) throw new Error('SFTP unavailable');
+        try {
+          await sftpCallback((done) => sftp!.ext_openssh_rename(temporaryPath!, request.remotePath, done));
+        } catch {
+          await sftpCallback((done) => sftp!.rename(temporaryPath!, request.remotePath, done));
+        }
+      };
+      const startSftp = (): void => {
+        client.sftp((error, session) => {
+          if (error !== undefined) return finish(new RemoteExecutionError('remote-failure', 'Remote SFTP session failed'));
+          sftp = session;
+          void (async () => {
+            try {
+              temporaryPath = `${request.remotePath}.ssh-mcp-upload-${randomBytes(12).toString('hex')}`;
+              await request.onUploadHandoff?.();
+              started = true;
+              request.onUploadStarted?.();
+              await new Promise<void>((resolveWrite, rejectWrite) => {
+                session.writeFile(temporaryPath!, request.content, { flag: 'w', mode: 0o600 }, (writeError) =>
+                  writeError === undefined ? resolveWrite() : rejectWrite(writeError),
+                );
+              });
+              await rename();
+              temporaryPath = undefined;
+              finish(undefined, { uploadedBytes: request.content.length, sha256: request.sha256 });
+            } catch {
+              cleanupTemporary();
+              finish(new RemoteExecutionError(started ? 'outcome-unknown' : 'remote-failure', 'Remote file upload failed'));
+            }
+          })();
+        });
+      };
+      try {
+        const authHandler: AuthHandlerMiddleware = (_methodsLeft, _partialSuccess, callback: NextAuthHandler) => {
+          authenticationStarted = true;
+          if (!hostVerified || this.credentials === undefined) return callback('none');
+          void this.credentials
+            .getPassword(request.authorization.profile.credentialReference!)
+            .then((credential) => callback({ type: 'password', username: request.authorization.profile.user, password: credential.password }))
+            .catch(() => callback('none'));
+        };
+        client.on('ready', () => {
+          ready = true;
+          startSftp();
+        });
+        client.connect({
+          host: request.authorization.profile.host,
+          port: request.authorization.profile.port,
+          username: request.authorization.profile.user,
+          readyTimeout: request.timeoutMs,
+          hostVerifier: (key: Buffer) => {
+            hostVerified = hostFingerprint(key) === request.authorization.profile.expectedHostFingerprint;
+            hostKeyRejected = !hostVerified;
+            return hostVerified;
+          },
+          ...(request.authorization.profile.authMode === 'agent-key' ? { agent: this.agent ?? process.env.SSH_AUTH_SOCK } : {}),
+          ...(request.authorization.profile.authMode === 'password' ? { authHandler } : {}),
+        });
+      } catch {
+        finish(new RemoteExecutionError('connection-failure', 'Remote SSH connection failed'));
+      }
+    });
+  }
+}
+
+/** Windows may use the SSH2 transport only for the approved password profile path. */
+export class WindowsPasswordFileUploadTransport implements RemoteFileUploadTransport {
+  constructor(private readonly passwordTransport: RemoteFileUploadTransport) {}
+
+  upload(request: RemoteFileUploadTransportRequest, signal?: AbortSignal): Promise<RemoteFileUploadTransportResult> {
+    if (request.authorization.profile.authMode !== 'password')
+      return Promise.reject(new RemoteExecutionError('windows-agent-key-unsupported', 'Windows agent-key upload requires the native trust boundary'));
+    return this.passwordTransport.upload(request, signal);
+  }
+}
+
+/** Adapts the authenticated local approval channel to an exact file-upload presentation. */
+export function createHumanFileUploadApprovalProvider(approver: HumanSudoApprovalProvider): HumanFileUploadApprovalProvider {
+  return {
+    approve: (request, signal) =>
+      approver.approve(
+        {
+          profileId: request.profileId,
+          command: 'upload_remote_file',
+          args: [request.remotePath, `sha256=${request.sha256}`, `sizeBytes=${request.sizeBytes}`],
+          timeoutMs: request.timeoutMs,
+          maxOutputBytes: 1,
+          operationId: request.operationId,
+          approvedIdentity: request.approvedIdentity,
+          leaseIdentityDigest: request.leaseIdentityDigest,
+        },
+        signal,
+      ),
+  };
+}
+
 class UploadApprovalStore {
   private pending = false;
   private readonly approvals = new Map<
@@ -342,6 +535,7 @@ export class RemoteFileUploadProvider {
             timeoutMs: request.timeoutMs,
             operationId: id,
             leaseIdentityDigest: authorization.identityDigest,
+            approvedIdentity: authorization.identity,
           },
           signal,
         );

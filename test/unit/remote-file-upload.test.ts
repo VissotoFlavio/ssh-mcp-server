@@ -2,12 +2,6 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
 
-import {
-  RemoteFileUploadProvider,
-  type FileUploadApprovalRequest,
-  type RemoteFileUploadTransport,
-  type RemoteFileUploadTransportRequest,
-} from '../../src/execution/remote-file-upload.js';
 import type {
   ExecutionAuditApproval,
   ExecutionAuditFinished,
@@ -15,6 +9,12 @@ import type {
   ExecutionAuditJournal,
 } from '../../src/execution/execution-audit-journal.js';
 import { RemoteExecutionError, createExecutionAuthorization } from '../../src/execution/remote-command-execution.js';
+import {
+  RemoteFileUploadProvider,
+  type FileUploadApprovalRequest,
+  type RemoteFileUploadTransport,
+  type RemoteFileUploadTransportRequest,
+} from '../../src/execution/remote-file-upload.js';
 
 const profile = {
   profileId: 'production-api',

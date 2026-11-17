@@ -9,18 +9,18 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import { serializeAuditEvent } from './diagnostics/redacted-diagnostics-audit.js';
 import { createLocalHumanSudoApprovalProvider } from './execution/human-approver-ipc.js';
 import {
-  requestFileUploadApprovalToolName,
-  uploadRemoteFileToolName,
-  type FileUploadResult,
-  type RemoteFileUploadProvider,
-} from './execution/remote-file-upload.js';
-import {
   remoteCommandToolName,
   requestSudoApprovalToolName,
   type HumanSudoApprovalProvider,
   type RemoteCommandExecutionProvider,
   type RemoteCommandResult,
 } from './execution/remote-command-execution.js';
+import {
+  requestFileUploadApprovalToolName,
+  uploadRemoteFileToolName,
+  type FileUploadResult,
+  type RemoteFileUploadProvider,
+} from './execution/remote-file-upload.js';
 import {
   APPROVED_PROFILE_CLASSIFICATION,
   createRuntimeApprovedProfileListingProvider,
@@ -933,12 +933,20 @@ export function createProductionRuntimeProviders(
     humanApproval?: HumanSudoApprovalProvider,
   ) => Pick<
     ServerOptions,
-    'approvedProfileListingProvider' | 'connectionValidationProvider' | 'windowsReadinessStatusProvider' | 'remoteCommandExecutionProvider'
+    | 'approvedProfileListingProvider'
+    | 'connectionValidationProvider'
+    | 'windowsReadinessStatusProvider'
+    | 'remoteCommandExecutionProvider'
+    | 'remoteFileUploadProvider'
   > = (humanApproval) => createWindowsRuntimeProviders(undefined, undefined, humanApproval),
   humanSudoApprovalProvider?: HumanSudoApprovalProvider,
 ): Pick<
   ServerOptions,
-  'approvedProfileListingProvider' | 'connectionValidationProvider' | 'windowsReadinessStatusProvider' | 'remoteCommandExecutionProvider'
+  | 'approvedProfileListingProvider'
+  | 'connectionValidationProvider'
+  | 'windowsReadinessStatusProvider'
+  | 'remoteCommandExecutionProvider'
+  | 'remoteFileUploadProvider'
 > {
   if (platform === 'win32') {
     if (!windowsSupported) return { windowsReadinessStatusProvider: createWindowsReadinessStatusProvider(false) };
@@ -962,7 +970,7 @@ export function createProductionRuntimeProviders(
 if (isEntrypoint) {
   const runProductionServer = async (): Promise<void> => {
     const localApprover = createLocalHumanSudoApprovalProvider();
-    const runtime = createProductionRuntimeProviders();
+    const runtime = createProductionRuntimeProviders(process.platform, undefined, undefined, localApprover);
     await runStdioServer(localApprover === undefined ? runtime : { ...runtime, humanSudoApprovalProvider: localApprover });
   };
 
