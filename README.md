@@ -13,11 +13,11 @@ agents can discover safe profile identifiers, validate one approved connection,
 execute one non-interactive command, or upload one bounded file through that
 profile. It never becomes an SSH terminal or a general file browser.
 
-> **Status:** `v1.2.0` is a source-built release. The native Windows runtime
-> remains within its alpha support boundary. This repository is public,
-> but npm publishing is disabled. No npm package, standalone binary, or license
-> has been published. Distribution remains controlled from source; publishing
-> or choosing a license is a separate decision.
+> **Status:** The native Windows runtime remains within its alpha support
+> boundary. This repository is public, but npm publishing is disabled. No npm
+> package, standalone binary, or license has been published. Distribution
+> remains controlled from source; publishing or choosing a license is a
+> separate decision.
 
 ## What it does—and does not do
 
