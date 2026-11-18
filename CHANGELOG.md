@@ -5,6 +5,11 @@ publish a release.
 
 ## Unreleased
 
+### Changed
+
+- Removed the fixed release version from the README status notice so the
+  documentation remains accurate between releases.
+
 ## [1.3.0] - 2026-11-18
 
 ### Added
