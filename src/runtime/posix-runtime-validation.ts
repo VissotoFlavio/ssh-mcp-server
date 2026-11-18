@@ -12,6 +12,7 @@ import {
   Ssh2RemoteCommandTransport,
   type HumanSudoApprovalProvider,
 } from '../execution/remote-command-execution.js';
+import { RemoteFileUploadProvider, Ssh2RemoteFileUploadTransport } from '../execution/remote-file-upload.js';
 import { HostIdentityCredentialPolicy, type AuthorizedConnection, type ConnectionProfile } from '../policy/host-identity-credential-policy.js';
 import { LocalConnectionProfileRegistry, type LocalProfileRegistry } from '../profiles/local-profile-registry.js';
 import {
@@ -545,5 +546,42 @@ export function createRuntimeRemoteCommandExecutionProvider(
     auditJournal,
     authorizationProvider: createProfileExecutionAuthorizationProvider(validationProvider),
     humanApproval,
+  });
+}
+
+/**
+ * Production SFTP upload composition for POSIX. Upload is deliberately absent
+ * until the same durable audit boundary required for command execution has
+ * been configured. The transport receives only an already validated lease.
+ */
+export function createRuntimeRemoteFileUploadProvider(dependencies: PosixRuntimeValidationDependencies = {}): RemoteFileUploadProvider | undefined {
+  const environment = dependencies.environment ?? process.env;
+  const platform = dependencies.platform ?? process.platform;
+  const uid = dependencies.uid ?? process.getuid?.();
+  if ((platform !== 'linux' && platform !== 'darwin') || uid === undefined) unavailable();
+  const stateRoot = environment.SSH_MCP_STATE_ROOT;
+  if (stateRoot === undefined) unavailable();
+  const auditRoot = environment[SSH_MCP_AUDIT_ROOT_ENV];
+  const auditKeyFile = environment[SSH_MCP_AUDIT_KEY_FILE_ENV];
+  const auditJournal =
+    dependencies.auditJournal ??
+    (auditRoot !== undefined && auditKeyFile !== undefined
+      ? new PosixExecutionAuditJournal({ root: auditRoot, keyFile: auditKeyFile, uid })
+      : undefined);
+  if (auditJournal === undefined) return undefined;
+
+  const validationProvider = dependencies.connectionValidationProvider ?? createRuntimeConnectionValidationProvider(dependencies);
+  const credentials = {
+    async getPassword(reference: string) {
+      const resolver = createPlatformCredentialStoreResolver({ platform, approvedReferences: [reference] });
+      const store = resolver.resolve(reference);
+      return store.getPassword(reference as Parameters<typeof store.getPassword>[0]);
+    },
+  };
+  return new RemoteFileUploadProvider({
+    connectionValidation: validationProvider,
+    transport: new Ssh2RemoteFileUploadTransport(credentials, environment.SSH_AUTH_SOCK),
+    auditJournal,
+    authorizationProvider: createProfileExecutionAuthorizationProvider(validationProvider),
   });
 }

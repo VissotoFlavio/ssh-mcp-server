@@ -49,7 +49,8 @@ For a controlled execution check, validate the approved profile first, then
 use `execute_remote_command` with a fixed executable and argv such as
 `docker` with `args: ["ps"]`. Treat timeout or cancellation after handoff as
 `outcome-unknown` and do not retry automatically. Privilege-escalation
-commands still require the separate trusted `request_sudo_approval` flow.
+commands require the explicit `request_action_approval` flow with
+`action: "remote-command"`.
 
 ## Safe support record
 

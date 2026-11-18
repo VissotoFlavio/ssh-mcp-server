@@ -2,15 +2,16 @@
 
 ![SSH MCP workflow](assets/ssh_mcp_workflow.png)
 
-Policy-driven SSH profile discovery, connection validation, and bounded remote
-command execution for AI agents—without agent-supplied credentials.
+Policy-driven SSH profile discovery, connection validation, bounded remote
+command execution, and exact SFTP upload for AI agents—without agent-supplied
+credentials.
 
 Use this MCP server when an operator wants an agent to confirm that one of the
 operator's already approved SSH profiles is ready for a subsequent,
 operator-authorized step. The server exposes a deliberately small surface:
 agents can discover safe profile identifiers, validate one approved connection,
-and execute one non-interactive command through that profile. It never becomes
-an SSH terminal.
+execute one non-interactive command, or upload one bounded file through that
+profile. It never becomes an SSH terminal or a general file browser.
 
 > **Status:** `v1.2.0` is a source-built release. The native Windows runtime
 > remains within its alpha support boundary. This repository is public,
@@ -23,8 +24,9 @@ an SSH terminal.
 | Supported                                                               | Explicitly not supported                                                                    |
 | ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
 | List operator-approved profile IDs                                      | Interactive or persistent shell                                                             |
-| Validate approved host identity and authentication                      | File transfer or port forwarding                                                            |
+| Validate approved host identity and authentication                      | Download, directory listing, or port forwarding                                             |
 | Execute one bounded, non-interactive command with limited output        | Accept a host, user, port, SSH option, key, password, token, or a local shell from an agent |
+| Upload one exact SFTP file after explicit action approval               | Interactive or persistent SFTP session                                                      |
 | Require request-bound, expiring human approval for privileged execution | Alter remote privileges or contact a production VPS during tests                            |
 | Return stable, structured results and redacted local audit records      | Reveal credentials, host keys, or command output in audit records                           |
 
@@ -53,11 +55,11 @@ behind the trusted boundary. Failures are fail-closed.
 
 ## Platform support
 
-| Platform                                            | Discovery                                         | `validate_connection`                                                                                                                      | Authentication readiness                                                                                                                                                                                                  |
-| --------------------------------------------------- | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Linux and macOS                                     | Available when the POSIX state root is configured | Available when the POSIX runtime is composed; unsafe or incomplete state fails closed at call time                                         | `agent-key` only, using a private known-hosts snapshot and a bounded OpenSSH ControlMaster check                                                                                                                          |
-| Native Windows alpha                                | Available only on the supported native envelope   | Advertised only when the required native runtime and provider-composition boundaries are available; individual calls can still fail closed | Password profiles retain host verification and Credential Manager ordering; agent-key commands use the native verified OpenSSH/snapshot boundary. Remote execution additionally requires the native trusted audit journal |
-| Other platforms or unsupported Windows environments | Not advertised                                    | Not advertised                                                                                                                             | Not supported                                                                                                                                                                                                             |
+| Platform                                            | Discovery                                         | `validate_connection`                                                                                                                    | `upload_remote_file`                                                                                                                                            |
+| --------------------------------------------------- | ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Linux and macOS                                     | Available when the POSIX state root is configured | `agent-key` only, using a private known-hosts snapshot and a bounded OpenSSH ControlMaster check                                         | `agent-key` only, when the POSIX state, known-hosts roots, audit root, and audit key are configured safely                                                      |
+| Native Windows alpha                                | Available only on the supported native envelope   | Password profiles retain host verification and Credential Manager ordering; agent-key uses the native verified OpenSSH/snapshot boundary | Password profiles only, when the trusted native audit journal is available; `agent-key` upload remains unavailable until a native verified SFTP boundary exists |
+| Other platforms or unsupported Windows environments | Not advertised                                    | Not advertised                                                                                                                           | Not advertised                                                                                                                                                  |
 
 The Windows alpha supports only 64-bit Windows 11 23H2 or later, or Windows
 Server 2022 or later, with 64-bit Node.js 22 or later and Microsoft OpenSSH
@@ -322,16 +324,12 @@ The bounded defaults are 30 seconds and 64 KiB; the maximums are 60 seconds
 and 1 MiB. There is no allowlist for remote executables or argument shapes.
 Commands that use `sudo`, `sudoedit`, `su`, `doas`, `dzdo`, `runuser`, or
 `pkexec`, and command evaluators such as `sh`, `bash`, PowerShell, Python,
-`env`, `xargs`, or `ssh`, return `approval-required` until the host-injected
-`HumanSudoApprovalProvider` issues an opaque one-use capability through
-`request_sudo_approval`. The capability expires after one minute,
-cannot be reused, and fails if the command or the immutable approved profile
-identity changes. A boolean such as `approved: true` is not accepted as
-authorization. A standalone CLI without a host approval callback returns
-`approval-unavailable`. Production hosts may connect the typed
-`ssh-mcp-approver` boundary: Unix socket on POSIX or SID-protected named pipe
-on Windows. Destination, verified identity, and canonical command remain local
-to that approver. A successful or failed call returns structured fields
+`env`, `xargs`, or `ssh`, return `approval-required` until the MCP client
+obtains explicit user confirmation through `request_action_approval` with
+`action: "remote-command"`. The capability expires after one minute, cannot
+be reused, and fails if the command or the immutable approved profile identity
+changes. A boolean such as `approved: true` is not accepted as authorization.
+A successful or failed call returns structured fields
 `operationId`, `profileId`, `outcome`, `code`, `exitCode`, `stdout`, `stderr`,
 and `outputTruncated` in addition to the existing text JSON. The stable codes
 include `success`, `remote-failure`, `connection-failure`,
@@ -376,71 +374,66 @@ execution or an `approval-required` handoff. The same redacted JSON object is
 kept in `content[0].text` and `structuredContent`; clients must not retry
 `outcome-unknown` automatically.
 
-### `request_sudo_approval`
+### `upload_remote_file`
 
-Requests human confirmation for one exact `sudo` command. The tool is state
-changing and requires confirmation. It returns only `approved`, a stable
-`code`, an opaque `operationId`, and an opaque one-use `capability` when the
-configured trusted approval boundary confirms the request. It accepts no
-caller token or boolean. The capability must be sent back only as
-`approvalToken` on the exact matching
-`execute_remote_command` request. Its destructive and non-idempotent
-annotations describe the sensitive approval action; they do not themselves
-execute a remote command or enforce authorization.
-
-The safe two-step flow is:
-
-**1. Request approval for the exact command**
+Uploads one Base64-encoded file, at most 1 MiB, to one absolute remote path.
+The client must first obtain explicit user confirmation through
+`request_action_approval`; the issued capability is bound to the profile,
+destination, content digest, size, and timeout. The SFTP transport writes a
+private temporary file, reads it back to calculate SHA-256, and renames it to
+the destination only when that digest matches. The journal records the
+operation without the path or file content in plaintext.
 
 ```json
 {
   "profileId": "staging-api",
-  "command": "sudo",
-  "args": ["systemctl", "restart", "api"]
+  "remotePath": "/srv/application/config.json",
+  "contentBase64": "eyJlbmFibGVkIjp0cnVlfQo=",
+  "timeoutMs": 30000
 }
 ```
 
-**2. Approved response**
+The result includes the SHA-256, byte count, `integrity`, and a stable outcome.
+`integrity: "verified"` means the temporary remote file was read back and
+hashed before rename. A timeout or cancellation after SFTP handoff is
+`outcome-unknown` and must not be retried automatically.
 
-The following capability is fictitious and must never be reused:
+### `request_action_approval`
+
+Requests one client-confirmed, opaque, one-use capability for an exact file
+upload or a remote command that requires the approval flow. This mutating MCP
+tool must receive explicit user confirmation in the conversation; it does not
+open a server-side dialog or accept a caller-provided approval boolean.
+
+For an upload, call it with the exact upload fields plus `action`:
 
 ```json
 {
-  "approved": true,
-  "code": "approved",
-  "operationId": "0123456789abcdef0123456789abcdef",
-  "capability": "fake-capability-for-documentation-only"
+  "action": "file-upload",
+  "profileId": "staging-api",
+  "remotePath": "/srv/application/config.json",
+  "contentBase64": "eyJlbmFibGVkIjp0cnVlfQo=",
+  "timeoutMs": 30000
 }
 ```
 
-**3. Execute the unchanged request with the fictitious capability**
+Send the returned fictitious capability only with the unchanged upload:
 
 ```json
 {
   "profileId": "staging-api",
-  "command": "sudo",
-  "args": ["systemctl", "restart", "api"],
-  "approvalToken": "fake-capability-for-documentation-only"
+  "remotePath": "/srv/application/config.json",
+  "contentBase64": "eyJlbmFibGVkIjp0cnVlfQo=",
+  "timeoutMs": 30000,
+  "approvalCapability": "fake-capability-for-documentation-only"
 }
 ```
 
-The approval result is returned in both `content[0].text` and
-`structuredContent`. On approval failure, the response keeps the structured
-fields and sets `isError: true`, for example:
-
-```json
-{
-  "approved": false,
-  "code": "approval-unavailable",
-  "operationId": "0123456789abcdef0123456789abcdef"
-}
-```
-
-`approval-unavailable`, `approval-rejected`, `approval-busy`, `cancelled`,
-altered, expired, or reused requests do not open an SSH session. The
-capability must never be copied into audit records, diagnostics, support
-tickets, or examples. No example contains a real token, credential, host, or
-destination.
+For a sensitive remote command, use `action: "remote-command"` with its
+exact `profileId`, `command`, arguments, timeout, and output limit, then send
+the capability as `approvalCapability` to `execute_remote_command`. A
+capability expires after one minute, cannot be reused, and is never written to
+audit, diagnostics, or support material.
 
 ### `validate_connection`
 
@@ -501,10 +494,10 @@ Use this sequence for every remote operation:
    not authorize a command, and non-sudo mutating commands may execute with
    the remote account's existing permissions without a mandatory MCP approval
    prompt.
-6. For an allowed command, call `execute_remote_command` with `command` and a
-   separate `args` array. Use the exact two-step approval flow when the command
-   contains a recognized privilege-escalation executable or is a command
-   evaluator/wrapper.
+6. For an upload, obtain a `file-upload` capability through
+   `request_action_approval`, then call `upload_remote_file` with the unchanged
+   request and capability. For a sensitive command, use the same two-step flow
+   with `action: "remote-command"`.
 7. Interpret the structured result and report its stable fields. If the result
    is `outcome-unknown`, do not retry automatically because the command may
    already have run.
@@ -516,8 +509,8 @@ platform, or request to bypass a guardrail as a hard stop.
 Never invent a profile ID, request or paste keys/secrets, accept a dynamic
 host or path, bypass the human approval flow, open a persistent SSH session,
 or retry a failed host/authentication check with weaker settings. Do not use
-the command runner as a substitute for a dedicated file-transfer or
-forwarding workflow.
+the command runner or upload tool as a substitute for download, browsing, or
+forwarding.
 
 ## Security, diagnostics, and troubleshooting
 
@@ -538,8 +531,8 @@ null exit code and empty output; clients must not retry automatically. Timeout
 or cancellation closes the server-controlled SSH channel/session but does not
 promise to kill an already detached remote process. The first delivery targets
 POSIX VPS hosts from POSIX or Windows clients; remote Windows-host quoting is
-future work. The MCP does not provide a separate interactive shell, transfer,
-or forwarding protocol. A non-interactive command may still invoke a remote
+future work. The MCP does not provide a separate interactive shell, download,
+directory listing, or forwarding protocol. A non-interactive command may still invoke a remote
 program that performs those actions and command evaluators require explicit
 human approval. Support
 material must omit hosts, usernames, profile IDs, credential references, paths,

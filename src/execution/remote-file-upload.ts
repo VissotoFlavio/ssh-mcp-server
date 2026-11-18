@@ -218,12 +218,23 @@ function mapError(error: unknown): FileUploadCode {
   const code = error instanceof RemoteExecutionError ? error.code : (error as { code?: unknown })?.code;
   if (code === 'authentication-failure' || code === 'authentication' || code === 'credential-unavailable') return 'authentication-failure';
   if (code === 'host-key-failure' || code === 'known-hosts-fingerprint-mismatch') return 'host-key-failure';
+  if (code === 'integrity-failure') return 'integrity-failure';
   if (code === 'connection-failure' || code === 'connection') return 'connection-failure';
   if (code === 'timeout') return 'timeout';
   if (code === 'cancelled') return 'cancelled';
   if (code === 'execution-audit-unavailable') return 'execution-audit-unavailable';
   if (code === 'outcome-unknown') return 'outcome-unknown';
   return 'remote-failure';
+}
+
+function remoteSha256(sftp: SFTPWrapper, path: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const digest = createHash('sha256');
+    const stream = sftp.createReadStream(path);
+    stream.on('data', (chunk: Buffer) => digest.update(chunk));
+    stream.once('error', reject);
+    stream.once('end', () => resolve(digest.digest('hex')));
+  });
 }
 
 function hostFingerprint(key: Buffer): string {
@@ -331,12 +342,19 @@ export class Ssh2RemoteFileUploadTransport implements RemoteFileUploadTransport 
                   writeError === undefined ? resolveWrite() : rejectWrite(writeError),
                 );
               });
+              const uploadedSha256 = await remoteSha256(session, temporaryPath!);
+              if (uploadedSha256 !== request.sha256)
+                throw new RemoteExecutionError('integrity-failure', 'Remote file upload integrity verification failed');
               await rename();
               temporaryPath = undefined;
-              finish(undefined, { uploadedBytes: request.content.length, sha256: request.sha256 });
-            } catch {
+              finish(undefined, { uploadedBytes: request.content.length, sha256: uploadedSha256 });
+            } catch (error) {
               cleanupTemporary();
-              finish(new RemoteExecutionError(started ? 'outcome-unknown' : 'remote-failure', 'Remote file upload failed'));
+              finish(
+                error instanceof RemoteExecutionError
+                  ? error
+                  : new RemoteExecutionError(started ? 'outcome-unknown' : 'remote-failure', 'Remote file upload failed'),
+              );
             }
           })();
         });
@@ -505,6 +523,7 @@ export class RemoteFileUploadProvider {
     } catch (error) {
       const code = mapError(error);
       await authorization?.release?.();
+      if (code === 'integrity-failure') return await finish(result(request, id, 'failure', code));
       if (handedOff) return await finish(unknownResult(request, id));
       if (code === 'timeout') return await finish(result(request, id, 'timeout', code));
       if (code === 'cancelled') return await finish(result(request, id, 'cancelled', code));
