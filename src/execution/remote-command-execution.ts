@@ -66,6 +66,7 @@ export type RemoteExecutionCode =
   | 'connection-failure'
   | 'authentication-failure'
   | 'host-key-failure'
+  | 'integrity-failure'
   | 'windows-agent-key-unsupported'
   | 'timeout'
   | 'cancelled'

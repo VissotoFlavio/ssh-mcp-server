@@ -5,6 +5,22 @@ publish a release.
 
 ## Unreleased
 
+## [1.3.0] - 2026-11-18
+
+### Added
+
+- Added the approved, audited `upload_remote_file` SFTP flow to Linux and
+  macOS for POSIX `agent-key` profiles with a configured durable audit journal.
+- Added an in-process disposable SSH/SFTP integration suite to CI, including
+  real host-key rejection coverage.
+
+### Changed
+
+- Upload now reads and hashes the temporary remote SFTP file before rename, so
+  `integrity: "verified"` represents an independent remote readback check.
+- Documented the exact upload and `request_action_approval` contracts by
+  platform and authentication mode.
+
 ## [1.2.0] - 2026-11-17
 
 ### Added

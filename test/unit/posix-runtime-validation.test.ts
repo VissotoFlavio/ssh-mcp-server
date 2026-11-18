@@ -7,6 +7,7 @@ import {
   SSH_MCP_KNOWN_HOSTS_ROOT_ENV,
   createRuntimeConnectionValidationProvider,
   createRuntimeRemoteCommandExecutionProvider,
+  createRuntimeRemoteFileUploadProvider,
   type PosixControlMasterChild,
   type PosixFileStats,
   type PosixRuntimeFileSystem,
@@ -177,6 +178,39 @@ test('production execution binds sudo approval to the validated POSIX authorizat
     authMode: profile.authMode,
     approvedKnownHostsReference: profile.approvedKnownHostsReference,
   });
+});
+
+test('composes POSIX upload only when a durable audit journal is available', async () => {
+  const dependencies = {
+    environment: { SSH_MCP_STATE_ROOT: '/state' },
+    platform: 'linux',
+    uid: 1000,
+    profileRegistry: { getProfile: async () => profile },
+    connectionValidationProvider: {
+      validateConnection: async () => ({ profileId: profile.profileId, ready: true as const }),
+      authorizeExecution: async () => ({ profile }),
+    },
+  };
+  assert.equal(createRuntimeRemoteFileUploadProvider(dependencies), undefined);
+
+  const uploadProvider = createRuntimeRemoteFileUploadProvider({
+    ...dependencies,
+    auditJournal: {
+      digestArguments: async () => 'a'.repeat(64),
+      begin: async () => ({
+        operationId: '0123456789abcdef0123456789abcdef',
+        finish: async () => undefined,
+      }),
+    },
+  });
+  assert.notEqual(uploadProvider, undefined);
+  const approval = await uploadProvider!.requestActionApproval({
+    profileId: profile.profileId,
+    remotePath: '/srv/application/config.json',
+    contentBase64: Buffer.from('{"enabled":true}').toString('base64'),
+  });
+  assert.equal(approval.approved, true);
+  assert.equal(typeof approval.capability, 'string');
 });
 
 test('rejects an operator root with unsafe permissions before ssh-add or a master runs', async () => {
