@@ -5,6 +5,8 @@ publish a release.
 
 ## Unreleased
 
+## [1.3.0] - 2026-11-18
+
 ### Added
 
 - Added the approved, audited `upload_remote_file` SFTP flow to Linux and
