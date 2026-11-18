@@ -135,6 +135,19 @@ test('returns unknown after an upload handoff is interrupted', async () => {
   assert.equal(uploaded.code, 'outcome-unknown');
 });
 
+test('preserves an explicit integrity failure after the upload handoff', async () => {
+  const uploadProvider = provider({
+    upload: async (request) => {
+      await request.onUploadHandoff?.();
+      throw new RemoteExecutionError('integrity-failure', 'the temporary file did not match the requested digest');
+    },
+  });
+  const uploaded = await uploadProvider.upload(await approvedInput(uploadProvider));
+  assert.equal(uploaded.outcome, 'failure');
+  assert.equal(uploaded.code, 'integrity-failure');
+  assert.equal(uploaded.integrity, 'unknown');
+});
+
 test('rejects a non-canonical Base64 payload before remote authorization', async () => {
   const uploadProvider = provider({ upload: async () => ({ uploadedBytes: 0, sha256: '' }) });
   const uploaded = await uploadProvider.upload({ ...input, contentBase64: 'V A==' });

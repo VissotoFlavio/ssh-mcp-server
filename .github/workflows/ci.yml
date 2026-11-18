@@ -50,6 +50,11 @@ jobs:
       - name: Run tests
         run: npm test
 
+      - name: Run SFTP integration tests
+        env:
+          SSH_INTEGRATION_TEST: 'true'
+        run: npm run test:integration
+
       - name: Build
         run: npm run build
 

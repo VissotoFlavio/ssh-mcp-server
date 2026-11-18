@@ -87,6 +87,7 @@ test('runs the complete injected validation flow over stdio without polluting pr
   });
   assert.deepEqual(listed.result, {
     content: [{ type: 'text', text: JSON.stringify({ profiles: [{ profileId: 'production-api', classification: 'operator-approved' }] }) }],
+    structuredContent: { profiles: [{ profileId: 'production-api', classification: 'operator-approved' }] },
   });
 
   const validated = await requestResponse(input, output, {
@@ -95,7 +96,10 @@ test('runs the complete injected validation flow over stdio without polluting pr
     method: 'tools/call',
     params: { name: validateConnectionToolName, arguments: { profileId: 'production-api' } },
   });
-  assert.deepEqual(validated.result, { content: [{ type: 'text', text: JSON.stringify({ profileId: 'production-api', ready: true }) }] });
+  assert.deepEqual(validated.result, {
+    content: [{ type: 'text', text: JSON.stringify({ profileId: 'production-api', ready: true }) }],
+    structuredContent: { profileId: 'production-api', ready: true },
+  });
   assert.equal(listings, 1);
   assert.deepEqual(validationInput, { profileId: 'production-api' });
   assert.deepEqual(
@@ -153,6 +157,7 @@ test('rejects unsafe validation input before invoking the injected provider', as
 
   assert.deepEqual(rejected.result, {
     content: [{ type: 'text', text: JSON.stringify({ ready: false, outcome: 'failure', code: 'invalid-input' }) }],
+    structuredContent: { ready: false, outcome: 'failure', code: 'invalid-input' },
     isError: true,
   });
   assert.equal(validationCalls, 0);
@@ -197,6 +202,7 @@ test('redacts a host-key mismatch from MCP output and the stderr audit record', 
 
   assert.deepEqual(rejected.result, {
     content: [{ type: 'text', text: JSON.stringify({ ready: false, outcome: 'failure', code: 'host-key-failure' }) }],
+    structuredContent: { ready: false, outcome: 'failure', code: 'host-key-failure' },
     isError: true,
   });
   assert.equal(JSON.stringify(rejected).includes('private'), false);

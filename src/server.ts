@@ -14,7 +14,11 @@ import {
   createRuntimeApprovedProfileListingProvider,
   type ApprovedProfileListingProvider,
 } from './profiles/approved-profile-listing.js';
-import { createRuntimeConnectionValidationProvider, createRuntimeRemoteCommandExecutionProvider } from './runtime/posix-runtime-validation.js';
+import {
+  createRuntimeConnectionValidationProvider,
+  createRuntimeRemoteCommandExecutionProvider,
+  createRuntimeRemoteFileUploadProvider,
+} from './runtime/posix-runtime-validation.js';
 import {
   toConnectionValidationFailure,
   type ConnectionValidationOutcome,
@@ -883,10 +887,12 @@ export function createProductionRuntimeProviders(
   }
   if (platform === 'linux' || platform === 'darwin') {
     const connectionValidationProvider = createRuntimeConnectionValidationProvider();
+    const remoteFileUploadProvider = createRuntimeRemoteFileUploadProvider({ connectionValidationProvider });
     return {
       approvedProfileListingProvider: createRuntimeApprovedProfileListingProvider(),
       connectionValidationProvider,
       remoteCommandExecutionProvider: createRuntimeRemoteCommandExecutionProvider({ connectionValidationProvider }),
+      ...(remoteFileUploadProvider === undefined ? {} : { remoteFileUploadProvider }),
     };
   }
   return {};

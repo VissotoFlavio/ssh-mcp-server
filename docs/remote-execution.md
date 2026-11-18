@@ -1,7 +1,7 @@
-# Remote command execution
+# Remote operations
 
-This increment adds one bounded MCP execution tool for an already approved SSH
-profile. The profile remains the source of truth for host identity,
+This increment adds bounded command execution and exact SFTP upload for an
+already approved SSH profile. The profile remains the source of truth for host identity,
 authentication mode, known-hosts data, and credential references. MCP callers
 cannot supply any of those values.
 
@@ -19,7 +19,7 @@ account's existing permissions. The MCP does not classify every command as
 destructive, and client-side confirmation conventions are not server
 authorization.
 
-The five tools advertise output schemas. Structured JSON results are returned
+All advertised tools expose output schemas. Structured JSON results are returned
 through `structuredContent` in addition to the existing JSON text content;
 legacy plain-text availability errors remain text-only for compatibility.
 
@@ -34,41 +34,16 @@ legacy plain-text availability errors remain text-only for compatibility.
    remote argument; it does not use a local shell.
 4. For a command containing a privilege-escalation executable such as `sudo`,
    `sudoedit`, `su`, `doas`, `dzdo`, `runuser`, or `pkexec`, or a command
-   evaluator/wrapper, call
-   `request_sudo_approval`. A trusted `HumanSudoApprovalProvider` callback injected by the host/runtime must
-   confirm the exact request. The MCP caller cannot provide an approval
-   boolean. Use the returned opaque one-time capability only with the
-   unchanged request. The supported local integration is the typed
-   `ssh-mcp-approver` IPC contract: a private authenticated Unix socket on
-   POSIX or a SID-protected named pipe on Windows. The production entrypoint
-   reads the POSIX socket location only from the trusted local environment
-   (`SSH_MCP_APPROVER_SOCKET`) plus the private 32-byte installation secret
-   file (`SSH_MCP_APPROVER_SECRET_FILE`), never from MCP input. The client
-   authenticates both directions with HMAC; frames are versioned and bound to
-   a one-use nonce, operation ID, lease identity digest, and canonical request.
-   The local approver request includes the immutable destination presentation
-   (host, port, user, verified fingerprint, authentication mode, and approved
-   known-hosts reference) so a human can confirm where the command will run;
-   those fields remain inside the authenticated local IPC envelope and are not
-   returned to MCP callers. The Windows broker dialog renders the authenticated
-   host, port, user, fingerprint, command, and complete argument vector with
-   escaped values; it fails closed if that bounded presentation cannot include
-   the whole request.
-   The POSIX socket and its secret are a local trust boundary: the client
-   requires owner-only socket/key material and validates `SO_PEERCRED` on Linux
-   or `getpeereid` on macOS in addition to HMAC. If the platform cannot expose
-   peer credentials, approval remains unavailable. Run the MCP server and
-   approver under a dedicated OS identity and do not treat this IPC as
-   protection from another process already trusted as the same user.
-   On Windows, build the packaged native broker and start it with
-   `npm run windows:approver`; it creates a SID/DACL-protected named pipe,
-   validates the client process token, prompts the local operator, and uses a
-   mutual HMAC challenge/response. The server reads only
-   `SSH_MCP_APPROVER_PIPE` and `SSH_MCP_APPROVER_SECRET` from its trusted
-   process environment. If the broker is absent or its handshake fails, only
-   privileged-execution approval is unavailable; ordinary commands remain
-   unaffected.
-5. Inspect the redacted local audit stream on standard error when diagnosing a
+   evaluator/wrapper, call `request_action_approval` with
+   `action: "remote-command"`. The MCP client must obtain explicit user
+   confirmation; use the returned opaque one-time capability only with the
+   unchanged request. The capability is bound to the full authorization lease
+   and expires after one minute.
+5. To upload one exact Base64 file, first call `request_action_approval` with
+   `action: "file-upload"`, then call `upload_remote_file` with the unchanged
+   profile, absolute path, content, timeout, and one-use capability. The
+   transport verifies the SHA-256 of the temporary remote file before rename.
+6. Inspect the redacted local audit stream on standard error when diagnosing a
    result. It contains the bounded command/arguments, profile, approval state,
    duration, exit status, outcome, and stable code, but never stdout/stderr,
    passwords, private keys, tokens, or credential blobs.
@@ -119,9 +94,9 @@ privileges. Commands may be used for those operator-authorized tasks, subject
 to the normal SSH profile and human approval boundaries.
 
 This increment excludes interactive or persistent SSH sessions, a local shell,
-and VPS changes during automated tests. The server has no separate file
-transfer or port-forwarding protocol, but it does not block remote programs
-from performing those actions. Shells, scripts, redirection, and pipes can be
+download, directory listing, port forwarding, and VPS changes during automated
+tests. It supports only the bounded upload described above. Shells, scripts,
+redirection, and pipes can be
 used only through a remote command evaluator and therefore require human
 approval. The first delivery supports POSIX VPS targets from POSIX or Windows
 clients; remote Windows-host quoting is future work. Integration tests are
@@ -139,6 +114,10 @@ either native boundary is unavailable; they never fall back to an ambient ssh2
 agent. No password, private key,
 executable path, or known-hosts path is accepted from MCP input or written to
 audit.
+
+Windows `password` profiles can use the SFTP upload transport after the same
+action approval and audit setup. Windows `agent-key` upload remains unavailable
+until a native verified SFTP boundary exists.
 
 Windows execution audit setup is separate from profile provisioning: an
 operator must explicitly initialize the protected native journal key before
