@@ -9,6 +9,9 @@ publish a release.
 
 - Removed the fixed release version from the README status notice so the
   documentation remains accurate between releases.
+- Remote-command validation failures now retain a syntactically valid requested
+  profile ID and return stable codes for invalid request shapes, commands,
+  arguments, timeouts, and output limits without auditing rejected values.
 
 ## [1.3.0] - 2026-11-18
 
