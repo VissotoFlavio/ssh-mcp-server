@@ -437,7 +437,9 @@ For a sensitive remote command, use `action: "remote-command"` with its
 exact `profileId`, `command`, arguments, timeout, and output limit, then send
 the capability as `approvalCapability` to `execute_remote_command`. A
 capability expires after one minute, cannot be reused, and is never written to
-audit, diagnostics, or support material.
+audit, diagnostics, or support material. Rejected command-approval requests
+preserve the stable validation, host-key, authentication, connection, timeout,
+cancellation, or provider-failure code without exposing provider details.
 
 ### `validate_connection`
 
