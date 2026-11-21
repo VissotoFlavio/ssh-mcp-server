@@ -577,6 +577,11 @@ approval-broker binaries, and the operator documentation, skill, and scripts
 they require. It intentionally excludes source, tests, CI files, development
 configuration, the POSIX native addon, and the test-only native addon.
 
+## Agent guidance
+
+Versioned repository policy, scoped guidance and development skills are
+documented in [docs/agent-guidance.md](docs/agent-guidance.md).
+
 ## Development checks
 
 Run the checks relevant to a source change:
