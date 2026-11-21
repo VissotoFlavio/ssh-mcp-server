@@ -23,6 +23,12 @@ All advertised tools expose output schemas. Structured JSON results are returned
 through `structuredContent` in addition to the existing JSON text content;
 legacy plain-text availability errors remain text-only for compatibility.
 
+Invalid remote-command requests fail before profile lookup or transport access.
+Their stable codes distinguish an invalid request shape, command, arguments,
+timeout, and output limit. The result retains a syntactically valid requested
+profile ID solely for correlation; otherwise it reports `unknown`. Neither the
+rejected payload nor its values are written to audit.
+
 ## Operator workflow
 
 1. Configure and verify a profile with the [POSIX setup guide](posix-setup.md)

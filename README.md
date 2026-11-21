@@ -337,7 +337,11 @@ include `success`, `remote-failure`, `connection-failure`,
 `approval-required`, `approval-expired`, `approval-altered`,
 `approval-reused`, `approval-unavailable`, `approval-busy`,
 `approval-rejected`, `execution-limit`, `execution-audit-unavailable`,
-`outcome-unknown`, `invalid-input`, and `provider-failure`.
+`outcome-unknown`, `invalid-input`, `invalid-request`, `invalid-command`,
+`invalid-arguments`, `invalid-timeout`, `invalid-output-limit`, and
+`provider-failure`. For an invalid command request, the result retains a
+syntactically valid requested `profileId`; otherwise it reports `unknown`.
+The server does not access a profile or transport for invalid requests.
 
 **Structured success response**
 

@@ -109,9 +109,32 @@ test('rejects extra local execution controls before profile or transport access'
   const { provider, transport } = createProvider(undefined, { audit });
   const result = await provider.execute({ ...command, shell: true });
   validated = transport.calls.length > 0;
-  assert.equal(result.code, 'invalid-input');
+  assert.equal(result.code, 'invalid-request');
+  assert.equal(result.profileId, profile.profileId);
   assert.equal(validated, false);
   assert.equal(JSON.stringify(audit).includes('shell'), false);
+  assert.equal(JSON.parse(audit[0]!).profileId, profile.profileId);
+});
+
+test('returns safe, actionable validation codes without accessing a profile or transport', async (t) => {
+  const cases: ReadonlyArray<readonly [string, Record<string, unknown>, string, string]> = [
+    ['command', { ...command, command: '' }, 'invalid-command', profile.profileId],
+    ['arguments', { ...command, args: [false] }, 'invalid-arguments', profile.profileId],
+    ['timeout', { ...command, timeoutMs: 0 }, 'invalid-timeout', profile.profileId],
+    ['output limit', { ...command, maxOutputBytes: 0 }, 'invalid-output-limit', profile.profileId],
+    ['profile', { ...command, profileId: 'not a profile' }, 'invalid-input', 'unknown'],
+  ];
+  for (const [name, input, code, profileId] of cases) {
+    await t.test(name, async () => {
+      const audit: string[] = [];
+      const { provider, transport } = createProvider(undefined, { audit });
+      const result = await provider.execute(input);
+      assert.equal(result.code, code);
+      assert.equal(result.profileId, profileId);
+      assert.equal(transport.calls.length, 0);
+      assert.equal(JSON.parse(audit[0]!).profileId, profileId);
+    });
+  }
 });
 
 test('maps authentication, host-key, timeout and cancellation failures safely', async (t) => {
