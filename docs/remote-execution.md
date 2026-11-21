@@ -48,6 +48,15 @@ rejected payload nor its values are written to audit.
    response preserves only its stable validation, connection, host-key,
    authentication, timeout, cancellation, or provider-failure code; it never
    exposes the underlying provider diagnostic.
+
+   A direct Docker Compose command is not a command evaluator: pass
+   `command: "docker"` with `"compose"` and its arguments in `args`. It does
+   not need a server-issued capability solely because it can mutate state,
+   though the MCP client must still receive the user's explicit confirmation
+   before invoking the destructive tool. `sh` with a script path, `sh -c`, and
+   other evaluators do need an exact, one-use capability. A changed, expired,
+   or reused capability is rejected before any remote transport is started.
+
 5. To upload one exact Base64 file, first call `request_action_approval` with
    `action: "file-upload"`, then call `upload_remote_file` with the unchanged
    profile, absolute path, content, timeout, and one-use capability. The

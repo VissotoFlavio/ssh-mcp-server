@@ -169,6 +169,95 @@ test('registers and routes remote execution without a production endpoint', asyn
   assert.match(audit, /remote-command-audit-event/u);
 });
 
+test('distinguishes direct Compose fixture commands from approved script execution', async () => {
+  const profile = {
+    profileId: 'test-profile',
+    host: 'test.invalid',
+    port: 22,
+    user: 'operator',
+    expectedHostFingerprint: 'SHA256:1111111111111111111111111111111111111111111',
+    authMode: 'agent-key' as const,
+    approvedKnownHostsReference: 'known-hosts://test-profile',
+  };
+  const calls: Array<{ command: string; args: readonly string[] }> = [];
+  let now = 0;
+  const remoteProvider = new RemoteCommandExecutionProvider({
+    profiles: { getProfile: async () => profile },
+    connectionValidation: {
+      validateConnection: async () => ({ profileId: profile.profileId, ready: true as const }),
+      authorizeExecution: async () => ({ profile }),
+    },
+    transport: {
+      async execute(request) {
+        calls.push({ command: request.command, args: request.args });
+        return { exitCode: 0, stdout: 'fixture-ok', stderr: '', outputTruncated: false };
+      },
+    },
+    now: () => now,
+  });
+
+  await withMcpClient({ remoteCommandExecutionProvider: remoteProvider }, async (client) => {
+    const compose = contractResult(
+      await client.callTool({
+        name: 'execute_remote_command',
+        arguments: {
+          profileId: profile.profileId,
+          command: 'docker',
+          args: ['compose', '--file', '/fixtures/compose.yml', '--project-name', 'approval-fixture', 'up', '--detach', '--no-build'],
+        },
+      }),
+    );
+    assert.equal(structuredPayload(compose).code, 'success');
+    assert.deepEqual(calls, [
+      {
+        command: 'docker',
+        args: ['compose', '--file', '/fixtures/compose.yml', '--project-name', 'approval-fixture', 'up', '--detach', '--no-build'],
+      },
+    ]);
+
+    const scriptRequest = { profileId: profile.profileId, command: 'sh', args: ['/fixtures/reconcile.sh'] };
+    const approval = contractResult(
+      await client.callTool({ name: 'request_action_approval', arguments: { action: 'remote-command', ...scriptRequest } }),
+    );
+    const capability = structuredPayload(approval).capability;
+    assert.equal(typeof capability, 'string');
+
+    const script = contractResult(
+      await client.callTool({ name: 'execute_remote_command', arguments: { ...scriptRequest, approvalCapability: capability } }),
+    );
+    assert.equal(structuredPayload(script).code, 'success');
+
+    const reused = contractResult(
+      await client.callTool({ name: 'execute_remote_command', arguments: { ...scriptRequest, approvalCapability: capability } }),
+    );
+    assert.equal(structuredPayload(reused).code, 'approval-reused');
+
+    const alteredApproval = contractResult(
+      await client.callTool({ name: 'request_action_approval', arguments: { action: 'remote-command', ...scriptRequest } }),
+    );
+    const altered = contractResult(
+      await client.callTool({
+        name: 'execute_remote_command',
+        arguments: { ...scriptRequest, args: ['/fixtures/changed.sh'], approvalCapability: structuredPayload(alteredApproval).capability },
+      }),
+    );
+    assert.equal(structuredPayload(altered).code, 'approval-altered');
+
+    const expiredApproval = contractResult(
+      await client.callTool({ name: 'request_action_approval', arguments: { action: 'remote-command', ...scriptRequest } }),
+    );
+    now = 60_000;
+    const expired = contractResult(
+      await client.callTool({
+        name: 'execute_remote_command',
+        arguments: { ...scriptRequest, approvalCapability: structuredPayload(expiredApproval).capability },
+      }),
+    );
+    assert.equal(structuredPayload(expired).code, 'approval-expired');
+    assert.equal(calls.length, 2);
+  });
+});
+
 test('MCP SDK 1.x validates structured output and preserves legacy text errors', async () => {
   let failDiscovery = false;
   const profile = {

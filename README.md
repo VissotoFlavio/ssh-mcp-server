@@ -329,6 +329,14 @@ obtains explicit user confirmation through `request_action_approval` with
 `action: "remote-command"`. The capability expires after one minute, cannot
 be reused, and fails if the command or the immutable approved profile identity
 changes. A boolean such as `approved: true` is not accepted as authorization.
+
+Direct commands do not enter the capability flow solely because they mutate
+remote state. For example, invoke Compose as `command: "docker"` with
+`["compose", ...]` in `args`; it is not a command evaluator. The MCP client
+must still obtain the user's explicit confirmation before calling this
+destructive tool. By contrast, `command: "sh"` with a script path, `sh -c`,
+and other evaluators require an exact, one-use capability.
+
 A successful or failed call returns structured fields
 `operationId`, `profileId`, `outcome`, `code`, `exitCode`, `stdout`, `stderr`,
 and `outputTruncated` in addition to the existing text JSON. The stable codes

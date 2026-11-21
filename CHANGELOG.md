@@ -15,6 +15,9 @@ publish a release.
 - Command-approval requests now preserve stable validation, connection,
   host-key, authentication, timeout, cancellation, and provider-failure codes
   instead of collapsing them into an unavailable-approval result.
+- Documented and added MCP integration coverage for direct Docker Compose
+  commands versus approval-bound shell and script execution, including altered
+  and reused capability rejection.
 
 ## [1.3.0] - 2026-11-18
 
