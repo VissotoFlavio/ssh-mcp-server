@@ -44,7 +44,10 @@ rejected payload nor its values are written to audit.
    `action: "remote-command"`. The MCP client must obtain explicit user
    confirmation; use the returned opaque one-time capability only with the
    unchanged request. The capability is bound to the full authorization lease
-   and expires after one minute.
+   and expires after one minute. If the request or authorization fails, the
+   response preserves only its stable validation, connection, host-key,
+   authentication, timeout, cancellation, or provider-failure code; it never
+   exposes the underlying provider diagnostic.
 5. To upload one exact Base64 file, first call `request_action_approval` with
    `action: "file-upload"`, then call `upload_remote_file` with the unchanged
    profile, absolute path, content, timeout, and one-use capability. The

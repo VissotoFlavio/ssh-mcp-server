@@ -88,6 +88,15 @@ export type RemoteExecutionCode =
   | 'invalid-output-limit'
   | 'provider-failure';
 
+export type ActionApprovalCode = 'approved' | RemoteExecutionCode;
+
+export interface ActionApprovalResult {
+  readonly approved: boolean;
+  readonly code: ActionApprovalCode;
+  readonly capability?: string;
+  readonly summary?: object;
+}
+
 export type HumanSudoApprovalDecision = boolean | 'unavailable';
 
 export interface RemoteCommandRequest {
@@ -665,6 +674,12 @@ function mapTransportError(error: unknown): RemoteExecutionCode {
   return 'remote-failure';
 }
 
+function actionApprovalFailureCode(error: unknown, signal: AbortSignal | undefined): RemoteExecutionCode {
+  if (signal?.aborted) return 'cancelled';
+  if (error instanceof RemoteExecutionError) return error.code;
+  return 'provider-failure';
+}
+
 function writeRemoteAudit(
   sink: ((serializedEvent: string) => void) | undefined,
   request: RemoteCommandRequest,
@@ -722,17 +737,19 @@ export class RemoteCommandExecutionProvider {
     this.actionApprovals = dependencies.actionApprovals ?? new ActionApprovalStore(this.now);
   }
 
-  async requestActionApproval(
-    input: unknown,
-    signal?: AbortSignal,
-  ): Promise<{ readonly approved: boolean; readonly code: string; readonly capability?: string; readonly summary?: object }> {
+  async requestActionApproval(input: unknown, signal?: AbortSignal): Promise<ActionApprovalResult> {
     let request: RemoteCommandRequest;
     try {
       request = parseRequest(input);
       if (!requiresHumanApproval(request.command, request.args)) return { approved: false, code: 'invalid-input' };
-      const authorization = await (
-        this.dependencies.authorizationProvider ?? createProfileExecutionAuthorizationProvider(this.dependencies.connectionValidation, this.now)
-      ).authorize(request.profileId, signal);
+      const authorization = await boundedOperation(
+        (authorizationSignal) =>
+          (
+            this.dependencies.authorizationProvider ?? createProfileExecutionAuthorizationProvider(this.dependencies.connectionValidation, this.now)
+          ).authorize(request.profileId, authorizationSignal),
+        request.timeoutMs!,
+        signal,
+      );
       return {
         approved: true,
         code: 'approved',
@@ -744,8 +761,8 @@ export class RemoteCommandExecutionProvider {
           argumentCount: request.args.length,
         },
       };
-    } catch {
-      return { approved: false, code: signal?.aborted ? 'cancelled' : 'approval-unavailable' };
+    } catch (error) {
+      return { approved: false, code: actionApprovalFailureCode(error, signal) };
     }
   }
 

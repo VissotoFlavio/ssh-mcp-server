@@ -12,6 +12,9 @@ publish a release.
 - Remote-command validation failures now retain a syntactically valid requested
   profile ID and return stable codes for invalid request shapes, commands,
   arguments, timeouts, and output limits without auditing rejected values.
+- Command-approval requests now preserve stable validation, connection,
+  host-key, authentication, timeout, cancellation, and provider-failure codes
+  instead of collapsing them into an unavailable-approval result.
 
 ## [1.3.0] - 2026-11-18
 
