@@ -18,7 +18,7 @@ environment detail, or a reproduction step.
 2. Before a GitHub operation, run `gh auth status`. Use only `gh` for GitHub
    operations and run it outside the sandbox when the environment requires it.
 3. Resolve the target from the current checkout with `gh repo view --json
-   nameWithOwner,url`. Do not assume or hard-code an owner or repository name.
+nameWithOwner,url`. Do not assume or hard-code an owner or repository name.
 4. Search open and closed issues for a likely duplicate before creating a new
    report. If one appears to match, present it to the requester rather than
    opening a duplicate unless they explicitly want a separate report.
