@@ -5,6 +5,11 @@ publish a release.
 
 ## Unreleased
 
+### Added
+
+- Added a reusable workflow for safe public bug reporting with optional
+  diagnostic context and automatic `bug` label application.
+
 ### Changed
 
 - Removed the fixed release version from the README status notice so the

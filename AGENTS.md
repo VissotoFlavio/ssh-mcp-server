@@ -22,6 +22,8 @@
   Pull requests require `Closes #<issue-number>` except releases.
 - Before opening a PR, inspect the final diff, run relevant validation and
   update `CHANGELOG.md` when a change is release-facing.
+- Before committing a change to a format-controlled file and before opening a
+  PR, run `npm run format:check` and correct any reported formatting errors.
 - CI validates pull requests and may generate approved package candidates; it
   never authorizes remote SSH operations, changes an operator profile, deploys
   a VPS or publishes an npm package. Keep permissions minimal and secrets out
