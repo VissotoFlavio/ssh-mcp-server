@@ -9,6 +9,8 @@ publish a release.
 
 - Added a reusable workflow for safe public bug reporting with optional
   diagnostic context and automatic `bug` label application.
+- Added a reusable workflow for safe public improvement and suggestion reports
+  with optional context and automatic `enhancement` label application.
 
 ### Changed
 
