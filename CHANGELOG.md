@@ -3,7 +3,7 @@
 All notable project changes are recorded here. This file does not announce or
 publish a release.
 
-## Unreleased
+## [1.4.0] - 2026-11-21
 
 ### Added
 
