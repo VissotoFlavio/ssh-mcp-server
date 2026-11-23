@@ -23,6 +23,12 @@ All advertised tools expose output schemas. Structured JSON results are returned
 through `structuredContent` in addition to the existing JSON text content;
 legacy plain-text availability errors remain text-only for compatibility.
 
+Invalid remote-command requests fail before profile lookup or transport access.
+Their stable codes distinguish an invalid request shape, command, arguments,
+timeout, and output limit. The result retains a syntactically valid requested
+profile ID solely for correlation; otherwise it reports `unknown`. Neither the
+rejected payload nor its values are written to audit.
+
 ## Operator workflow
 
 1. Configure and verify a profile with the [POSIX setup guide](posix-setup.md)
@@ -38,7 +44,19 @@ legacy plain-text availability errors remain text-only for compatibility.
    `action: "remote-command"`. The MCP client must obtain explicit user
    confirmation; use the returned opaque one-time capability only with the
    unchanged request. The capability is bound to the full authorization lease
-   and expires after one minute.
+   and expires after one minute. If the request or authorization fails, the
+   response preserves only its stable validation, connection, host-key,
+   authentication, timeout, cancellation, or provider-failure code; it never
+   exposes the underlying provider diagnostic.
+
+   A direct Docker Compose command is not a command evaluator: pass
+   `command: "docker"` with `"compose"` and its arguments in `args`. It does
+   not need a server-issued capability solely because it can mutate state,
+   though the MCP client must still receive the user's explicit confirmation
+   before invoking the destructive tool. `sh` with a script path, `sh -c`, and
+   other evaluators do need an exact, one-use capability. A changed, expired,
+   or reused capability is rejected before any remote transport is started.
+
 5. To upload one exact Base64 file, first call `request_action_approval` with
    `action: "file-upload"`, then call `upload_remote_file` with the unchanged
    profile, absolute path, content, timeout, and one-use capability. The

@@ -36,7 +36,7 @@ import { supportsWindowsAlphaRuntime } from './windows/windows-runtime-support.j
 import { createWindowsRuntimeProviders } from './windows/windows-runtime.js';
 
 export const serverName = 'ssh-mcp-server';
-export const serverVersion = '1.3.0';
+export const serverVersion = '1.4.0';
 export const listApprovedProfilesToolName = 'list_approved_profiles';
 export const validateConnectionToolName = 'validate_connection';
 export const getWindowsReadinessStatusToolName = 'get_windows_readiness_status';
@@ -159,6 +159,11 @@ const REMOTE_COMMAND_OUTPUT_SCHEMA = {
         'execution-audit-unavailable',
         'outcome-unknown',
         'invalid-input',
+        'invalid-request',
+        'invalid-command',
+        'invalid-arguments',
+        'invalid-timeout',
+        'invalid-output-limit',
         'provider-failure',
       ],
     },

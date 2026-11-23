@@ -109,9 +109,32 @@ test('rejects extra local execution controls before profile or transport access'
   const { provider, transport } = createProvider(undefined, { audit });
   const result = await provider.execute({ ...command, shell: true });
   validated = transport.calls.length > 0;
-  assert.equal(result.code, 'invalid-input');
+  assert.equal(result.code, 'invalid-request');
+  assert.equal(result.profileId, profile.profileId);
   assert.equal(validated, false);
   assert.equal(JSON.stringify(audit).includes('shell'), false);
+  assert.equal(JSON.parse(audit[0]!).profileId, profile.profileId);
+});
+
+test('returns safe, actionable validation codes without accessing a profile or transport', async (t) => {
+  const cases: ReadonlyArray<readonly [string, Record<string, unknown>, string, string]> = [
+    ['command', { ...command, command: '' }, 'invalid-command', profile.profileId],
+    ['arguments', { ...command, args: [false] }, 'invalid-arguments', profile.profileId],
+    ['timeout', { ...command, timeoutMs: 0 }, 'invalid-timeout', profile.profileId],
+    ['output limit', { ...command, maxOutputBytes: 0 }, 'invalid-output-limit', profile.profileId],
+    ['profile', { ...command, profileId: 'not a profile' }, 'invalid-input', 'unknown'],
+  ];
+  for (const [name, input, code, profileId] of cases) {
+    await t.test(name, async () => {
+      const audit: string[] = [];
+      const { provider, transport } = createProvider(undefined, { audit });
+      const result = await provider.execute(input);
+      assert.equal(result.code, code);
+      assert.equal(result.profileId, profileId);
+      assert.equal(transport.calls.length, 0);
+      assert.equal(JSON.parse(audit[0]!).profileId, profileId);
+    });
+  }
 });
 
 test('maps authentication, host-key, timeout and cancellation failures safely', async (t) => {
@@ -142,6 +165,57 @@ test('preserves public host-key and authentication failure classes from authoriz
     authorizationError: new HostIdentityCredentialPolicyError('agent-identity-unavailable', 'private'),
   });
   assert.equal((await authentication.provider.execute(command)).code, 'authentication-failure');
+});
+
+test('preserves actionable, redacted failures when requesting command approval', async (t) => {
+  for (const [name, input, authorizationError, expectedCode] of [
+    ['invalid request', { profileId: profile.profileId, command: 'sudo', args: ['id'], shell: true }, undefined, 'invalid-request'],
+    [
+      'host key',
+      { profileId: profile.profileId, command: 'sudo', args: ['id'] },
+      new HostIdentityCredentialPolicyError('known-hosts-entry-mismatch', 'private'),
+      'host-key-failure',
+    ],
+    [
+      'authentication',
+      { profileId: profile.profileId, command: 'sudo', args: ['id'] },
+      new HostIdentityCredentialPolicyError('agent-identity-unavailable', 'private'),
+      'authentication-failure',
+    ],
+    ['provider', { profileId: profile.profileId, command: 'sudo', args: ['id'] }, new Error('super-secret provider failure'), 'provider-failure'],
+  ] as const) {
+    await t.test(name, async () => {
+      const { provider } = createProvider(undefined, { authorizationError });
+      const result = await provider.requestActionApproval(input);
+      assert.equal(result.approved, false);
+      assert.equal(result.code, expectedCode);
+      assert.equal(JSON.stringify(result).includes('super-secret'), false);
+    });
+  }
+});
+
+test('bounds and cancels command approval authorization', async () => {
+  const provider = new RemoteCommandExecutionProvider({
+    profiles: { getProfile: async () => profile },
+    connectionValidation: {
+      validateConnection: async () => ({ profileId: profile.profileId, ready: true as const }),
+    },
+    authorizationProvider: {
+      authorize: async () => new Promise(() => undefined),
+    },
+    transport: new FakeTransport(),
+  });
+  assert.equal(
+    (await provider.requestActionApproval({ profileId: profile.profileId, command: 'sudo', args: ['id'], timeoutMs: 10 })).code,
+    'timeout',
+  );
+
+  const controller = new AbortController();
+  controller.abort();
+  assert.equal(
+    (await provider.requestActionApproval({ profileId: profile.profileId, command: 'sudo', args: ['id'] }, controller.signal)).code,
+    'cancelled',
+  );
 });
 
 test('executes sudo once after client confirmation and records a redacted audit event', async () => {

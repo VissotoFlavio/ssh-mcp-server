@@ -3,7 +3,28 @@
 All notable project changes are recorded here. This file does not announce or
 publish a release.
 
-## Unreleased
+## [1.4.0] - 2026-11-21
+
+### Added
+
+- Added a reusable workflow for safe public bug reporting with optional
+  diagnostic context and automatic `bug` label application.
+- Added a reusable workflow for safe public improvement and suggestion reports
+  with optional context and automatic `enhancement` label application.
+
+### Changed
+
+- Removed the fixed release version from the README status notice so the
+  documentation remains accurate between releases.
+- Remote-command validation failures now retain a syntactically valid requested
+  profile ID and return stable codes for invalid request shapes, commands,
+  arguments, timeouts, and output limits without auditing rejected values.
+- Command-approval requests now preserve stable validation, connection,
+  host-key, authentication, timeout, cancellation, and provider-failure codes
+  instead of collapsing them into an unavailable-approval result.
+- Documented and added MCP integration coverage for direct Docker Compose
+  commands versus approval-bound shell and script execution, including altered
+  and reused capability rejection.
 
 ## [1.3.0] - 2026-11-18
 

@@ -81,7 +81,21 @@ export type RemoteExecutionCode =
   | 'execution-audit-unavailable'
   | 'outcome-unknown'
   | 'invalid-input'
+  | 'invalid-request'
+  | 'invalid-command'
+  | 'invalid-arguments'
+  | 'invalid-timeout'
+  | 'invalid-output-limit'
   | 'provider-failure';
+
+export type ActionApprovalCode = 'approved' | RemoteExecutionCode;
+
+export interface ActionApprovalResult {
+  readonly approved: boolean;
+  readonly code: ActionApprovalCode;
+  readonly capability?: string;
+  readonly summary?: object;
+}
 
 export type HumanSudoApprovalDecision = boolean | 'unavailable';
 
@@ -207,7 +221,7 @@ function own(value: Record<string, unknown>, key: string): unknown {
 function boundedTimeout(value: unknown): number {
   if (value === undefined) return REMOTE_COMMAND_DEFAULT_TIMEOUT_MS;
   if (!Number.isSafeInteger(value) || (value as number) < 1 || (value as number) > REMOTE_COMMAND_MAX_TIMEOUT_MS) {
-    throw new RemoteExecutionError('invalid-input', 'Remote command input is invalid');
+    throw new RemoteExecutionError('invalid-timeout', 'Remote command input is invalid');
   }
   return value as number;
 }
@@ -215,7 +229,7 @@ function boundedTimeout(value: unknown): number {
 function boundedOutputLimit(value: unknown): number {
   if (value === undefined) return REMOTE_COMMAND_DEFAULT_OUTPUT_LIMIT;
   if (!Number.isSafeInteger(value) || (value as number) < 1 || (value as number) > REMOTE_COMMAND_MAX_OUTPUT_LIMIT) {
-    throw new RemoteExecutionError('invalid-input', 'Remote command input is invalid');
+    throw new RemoteExecutionError('invalid-output-limit', 'Remote command input is invalid');
   }
   return value as number;
 }
@@ -227,26 +241,26 @@ function validateProfileId(value: unknown): string {
   return value;
 }
 
-function validateText(value: unknown, maxLength: number): string {
+function validateText(value: unknown, maxLength: number, code: RemoteExecutionCode = 'invalid-input'): string {
   if (typeof value !== 'string' || value.length === 0 || value.length > maxLength || CONTROL_CHARACTERS.test(value)) {
-    throw new RemoteExecutionError('invalid-input', 'Remote command input is invalid');
+    throw new RemoteExecutionError(code, 'Remote command input is invalid');
   }
   return value;
 }
 
 function validateCommand(value: unknown): string {
-  return validateText(value, MAX_COMMAND_LENGTH);
+  return validateText(value, MAX_COMMAND_LENGTH, 'invalid-command');
 }
 
 function validateArgs(value: unknown): readonly string[] {
   if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype || value.length > MAX_ARGUMENTS) {
-    throw new RemoteExecutionError('invalid-input', 'Remote command input is invalid');
+    throw new RemoteExecutionError('invalid-arguments', 'Remote command input is invalid');
   }
-  return value.map((argument) => validateText(argument, MAX_ARGUMENT_LENGTH));
+  return value.map((argument) => validateText(argument, MAX_ARGUMENT_LENGTH, 'invalid-arguments'));
 }
 
 function parseRequest(input: unknown, allowApprovalCapability = false): RemoteCommandRequest {
-  if (!isPlainRecord(input)) throw new RemoteExecutionError('invalid-input', 'Remote command input is invalid');
+  if (!isPlainRecord(input)) throw new RemoteExecutionError('invalid-request', 'Remote command input is invalid');
   const keys = Reflect.ownKeys(input);
   const allowed = new Set([
     'profileId',
@@ -257,7 +271,7 @@ function parseRequest(input: unknown, allowApprovalCapability = false): RemoteCo
     ...(allowApprovalCapability ? ['approvalCapability'] : []),
   ]);
   if (keys.some((key) => typeof key !== 'string' || !allowed.has(key))) {
-    throw new RemoteExecutionError('invalid-input', 'Remote command input is invalid');
+    throw new RemoteExecutionError('invalid-request', 'Remote command input is invalid');
   }
   const profileId = validateProfileId(own(input, 'profileId'));
   const command = validateCommand(own(input, 'command'));
@@ -275,6 +289,17 @@ function parseRequest(input: unknown, allowApprovalCapability = false): RemoteCo
     maxOutputBytes,
     ...(approvalCapability === undefined ? {} : { approvalCapability }),
   });
+}
+
+function safeRequestedProfileId(input: unknown): string {
+  if (!isPlainRecord(input)) return 'unknown';
+  const descriptor = Object.getOwnPropertyDescriptor(input, 'profileId');
+  if (descriptor === undefined || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) return 'unknown';
+  try {
+    return validateProfileId(descriptor.value);
+  } catch {
+    return 'unknown';
+  }
 }
 
 function commandApprovalBinding(request: RemoteCommandRequest): string {
@@ -649,6 +674,12 @@ function mapTransportError(error: unknown): RemoteExecutionCode {
   return 'remote-failure';
 }
 
+function actionApprovalFailureCode(error: unknown, signal: AbortSignal | undefined): RemoteExecutionCode {
+  if (signal?.aborted) return 'cancelled';
+  if (error instanceof RemoteExecutionError) return error.code;
+  return 'provider-failure';
+}
+
 function writeRemoteAudit(
   sink: ((serializedEvent: string) => void) | undefined,
   request: RemoteCommandRequest,
@@ -706,17 +737,19 @@ export class RemoteCommandExecutionProvider {
     this.actionApprovals = dependencies.actionApprovals ?? new ActionApprovalStore(this.now);
   }
 
-  async requestActionApproval(
-    input: unknown,
-    signal?: AbortSignal,
-  ): Promise<{ readonly approved: boolean; readonly code: string; readonly capability?: string; readonly summary?: object }> {
+  async requestActionApproval(input: unknown, signal?: AbortSignal): Promise<ActionApprovalResult> {
     let request: RemoteCommandRequest;
     try {
       request = parseRequest(input);
       if (!requiresHumanApproval(request.command, request.args)) return { approved: false, code: 'invalid-input' };
-      const authorization = await (
-        this.dependencies.authorizationProvider ?? createProfileExecutionAuthorizationProvider(this.dependencies.connectionValidation, this.now)
-      ).authorize(request.profileId, signal);
+      const authorization = await boundedOperation(
+        (authorizationSignal) =>
+          (
+            this.dependencies.authorizationProvider ?? createProfileExecutionAuthorizationProvider(this.dependencies.connectionValidation, this.now)
+          ).authorize(request.profileId, authorizationSignal),
+        request.timeoutMs!,
+        signal,
+      );
       return {
         approved: true,
         code: 'approved',
@@ -728,8 +761,8 @@ export class RemoteCommandExecutionProvider {
           argumentCount: request.args.length,
         },
       };
-    } catch {
-      return { approved: false, code: signal?.aborted ? 'cancelled' : 'approval-unavailable' };
+    } catch (error) {
+      return { approved: false, code: actionApprovalFailureCode(error, signal) };
     }
   }
 
@@ -915,9 +948,11 @@ export class RemoteCommandExecutionProvider {
     let request: RemoteCommandRequest;
     try {
       request = parseRequest(input, true);
-    } catch {
-      const invalid = safeResult('unknown', 'failure', 'invalid-input');
-      writeRemoteAudit(this.dependencies.auditSink, { profileId: 'unknown', command: '[invalid]', args: [] }, 'rejected', invalid, 0);
+    } catch (error) {
+      const profileId = safeRequestedProfileId(input);
+      const code = error instanceof RemoteExecutionError ? error.code : 'invalid-input';
+      const invalid = safeResult(profileId, 'failure', code);
+      writeRemoteAudit(this.dependencies.auditSink, { profileId, command: '[invalid]', args: [] }, 'rejected', invalid, 0);
       return invalid;
     }
     const releaseConcurrency = this.concurrency.tryAcquire();
@@ -1306,6 +1341,11 @@ export function serializeRemoteAuditEvent(input: unknown): string {
     'execution-audit-unavailable',
     'outcome-unknown',
     'invalid-input',
+    'invalid-request',
+    'invalid-command',
+    'invalid-arguments',
+    'invalid-timeout',
+    'invalid-output-limit',
     'provider-failure',
   ]);
   const requestedCode = own(input, 'code');

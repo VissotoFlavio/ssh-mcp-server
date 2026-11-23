@@ -13,11 +13,11 @@ agents can discover safe profile identifiers, validate one approved connection,
 execute one non-interactive command, or upload one bounded file through that
 profile. It never becomes an SSH terminal or a general file browser.
 
-> **Status:** `v1.2.0` is a source-built release. The native Windows runtime
-> remains within its alpha support boundary. This repository is public,
-> but npm publishing is disabled. No npm package, standalone binary, or license
-> has been published. Distribution remains controlled from source; publishing
-> or choosing a license is a separate decision.
+> **Status:** The native Windows runtime remains within its alpha support
+> boundary. This repository is public, but npm publishing is disabled. No npm
+> package, standalone binary, or license has been published. Distribution
+> remains controlled from source; publishing or choosing a license is a
+> separate decision.
 
 ## What it does—and does not do
 
@@ -329,6 +329,14 @@ obtains explicit user confirmation through `request_action_approval` with
 `action: "remote-command"`. The capability expires after one minute, cannot
 be reused, and fails if the command or the immutable approved profile identity
 changes. A boolean such as `approved: true` is not accepted as authorization.
+
+Direct commands do not enter the capability flow solely because they mutate
+remote state. For example, invoke Compose as `command: "docker"` with
+`["compose", ...]` in `args`; it is not a command evaluator. The MCP client
+must still obtain the user's explicit confirmation before calling this
+destructive tool. By contrast, `command: "sh"` with a script path, `sh -c`,
+and other evaluators require an exact, one-use capability.
+
 A successful or failed call returns structured fields
 `operationId`, `profileId`, `outcome`, `code`, `exitCode`, `stdout`, `stderr`,
 and `outputTruncated` in addition to the existing text JSON. The stable codes
@@ -337,7 +345,11 @@ include `success`, `remote-failure`, `connection-failure`,
 `approval-required`, `approval-expired`, `approval-altered`,
 `approval-reused`, `approval-unavailable`, `approval-busy`,
 `approval-rejected`, `execution-limit`, `execution-audit-unavailable`,
-`outcome-unknown`, `invalid-input`, and `provider-failure`.
+`outcome-unknown`, `invalid-input`, `invalid-request`, `invalid-command`,
+`invalid-arguments`, `invalid-timeout`, `invalid-output-limit`, and
+`provider-failure`. For an invalid command request, the result retains a
+syntactically valid requested `profileId`; otherwise it reports `unknown`.
+The server does not access a profile or transport for invalid requests.
 
 **Structured success response**
 
@@ -433,7 +445,9 @@ For a sensitive remote command, use `action: "remote-command"` with its
 exact `profileId`, `command`, arguments, timeout, and output limit, then send
 the capability as `approvalCapability` to `execute_remote_command`. A
 capability expires after one minute, cannot be reused, and is never written to
-audit, diagnostics, or support material.
+audit, diagnostics, or support material. Rejected command-approval requests
+preserve the stable validation, host-key, authentication, connection, timeout,
+cancellation, or provider-failure code without exposing provider details.
 
 ### `validate_connection`
 
@@ -576,6 +590,11 @@ The package contains only the compiled runtime, production Windows trust and
 approval-broker binaries, and the operator documentation, skill, and scripts
 they require. It intentionally excludes source, tests, CI files, development
 configuration, the POSIX native addon, and the test-only native addon.
+
+## Agent guidance
+
+Versioned repository policy, scoped guidance and development skills are
+documented in [docs/agent-guidance.md](docs/agent-guidance.md).
 
 ## Development checks
 
